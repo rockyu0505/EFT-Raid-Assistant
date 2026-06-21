@@ -174,12 +174,13 @@ def _find_tooltip_border_box(image: Image.Image) -> tuple[int, int, int, int] | 
     candidates: list[tuple[float, tuple[int, int, int, int]]] = []
     width, height = image.size
     gray_pixels = gray.load()
+    min_box_height = max(20, round(height * 0.08))
     for index, (top_y, top_x0, top_x1) in enumerate(runs):
         for bottom_y, bottom_x0, bottom_x1 in runs[index + 1 :]:
             box_height = bottom_y - top_y
-            if box_height > 110:
+            if box_height > 76:
                 break
-            if box_height < 20:
+            if box_height < min_box_height:
                 continue
 
             overlap = min(top_x1, bottom_x1) - max(top_x0, bottom_x0)
@@ -202,17 +203,21 @@ def _find_tooltip_border_box(image: Image.Image) -> tuple[int, int, int, int] | 
                 _vertical_line_score(mask, max(top_x1, bottom_x1) - 1, top_y, bottom_y),
             )
             dark_ratio = _dark_interior_ratio(gray_pixels, (x0, top_y, x1, bottom_y))
+            bright_ratio = _bright_interior_ratio(gray_pixels, (x0, top_y, x1, bottom_y))
             if top_score + bottom_score < 0.8:
                 continue
             if left_score + right_score < 0.08:
                 continue
             if dark_ratio < 0.42:
                 continue
+            if bright_ratio < 0.055:
+                continue
 
             score = (
                 (top_score + bottom_score) * 80
                 + (left_score + right_score) * 90
                 + dark_ratio * 70
+                + bright_ratio * 160
                 + box_width * 0.05
                 + box_height * 0.25
             )
@@ -303,6 +308,23 @@ def _dark_interior_ratio(
     if values == 0:
         return 0.0
     return dark / values
+
+
+def _bright_interior_ratio(
+    pixels: Any,
+    box: tuple[int, int, int, int],
+) -> float:
+    x0, y0, x1, y1 = box
+    values = 0
+    bright = 0
+    for y in range(y0 + 3, y1 - 2):
+        for x in range(x0 + 3, x1 - 3):
+            values += 1
+            if pixels[x, y] > 115:
+                bright += 1
+    if values == 0:
+        return 0.0
+    return bright / values
 
 
 def _inset_box(
@@ -686,7 +708,9 @@ def parse_item_name_candidates(text: str) -> list[str]:
             continue
         if value.count(" ") > 12:
             continue
-        candidates.append(value)
+        if _looks_like_ocr_gibberish(value):
+            continue
+        candidates.extend(_line_candidate_variants(value))
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -697,7 +721,9 @@ def parse_item_name_candidates(text: str) -> list[str]:
             deduped.append(value)
     if len(deduped) > 1:
         joined = " ".join(deduped)
-        if len(joined) <= 120:
+        if len(joined) <= 120 and _normalize_candidate_key(deduped[0]) not in _normalize_candidate_key(
+            deduped[1]
+        ):
             deduped.insert(0, joined)
     return deduped[:5]
 
@@ -709,6 +735,55 @@ def _clean_line(value: str) -> str:
     value = re.sub(r"(?<=[0-9])\s+(?=[\u4e00-\u9fff])", "", value)
     value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
     return value
+
+
+def _normalize_candidate_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.casefold())
+
+
+def _line_candidate_variants(value: str) -> list[str]:
+    variants: list[str] = []
+    trimmed = _trim_tail_after_last_cjk(value)
+    if trimmed and trimmed != value:
+        variants.append(trimmed)
+    variants.append(value)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        key = variant.casefold()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(variant)
+    return deduped
+
+
+def _looks_like_ocr_gibberish(value: str) -> bool:
+    has_cjk = re.search(r"[\u4e00-\u9fff]", value) is not None
+    latin_tokens = re.findall(r"[A-Za-z]{2,}", value)
+    suspicious = 0
+    for token in latin_tokens:
+        if len(token) < 5:
+            continue
+        rest = token[1:]
+        if re.search(r"[A-Z]", rest) and re.search(r"[a-z]", rest):
+            suspicious += 1
+            if not has_cjk and len(token) >= 10 and not re.search(r"\d", value):
+                return True
+    return has_cjk and suspicious >= 2
+
+
+def _trim_tail_after_last_cjk(value: str) -> str:
+    matches = list(re.finditer(r"[\u4e00-\u9fff]", value))
+    if not matches:
+        return value
+    last_cjk_end = matches[-1].end()
+    tail = value[last_cjk_end:].strip()
+    if not tail:
+        return value
+    if re.search(r"[\u4e00-\u9fff]", tail):
+        return value
+    return value[:last_cjk_end].strip(" .,:;()/[]{}-")
 
 
 def _image_to_string(

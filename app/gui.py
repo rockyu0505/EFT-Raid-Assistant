@@ -5,7 +5,7 @@ import threading
 import time
 from datetime import datetime
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -35,13 +36,11 @@ from PySide6.QtWidgets import (
 
 from app.capture import (
     Region,
-    capture_game_mode_region,
     capture_hover_item_name_region,
     capture_inventory_tab_region,
     capture_item_name_region,
     capture_timer_strip,
     debug_paths,
-    game_mode_debug_path,
     hover_search_debug_path,
     inventory_tab_debug_path,
     is_tarkov_foreground,
@@ -51,8 +50,6 @@ from app.capture import (
 from app.config import load_config, save_config
 from app.hotkeys import HotkeyManager
 from app.item_ocr import (
-    detect_game_mode,
-    detect_game_mode_crop,
     detect_inventory_screen,
     detect_inventory_tab_crop,
     refine_tooltip_name_crop,
@@ -80,11 +77,14 @@ class MainWindow(QMainWindow):
         self.hotkeys = HotkeyManager()
         self.reminders = ReminderManager()
         self.price_client = TarkovPriceClient()
-        self.current_price_game_mode = str(self.config.get("price_game_mode_default", "regular"))
+        self.current_price_game_mode = str(self.config.get("price_game_mode_default", "pve"))
         self.price_client.set_game_mode(self.current_price_game_mode)
         self.price_overlay = PriceOverlay()
         self._cached_item_region: Region | None = None
         self._item_region_calibrated = False
+        self._inventory_check_cache: (
+            tuple[float, tuple[int, int] | None, bool, list[str]] | None
+        ) = None
 
         self.watch_checks: dict[str, QCheckBox] = {}
         self.timer_fields: dict[str, QLineEdit] = {}
@@ -160,6 +160,17 @@ class MainWindow(QMainWindow):
 
         self.item_name_field = QLineEdit()
         self.item_name_field.setPlaceholderText("OCR 结果或手动输入物品名")
+        self.price_mode_combo = QComboBox()
+        self.price_mode_combo.addItem("PvE", "pve")
+        self.price_mode_combo.addItem("PvP", "regular")
+        mode_index = self.price_mode_combo.findData(self.current_price_game_mode)
+        self.price_mode_combo.setCurrentIndex(max(0, mode_index))
+        self.price_mode_combo.currentIndexChanged.connect(self._on_price_mode_changed)
+        price_mode_widget = QWidget()
+        price_mode_layout = QHBoxLayout(price_mode_widget)
+        price_mode_layout.setContentsMargins(0, 0, 0, 0)
+        price_mode_layout.addWidget(QLabel("价格模式"))
+        price_mode_layout.addWidget(self.price_mode_combo)
         self.item_price_label = QLabel("价格: -")
         self.item_price_label.setWordWrap(True)
 
@@ -171,7 +182,8 @@ class MainWindow(QMainWindow):
         self.open_item_crop_button.clicked.connect(self.open_item_crop)
 
         layout.addWidget(QLabel("物品名"), 0, 0)
-        layout.addWidget(self.item_name_field, 0, 1, 1, 4)
+        layout.addWidget(self.item_name_field, 0, 1, 1, 3)
+        layout.addWidget(price_mode_widget, 0, 4)
         layout.addWidget(self.item_price_label, 1, 0, 1, 5)
         layout.addWidget(self.item_capture_button, 2, 0)
         layout.addWidget(self.lookup_button, 2, 1)
@@ -253,6 +265,11 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.config.update(dialog.values())
+        if hasattr(self, "price_mode_combo"):
+            mode_index = self.price_mode_combo.findData(
+                str(self.config.get("price_game_mode_default", "pve"))
+            )
+            self.price_mode_combo.setCurrentIndex(max(0, mode_index))
         self._save_config()
         self._register_hotkeys()
         self._log("设置已更新。")
@@ -275,7 +292,22 @@ class MainWindow(QMainWindow):
         self.config["selected_traders"] = [
             trader for trader, check in self.watch_checks.items() if check.isChecked()
         ]
+        if hasattr(self, "price_mode_combo"):
+            self.config["price_game_mode_default"] = self._selected_price_game_mode()
         save_config(self.config)
+
+    def _selected_price_game_mode(self) -> str:
+        if not hasattr(self, "price_mode_combo"):
+            return str(self.config.get("price_game_mode_default", "pve"))
+        return str(self.price_mode_combo.currentData() or "pve")
+
+    def _on_price_mode_changed(self) -> None:
+        mode = self._selected_price_game_mode()
+        self.current_price_game_mode = self.price_client.set_game_mode(mode)
+        self.config["price_game_mode_default"] = self.current_price_game_mode
+        save_config(self.config)
+        self._update_cache_status_label()
+        self._log(f"Price mode set manually: {_game_mode_label(self.current_price_game_mode)}.")
 
     def _register_hotkeys(self) -> None:
         try:
@@ -390,14 +422,18 @@ class MainWindow(QMainWindow):
                 time.sleep(wait_ms / 1000)
 
         capture_region: Region | None = None
-        save_full_screenshot = True
+        save_full_screenshot = False
         try:
-            capture_region = self._cached_item_region
-            save_full_screenshot = not self._item_region_calibrated or capture_region is None
-            if capture_region is None:
-                capture_region = resolve_capture_region(capture_mode)
-                self._cached_item_region = capture_region
-                self._item_region_calibrated = True
+            previous_region = self._cached_item_region
+            capture_region = resolve_capture_region(capture_mode)
+            resolution_changed = _region_size_signature(previous_region) != _region_size_signature(
+                capture_region
+            )
+            save_full_screenshot = not self._item_region_calibrated or resolution_changed
+            self._cached_item_region = capture_region
+            self._item_region_calibrated = True
+            if resolution_changed:
+                self._clear_state_detection_cache()
 
             if item_mode == "Hover tooltip":
                 _, _, size, region_name = capture_hover_item_name_region(
@@ -425,20 +461,17 @@ class MainWindow(QMainWindow):
 
         self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
         self._log(f"Captured item region: {size[0]}x{size[1]}, source: {region_name}.")
-        self._detect_price_game_mode_from_capture(capture_region)
+        if save_full_screenshot:
+            self._log("Capture region calibrated; subsequent item lookups use ROI-only crops.")
+        else:
+            self._log("Using ROI-only capture: tooltip + inventory tab.")
 
         if bool(self.config.get("require_inventory_check", True)):
             try:
-                capture_inventory_tab_region(
+                detected, found = self._detect_inventory_from_capture(
                     capture_mode,
                     manual_size,
-                    tuple(self.config.get("inventory_tab_roi_base", [105, 0, 235, 48])),
                     capture_region,
-                )
-                detected, found, _ = detect_inventory_tab_crop(
-                    inventory_tab_debug_path(),
-                    str(self.config.get("tesseract_cmd", "")),
-                    str(self.config.get("item_ocr_language", "chi_sim+eng")),
                 )
             except OcrUnavailableError as exc:
                 self._log(str(exc))
@@ -449,7 +482,7 @@ class MainWindow(QMainWindow):
                 return
             if not detected:
                 self.item_price_label.setText("Price: inventory tab not detected")
-                self.price_overlay.hide()
+                self.price_overlay.clear_prices()
                 self._log(
                     "Skipped item lookup: top-left equipment tab was not detected. "
                     f"Detected keywords: {', '.join(found) or 'none'}"
@@ -518,7 +551,9 @@ class MainWindow(QMainWindow):
             self._log("已跳过查价：物品名为空。")
             return
 
-        mode = self.price_client.set_game_mode(self.current_price_game_mode)
+        mode = self.price_client.set_game_mode(self._selected_price_game_mode())
+        self.current_price_game_mode = mode
+        self.config["price_game_mode_default"] = mode
         label = _game_mode_label(mode)
         self.item_price_label.setText(f"价格: 正在查询 {label} / {name}...")
         self._log(f"正在从本地 {label} 缓存查价：{name}")
@@ -534,59 +569,59 @@ class MainWindow(QMainWindow):
         else:
             self.price_result_ready.emit(price, "")
 
-    def _detect_price_game_mode_from_capture(self, capture_region: Region | None = None) -> None:
-        fallback = str(self.config.get("price_game_mode_default", "regular"))
-        try:
-            if capture_region is not None:
-                capture_game_mode_region(
-                    str(self.config.get("capture_mode", "Auto")),
-                    self._manual_size(),
-                    tuple(self.config.get("game_mode_roi_base", [0, 1088, 360, 1152])),
-                    capture_region,
-                )
-                mode, raw_text = detect_game_mode_crop(
-                    game_mode_debug_path(),
-                    str(self.config.get("tesseract_cmd", "")),
-                    str(self.config.get("game_mode_ocr_language", "chi_sim+eng")),
-                )
-            else:
-                full_path, _ = debug_paths()
-                mode, raw_text = detect_game_mode(
-                    full_path,
-                    str(self.config.get("tesseract_cmd", "")),
-                    str(self.config.get("game_mode_ocr_language", "chi_sim+eng")),
-                    tuple(self.config.get("game_mode_roi_base", [0, 1088, 360, 1152])),
-                )
-        except Exception as exc:
-            mode = None
-            raw_text = ""
-            self._log(f"Price mode detection failed; using default {_game_mode_label(fallback)}. Reason: {exc}")
+    def _detect_inventory_from_capture(
+        self,
+        capture_mode: str,
+        manual_size: tuple[int, int] | None,
+        capture_region: Region | None,
+    ) -> tuple[bool, list[str]]:
+        signature = _region_size_signature(capture_region)
+        cached = self._inventory_check_cache
+        if cached is not None:
+            cached_at, cached_signature, cached_detected, cached_found = cached
+            if cached_signature == signature and self._state_detection_cache_is_fresh(cached_at):
+                self._log("Using cached inventory tab state.")
+                return cached_detected, cached_found
 
-        if mode is None:
-            mode = fallback
-            if raw_text:
-                self._log(
-                    f"PvE/PvP mark not detected; using default {_game_mode_label(mode)}. "
-                    f"OCR: {raw_text.strip() or 'empty'}"
-                )
-        else:
-            self._log(f"Detected price mode: {_game_mode_label(mode)}.")
-        self.current_price_game_mode = self.price_client.set_game_mode(mode)
+        capture_inventory_tab_region(
+            capture_mode,
+            manual_size,
+            tuple(self.config.get("inventory_tab_roi_base", [105, 0, 235, 48])),
+            capture_region,
+        )
+        detected, found, _ = detect_inventory_tab_crop(
+            inventory_tab_debug_path(),
+            str(self.config.get("tesseract_cmd", "")),
+            str(self.config.get("item_ocr_language", "chi_sim+eng")),
+        )
+        self._inventory_check_cache = (time.monotonic(), signature, detected, found)
+        return detected, found
+
+    def _state_detection_cache_is_fresh(self, cached_at: float) -> bool:
+        ttl = max(0.0, float(self.config.get("state_detection_cache_seconds", 2)))
+        return ttl > 0 and time.monotonic() - cached_at <= ttl
+
+    def _clear_state_detection_cache(self) -> None:
+        self._inventory_check_cache = None
 
     def _on_price_result_ready(self, price: object, error: str) -> None:
         if error:
             self.item_price_label.setText(f"价格: {error}")
             self._log(error)
-            self.price_overlay.hide()
+            self.price_overlay.clear_prices()
             return
 
         text = _format_price_compact(price)
         self.item_price_label.setText(text)
         self._log(text)
         if bool(self.config.get("price_overlay_enabled", True)):
-            self.price_overlay.show_price(text)
+            try:
+                seconds = int(self.config.get("price_overlay_seconds", 10))
+            except (TypeError, ValueError):
+                seconds = 10
+            self.price_overlay.show_price(text, seconds)
         else:
-            self.price_overlay.hide()
+            self.price_overlay.clear_prices()
 
     def schedule_selected(self) -> None:
         self._save_config()
@@ -681,7 +716,6 @@ class SettingsDialog(QDialog):
         self.roi_fields: list[QSpinBox] = []
         self.item_roi_fields: list[QSpinBox] = []
         self.inventory_tab_roi_fields: list[QSpinBox] = []
-        self.game_mode_roi_fields: list[QSpinBox] = []
         self.hover_offset_fields: list[QSpinBox] = []
         self.hover_size_fields: list[QSpinBox] = []
         self.hover_search_margin_fields: list[QSpinBox] = []
@@ -734,7 +768,6 @@ class SettingsDialog(QDialog):
         timer_roi = self._build_roi_fields(self.roi_fields)
         item_roi = self._build_roi_fields(self.item_roi_fields)
         inventory_tab_roi = self._build_roi_fields(self.inventory_tab_roi_fields)
-        game_mode_roi = self._build_roi_fields(self.game_mode_roi_fields)
         hover_offset = self._build_number_fields(self.hover_offset_fields, ["x", "y"], -2000, 2000)
         hover_size = self._build_number_fields(self.hover_size_fields, ["宽", "高"], 20, 2000)
         hover_search_margins = self._build_number_fields(
@@ -762,7 +795,6 @@ class SettingsDialog(QDialog):
         layout.addRow("悬停提示偏移", hover_offset)
         layout.addRow("悬停提示尺寸", hover_size)
         layout.addRow("装备页签 ROI", inventory_tab_roi)
-        layout.addRow("模式标记 ROI", game_mode_roi)
         layout.addRow("倒计时 ROI", timer_roi)
         layout.addRow("物品名 ROI", item_roi)
         return tab
@@ -775,13 +807,11 @@ class SettingsDialog(QDialog):
         self.schedule_hotkey = QLineEdit()
         self.tesseract_cmd = QLineEdit()
         self.item_ocr_language = QLineEdit()
-        self.game_mode_ocr_language = QLineEdit()
         layout.addRow("识别倒计时", self.capture_hotkey)
         layout.addRow("物品查价", self.item_lookup_hotkey)
         layout.addRow("设置提醒", self.schedule_hotkey)
         layout.addRow("Tesseract 路径", self.tesseract_cmd)
         layout.addRow("物品 OCR 语言", self.item_ocr_language)
-        layout.addRow("模式 OCR 语言", self.game_mode_ocr_language)
         return tab
 
     def _build_prices_tab(self) -> QWidget:
@@ -791,14 +821,17 @@ class SettingsDialog(QDialog):
         self.require_tarkov_foreground = QCheckBox("截图前要求 Tarkov 是前台窗口")
         self.require_inventory_check = QCheckBox("查价前先检测背包/详情界面")
         self.refresh_prices_on_startup = QCheckBox("启动时刷新全量物品价格缓存")
+        self.price_overlay_seconds = QSpinBox()
+        self.price_overlay_seconds.setRange(1, 120)
         self.price_game_mode_default = QComboBox()
-        self.price_game_mode_default.addItem("PvP", "regular")
         self.price_game_mode_default.addItem("PvE", "pve")
+        self.price_game_mode_default.addItem("PvP", "regular")
         layout.addRow(self.price_overlay_enabled)
         layout.addRow(self.require_tarkov_foreground)
         layout.addRow(self.require_inventory_check)
         layout.addRow(self.refresh_prices_on_startup)
-        layout.addRow("识别失败默认价格模式", self.price_game_mode_default)
+        layout.addRow("浮窗显示秒数", self.price_overlay_seconds)
+        layout.addRow("默认价格模式", self.price_game_mode_default)
         return tab
 
     def _build_reminders_tab(self) -> QWidget:
@@ -862,11 +895,6 @@ class SettingsDialog(QDialog):
         ):
             spin.setValue(int(value))
         for spin, value in zip(
-            self.game_mode_roi_fields,
-            self._config.get("game_mode_roi_base", [0, 1088, 360, 1152]),
-        ):
-            spin.setValue(int(value))
-        for spin, value in zip(
             self.hover_offset_fields,
             self._config.get("hover_tooltip_offset", [12, -60]),
         ):
@@ -892,9 +920,6 @@ class SettingsDialog(QDialog):
         self.schedule_hotkey.setText(str(self._config.get("schedule_hotkey", "F10")))
         self.tesseract_cmd.setText(str(self._config.get("tesseract_cmd", "")))
         self.item_ocr_language.setText(str(self._config.get("item_ocr_language", "chi_sim+eng")))
-        self.game_mode_ocr_language.setText(
-            str(self._config.get("game_mode_ocr_language", "chi_sim+eng"))
-        )
 
         self.price_overlay_enabled.setChecked(bool(self._config.get("price_overlay_enabled", True)))
         self.require_tarkov_foreground.setChecked(
@@ -904,8 +929,9 @@ class SettingsDialog(QDialog):
         self.refresh_prices_on_startup.setChecked(
             bool(self._config.get("refresh_prices_on_startup", True))
         )
+        self.price_overlay_seconds.setValue(int(self._config.get("price_overlay_seconds", 10)))
         game_mode_index = self.price_game_mode_default.findData(
-            str(self._config.get("price_game_mode_default", "regular"))
+            str(self._config.get("price_game_mode_default", "pve"))
         )
         self.price_game_mode_default.setCurrentIndex(max(0, game_mode_index))
 
@@ -927,19 +953,18 @@ class SettingsDialog(QDialog):
             "roi_base": [spin.value() for spin in self.roi_fields],
             "item_roi_base": [spin.value() for spin in self.item_roi_fields],
             "inventory_tab_roi_base": [spin.value() for spin in self.inventory_tab_roi_fields],
-            "game_mode_roi_base": [spin.value() for spin in self.game_mode_roi_fields],
             "hover_tooltip_offset": [spin.value() for spin in self.hover_offset_fields],
             "hover_tooltip_size": [spin.value() for spin in self.hover_size_fields],
             "hover_search_margins": [spin.value() for spin in self.hover_search_margin_fields],
             "hover_name_padding": [spin.value() for spin in self.hover_name_padding_fields],
             "hover_wait_ms": self.hover_wait_ms.value(),
             "item_ocr_language": self.item_ocr_language.text().strip() or "chi_sim+eng",
-            "game_mode_ocr_language": self.game_mode_ocr_language.text().strip() or "chi_sim+eng",
             "price_overlay_enabled": self.price_overlay_enabled.isChecked(),
+            "price_overlay_seconds": self.price_overlay_seconds.value(),
             "require_tarkov_foreground": self.require_tarkov_foreground.isChecked(),
             "require_inventory_check": self.require_inventory_check.isChecked(),
             "refresh_prices_on_startup": self.refresh_prices_on_startup.isChecked(),
-            "price_game_mode_default": self.price_game_mode_default.currentData() or "regular",
+            "price_game_mode_default": self.price_game_mode_default.currentData() or "pve",
             "lead_time_seconds": self.lead_seconds.value(),
             "repeat_alert_seconds": self.repeat_seconds.value(),
             "sound_enabled": self.sound_enabled.isChecked(),
@@ -1012,9 +1037,59 @@ def _game_mode_label(game_mode: str) -> str:
     return "PvE" if str(game_mode).strip().casefold() == "pve" else "PvP"
 
 
+def _region_size_signature(region: Region | None) -> tuple[int, int] | None:
+    if region is None:
+        return None
+    return region.width, region.height
+
+
 class PriceOverlay(QWidget):
     def __init__(self) -> None:
         super().__init__()
+        self._toasts: list[PriceToast] = []
+
+    def show_price(self, text: str, seconds: int = 10) -> None:
+        toast = PriceToast(text)
+        toast.closed_callback = lambda item=toast: self._forget_toast(item)
+        self._toasts.insert(0, toast)
+        while len(self._toasts) > 3:
+            old_toast = self._toasts.pop()
+            old_toast.close()
+        self._position_toasts()
+        toast.show_for(seconds)
+
+    def clear_prices(self) -> None:
+        toasts = list(self._toasts)
+        self._toasts.clear()
+        for toast in toasts:
+            toast.close()
+
+    def hide(self) -> None:
+        self.clear_prices()
+        super().hide()
+
+    def _forget_toast(self, toast: "PriceToast") -> None:
+        if toast in self._toasts:
+            self._toasts.remove(toast)
+
+    def _position_toasts(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        rect = screen.availableGeometry()
+        top = rect.top() + 80
+        for toast in self._toasts:
+            toast.adjustSize()
+            toast.move(rect.right() - toast.width() - 24, top)
+            top += toast.height() + 10
+
+
+class PriceToast(QWidget):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.closed_callback: object | None = None
+        self._closing = False
+        self._animation: QPropertyAnimation | None = None
         self.setWindowTitle("塔科夫物品价格")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -1022,14 +1097,17 @@ class PriceOverlay(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(1.0)
+        self.setGraphicsEffect(self._opacity)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        self.label = QLabel("Price: -")
-        self.label.setWordWrap(True)
-        self.label.setMinimumWidth(420)
-        self.label.setMaximumWidth(520)
-        self.label.setStyleSheet(
+        layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setMinimumWidth(420)
+        label.setMaximumWidth(520)
+        label.setStyleSheet(
             "QLabel {"
             "background: rgba(14, 16, 18, 220);"
             "color: #f4f0df;"
@@ -1039,14 +1117,30 @@ class PriceOverlay(QWidget):
             "font-size: 14px;"
             "}"
         )
-        layout.addWidget(self.label)
+        layout.addWidget(label)
 
-    def show_price(self, text: str) -> None:
-        self.label.setText(text)
-        self.adjustSize()
-        screen = QApplication.primaryScreen()
-        if screen is not None:
-            rect = screen.availableGeometry()
-            self.move(rect.right() - self.width() - 24, rect.top() + 80)
+    def show_for(self, seconds: int) -> None:
         self.show()
         self.raise_()
+        duration_ms = max(1, int(seconds)) * 1000
+        QTimer.singleShot(duration_ms, self.fade_out)
+
+    def fade_out(self, duration_ms: int = 450) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._animation = animation
+        animation.setDuration(max(80, duration_ms))
+        animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(self.close)
+        animation.start()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        callback = self.closed_callback
+        self.closed_callback = None
+        if callable(callback):
+            callback()
+        super().closeEvent(event)

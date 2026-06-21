@@ -339,8 +339,17 @@ class TarkovPriceClient:
         if target is None:
             best_alias = ""
             best_score = 0.0
+            compact_query = _compact_alias_text(normalized_query)
             for alias in self._aliases:
-                score = _match_score(normalized_query, alias)
+                compact_alias = _compact_alias_text(alias)
+                if (
+                    compact_alias
+                    and len(compact_alias) >= 4
+                    and compact_alias in compact_query
+                ):
+                    score = 0.96
+                else:
+                    score = _match_score(normalized_query, alias)
                 if _has_model_conflict(normalized_query, alias):
                     score -= 0.35
                 if score > best_score:
@@ -372,6 +381,10 @@ def _normalize(value: str) -> str:
     value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
     value = re.sub(r"(\d)(\d{2}x\d{2})", r"\1.\2", value)
     return " ".join(value.split())
+
+
+def _compact_alias_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", _normalize(value))
 
 
 def _merge_localized_items(
