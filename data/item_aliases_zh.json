@@ -1,0 +1,12 @@
+{
+  "_说明": "把中文游戏内名称或常用简称映射到 tarkov.dev 的 item id、normalizedName、英文全名或英文短名。以下是格式示例，请按需要替换为真实条目。",
+  "_示例_显卡": "graphics-card",
+  "_示例_LEDX": "ledx-skin-transilluminator",
+  "物品箱": "Item case",
+  "THICC 物品箱": "T H I C C item case",
+  "T H I C C 物品箱": "T H I C C item case",
+  "军用转速计": "Military gyrotachometer",
+  "军用转速仪": "Military gyrotachometer",
+  "BURR M4A1 5.56x45卡宾枪": "Colt M4A1 5.56x45 assault rifle",
+  "BURR M16A2 5.56x45突击步枪": "Colt M16A2 5.56x45 assault rifle"
+}
