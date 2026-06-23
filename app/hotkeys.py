@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Callable
+from contextlib import suppress
 
 
 class HotkeyManager:
@@ -33,13 +34,18 @@ class HotkeyManager:
         self._listener = keyboard.GlobalHotKeys(bindings)
         self._listener.start()
 
-    def unregister(self) -> None:
+    def unregister(self, join_timeout: float = 1.0) -> None:
         if self._listener is None:
             return
+        listener = self._listener
         try:
-            self._listener.stop()  # type: ignore[attr-defined]
+            listener.stop()  # type: ignore[attr-defined]
         finally:
             self._listener = None
+        join = getattr(listener, "join", None)
+        if callable(join):
+            with suppress(RuntimeError):
+                join(timeout=max(0.0, join_timeout))
 
 
 def normalize_hotkey(value: str) -> str:

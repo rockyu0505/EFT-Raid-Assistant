@@ -54,11 +54,19 @@ class ItemPrice:
     game_mode: str
     name: str
     short_name: str
+    zh_name: str
+    zh_short_name: str
     matched_name: str
     confidence: float
     last_low_price: int | None
     avg_24h_price: int | None
     base_price: int | None
+    width: int | None
+    height: int | None
+    slots: int | None
+    value_per_slot: int | None
+    item_types: tuple[str, ...]
+    is_firearm: bool
     best_vendor_name: str | None
     best_vendor_price: int | None
     best_vendor_currency: str | None

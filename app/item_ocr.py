@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,8 @@ BAD_CAPTURE_KEYWORDS = {
     "EscapeFromTarkov",
 }
 
+_RAPIDOCR_ENGINES: dict[str, object] = {}
+
 
 def detect_bad_capture_overlay(
     screenshot_path: Path,
@@ -125,15 +128,26 @@ def refine_tooltip_name_crop(
     tesseract_cmd: str = "",
     language: str = "chi_sim+eng",
     padding: tuple[int, int, int, int] = (10, 8, 10, 8),
+    cursor_anchor: tuple[int, int] | None = None,
+    cursor_bottom_gap: int = 20,
+    cursor_gap_tolerance: int = 36,
 ) -> tuple[bool, list[str]]:
     """Find the tooltip bounds inside the hover search crop and save a tighter name crop."""
     image = Image.open(search_path).convert("RGB")
-    border_box = _find_tooltip_border_box(image)
+    border_box = _find_tooltip_border_box(
+        image,
+        cursor_anchor=cursor_anchor,
+        cursor_bottom_gap=cursor_bottom_gap,
+        cursor_gap_tolerance=cursor_gap_tolerance,
+    )
     if border_box is not None:
         crop_box = _inset_box(border_box, 2, image.size)
         image.crop(crop_box).save(output_path)
         x0, y0, x1, y1 = border_box
-        return True, [f"border:{x1 - x0}x{y1 - y0}"]
+        details = [f"border:{x1 - x0}x{y1 - y0}"]
+        if cursor_anchor is not None:
+            details.append(f"cursor-gap:{cursor_anchor[1] - y1}/{cursor_bottom_gap}")
+        return True, details
 
     try:
         import pytesseract  # type: ignore
@@ -164,7 +178,12 @@ def refine_tooltip_name_crop(
     return True, [str(box["text"]) for box in cluster]
 
 
-def _find_tooltip_border_box(image: Image.Image) -> tuple[int, int, int, int] | None:
+def _find_tooltip_border_box(
+    image: Image.Image,
+    cursor_anchor: tuple[int, int] | None = None,
+    cursor_bottom_gap: int = 20,
+    cursor_gap_tolerance: int = 36,
+) -> tuple[int, int, int, int] | None:
     gray = ImageOps.grayscale(image)
     mask = _tooltip_border_mask(gray)
     runs = _horizontal_border_runs(mask, min_run=24)
@@ -208,10 +227,14 @@ def _find_tooltip_border_box(image: Image.Image) -> tuple[int, int, int, int] | 
                 continue
             if left_score + right_score < 0.08:
                 continue
-            if dark_ratio < 0.42:
+            if dark_ratio < 0.70:
                 continue
             if bright_ratio < 0.055:
                 continue
+            if cursor_anchor is not None:
+                gap = cursor_anchor[1] - bottom_y
+                if gap < -6 or gap > cursor_bottom_gap + cursor_gap_tolerance:
+                    continue
 
             score = (
                 (top_score + bottom_score) * 80
@@ -221,11 +244,47 @@ def _find_tooltip_border_box(image: Image.Image) -> tuple[int, int, int, int] | 
                 + box_width * 0.05
                 + box_height * 0.25
             )
+            if cursor_anchor is not None:
+                gap = cursor_anchor[1] - bottom_y
+                gap_error = abs(gap - cursor_bottom_gap)
+                gap_score = max(0.0, 1.0 - gap_error / max(1, cursor_gap_tolerance))
+                score += gap_score * 130
             candidates.append((score, (x0, top_y, x1, bottom_y)))
 
     if not candidates:
         return None
+    if cursor_anchor is not None:
+        candidates = _penalize_parent_tooltip_boxes(candidates)
     return max(candidates, key=lambda value: value[0])[1]
+
+
+def _penalize_parent_tooltip_boxes(
+    candidates: list[tuple[float, tuple[int, int, int, int]]],
+) -> list[tuple[float, tuple[int, int, int, int]]]:
+    """Prefer the inner tooltip when inventory label rows form a larger fake box."""
+    adjusted: list[tuple[float, tuple[int, int, int, int]]] = []
+    for score, box in candidates:
+        x0, y0, x1, y1 = box
+        width = x1 - x0
+        height = y1 - y0
+        parent_penalty = 0.0
+        for _, other in candidates:
+            if other == box:
+                continue
+            ox0, oy0, ox1, oy1 = other
+            other_height = oy1 - oy0
+            if other_height + 12 >= height:
+                continue
+            if abs(oy1 - y1) > 4:
+                continue
+            overlap = min(x1, ox1) - max(x0, ox0)
+            if overlap <= 0:
+                continue
+            if overlap / max(1, min(width, ox1 - ox0)) >= 0.70:
+                parent_penalty = 95.0
+                break
+        adjusted.append((score - parent_penalty, box))
+    return adjusted
 
 
 def _tooltip_border_mask(gray: Image.Image) -> list[bytearray]:
@@ -443,8 +502,38 @@ def run_item_name_ocr(
     crop_path: Path,
     tesseract_cmd: str = "",
     language: str = "chi_sim+eng",
+    engine: str = "tesseract",
 ) -> ParsedItemName:
     """OCR a UI crop and return likely item-name candidates."""
+    engine_key = engine.strip().casefold()
+    if engine_key in {
+        "rapidocr",
+        "rapidocr_v4",
+        "rapidocr-v4",
+        "rapidocr_v5",
+        "rapidocr-v5",
+        "rapidocr+tesseract",
+        "rapidocr_with_tesseract",
+    }:
+        rapid_model = "v5" if engine_key in {"rapidocr_v5", "rapidocr-v5"} else "v4"
+        rapid_result = _run_rapidocr_item_name(crop_path, rapid_model)
+        if engine_key in {"rapidocr", "rapidocr_v4", "rapidocr-v4", "rapidocr_v5", "rapidocr-v5"}:
+            return rapid_result
+        tesseract_result = _run_tesseract_item_name(crop_path, tesseract_cmd, language)
+        return ParsedItemName(
+            raw_text=f"RapidOCR:\n{rapid_result.raw_text}\n\nTesseract:\n{tesseract_result.raw_text}",
+            candidates=_merge_candidates(rapid_result.candidates, tesseract_result.candidates),
+            variant_name=f"{rapid_result.variant_name}+{tesseract_result.variant_name}",
+        )
+
+    return _run_tesseract_item_name(crop_path, tesseract_cmd, language)
+
+
+def _run_tesseract_item_name(
+    crop_path: Path,
+    tesseract_cmd: str = "",
+    language: str = "chi_sim+eng",
+) -> ParsedItemName:
     try:
         import pytesseract  # type: ignore
     except ImportError as exc:
@@ -461,10 +550,171 @@ def run_item_name_ocr(
         candidates = parse_item_name_candidates(text)
         if _score_candidates(candidates) > _score_candidates(best.candidates):
             best = ParsedItemName(raw_text=text, candidates=candidates, variant_name=variant.name)
-        if candidates:
-            break
 
     return best
+
+
+def _merge_candidates(*candidate_groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for candidates in candidate_groups:
+        for candidate in candidates:
+            key = _normalize_candidate_key(candidate)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(candidate)
+    return merged[:8]
+
+
+def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v4") -> ParsedItemName:
+    try:
+        import numpy as np  # type: ignore
+        from rapidocr import OCRVersion, RapidOCR  # type: ignore
+    except ImportError as exc:
+        return ParsedItemName(
+            raw_text=f"RapidOCR unavailable: {exc}",
+            candidates=[],
+            variant_name="rapidocr-unavailable",
+        )
+
+    engine_key = "v5" if model_version == "v5" else "v4"
+    if engine_key not in _RAPIDOCR_ENGINES:
+        started = time.perf_counter()
+        params: dict[str, Any] | None = None
+        if engine_key == "v5":
+            params = {"Rec.ocr_version": OCRVersion.PPOCRV5}
+        _RAPIDOCR_ENGINES[engine_key] = RapidOCR(params=params)
+        init_ms = round((time.perf_counter() - started) * 1000)
+    else:
+        init_ms = 0
+    rapidocr_engine = _RAPIDOCR_ENGINES[engine_key]
+
+    image = Image.open(crop_path).convert("RGB")
+    line_images = _split_text_line_images(image)
+    variants = _build_item_variants(image)
+    line_variants = [
+        (f"lines:{index + 1}", line_image)
+        for index, line_image in enumerate(line_images)
+        if line_image.width > 0 and line_image.height > 0
+    ]
+    variant_images = [(variant.name, variant.image) for variant in variants]
+    if len(line_variants) > 1:
+        variant_images.insert(0, ("line-split", line_variants))
+    best = ParsedItemName(raw_text="", candidates=[], variant_name="rapidocr-none")
+    best_score = 0
+    raw_parts: list[str] = []
+
+    for variant_name, variant_payload in variant_images:
+        started = time.perf_counter()
+        if isinstance(variant_payload, list):
+            texts: list[str] = []
+            scores: list[float] = []
+            for _, line_image in variant_payload:
+                result = rapidocr_engine(
+                    np.array(line_image.convert("RGB")),
+                    use_det=False,
+                    use_cls=False,
+                    use_rec=True,
+                )
+                texts.extend(
+                    str(text)
+                    for text in (getattr(result, "txts", None) or [])
+                    if str(text).strip()
+                )
+                scores.extend(float(score) for score in (getattr(result, "scores", None) or []))
+        else:
+            result = rapidocr_engine(
+                np.array(variant_payload.convert("RGB")),
+                use_det=False,
+                use_cls=False,
+                use_rec=True,
+            )
+            texts = [
+                str(text) for text in (getattr(result, "txts", None) or []) if str(text).strip()
+            ]
+            scores = [float(score) for score in (getattr(result, "scores", None) or [])]
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        text = "\n".join(texts)
+        raw_parts.append(f"{variant_name}:{elapsed_ms}ms:{text}")
+        candidates = parse_item_name_candidates(text)
+        score = _score_candidates(candidates)
+        if scores:
+            score += round(max(scores) * 10)
+        if score > best_score:
+            best_score = score
+            best = ParsedItemName(
+                raw_text=text,
+                candidates=candidates,
+                variant_name=f"rapidocr-{engine_key}:{variant_name}:{elapsed_ms}ms:init{init_ms}ms",
+            )
+
+    if best.candidates:
+        return best
+    return ParsedItemName(
+        raw_text="\n".join(raw_parts),
+        candidates=[],
+        variant_name=f"rapidocr-{engine_key}:none:init{init_ms}ms",
+    )
+
+
+def _split_text_line_images(image: Image.Image) -> list[Image.Image]:
+    gray = ImageOps.grayscale(image)
+    width, height = gray.size
+    if width < 20 or height < 20:
+        return [image]
+
+    pixels = gray.load()
+    threshold = 125
+    min_hits = max(3, round(width * 0.012))
+    rows: list[int] = []
+    for y in range(height):
+        hits = 0
+        for x in range(width):
+            if pixels[x, y] >= threshold:
+                hits += 1
+        if hits >= min_hits:
+            rows.append(y)
+    if not rows:
+        return [image]
+
+    groups: list[tuple[int, int]] = []
+    start = previous = rows[0]
+    max_gap = max(2, round(height * 0.045))
+    for y in rows[1:]:
+        if y - previous <= max_gap:
+            previous = y
+            continue
+        groups.append((start, previous))
+        start = previous = y
+    groups.append((start, previous))
+
+    min_height = max(5, round(height * 0.11))
+    text_groups = [(top, bottom) for top, bottom in groups if bottom - top + 1 >= min_height]
+    if len(text_groups) < 2:
+        return [image]
+
+    padding = max(3, round(height * 0.08))
+    line_images: list[Image.Image] = []
+    for top, bottom in text_groups:
+        if bottom >= height - 2:
+            continue
+        y0 = max(0, top - padding)
+        y1 = min(height, bottom + padding + 1)
+        bright_columns: list[int] = []
+        for x in range(width):
+            for y in range(max(0, top), min(height, bottom + 1)):
+                if pixels[x, y] >= threshold:
+                    bright_columns.append(x)
+                    break
+        if not bright_columns:
+            continue
+        x0 = max(0, min(bright_columns) - padding)
+        x1 = min(width, max(bright_columns) + padding + 1)
+        if x1 - x0 < max(12, round(width * 0.05)):
+            continue
+        line_images.append(image.crop((x0, y0, x1, y1)))
+    return line_images
 
 
 def detect_inventory_screen(
@@ -868,7 +1118,18 @@ def _is_tesseract_language_error(exc: Exception) -> bool:
 def _score_candidates(candidates: list[str]) -> int:
     if not candidates:
         return 0
-    return len(candidates) * 10 + min(len(candidates[0]), 40)
+    first = candidates[0]
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", first))
+    latin_count = len(re.findall(r"[A-Za-z]", first))
+    score = len(candidates) * 10 + min(len(first), 40)
+    if cjk_count:
+        score += 18 + cjk_count * 8
+    if not cjk_count and latin_count:
+        tokens = re.findall(r"[A-Za-z]+", first)
+        uppercase_tokens = [token for token in tokens if token.isupper() and not re.search(r"\d", token)]
+        if len(uppercase_tokens) >= 2 and len(first) <= 18:
+            score -= 14
+    return score
 
 
 def _build_item_variants(image: Image.Image) -> list[OcrVariant]:

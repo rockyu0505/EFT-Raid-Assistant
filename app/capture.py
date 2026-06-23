@@ -113,6 +113,20 @@ def scale_box(
     )
 
 
+def scale_metric(
+    value: int,
+    current_height: int,
+    reference_height: int,
+    minimum: int,
+) -> int:
+    """Scale a vertical UI pixel metric to the current capture height."""
+    if value <= 0:
+        return minimum
+    if current_height <= 0 or reference_height <= 0:
+        return max(minimum, value)
+    return max(minimum, round(value * current_height / reference_height))
+
+
 def capture_timer_strip(
     capture_mode: str,
     manual_size: tuple[int, int] | None,
@@ -170,7 +184,7 @@ def capture_hover_item_name_region(
     search_margins: tuple[int, int, int, int] | None = DEFAULT_HOVER_SEARCH_MARGINS,
     region: Region | None = None,
     save_full_screenshot: bool = True,
-) -> tuple[Image.Image, Image.Image, tuple[int, int], str]:
+) -> tuple[Image.Image, Image.Image, tuple[int, int], str, tuple[int, int]]:
     """Capture the tooltip search area near the current mouse cursor."""
     DEBUG_DIR.mkdir(exist_ok=True)
     region = region or _resolve_region(capture_mode)
@@ -189,6 +203,7 @@ def capture_hover_item_name_region(
         x1 = x0 + crop_size[0]
         y1 = y0 + crop_size[1]
     crop_box = _fit_crop_box((x0, y0, x1, y1), (region.width, region.height))
+    cursor_anchor = (rel_x - crop_box[0], rel_y - crop_box[1])
     crop_region = Region(
         left=region.left + crop_box[0],
         top=region.top + crop_box[1],
@@ -205,7 +220,7 @@ def capture_hover_item_name_region(
         image = crop
     crop.save(ITEM_HOVER_SEARCH_PATH)
     crop.save(ITEM_NAME_PATH)
-    return image, crop, (region.width, region.height), crop_region.name
+    return image, crop, (region.width, region.height), crop_region.name, cursor_anchor
 
 
 def capture_inventory_tab_region(

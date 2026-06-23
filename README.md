@@ -1,15 +1,134 @@
-# Tarkov Raid Assistant
+# EFT Raid Assistant
 
-MVP Windows desktop app for Escape from Tarkov trader restock reminders and item price lookup.
+一个面向中文玩家的 Escape from Tarkov 局内辅助工具。它专注于截图、OCR、本地查价和提醒，不会点击鼠标、移动鼠标、读取游戏内存、注入游戏进程或自动化游戏操作。
 
-The app does not automate gameplay. It only captures a screenshot when you ask it to, OCRs visible text, lets you manually correct OCR output, schedules local popup/sound reminders, and looks up item prices from the public tarkov.dev GraphQL API.
+当前版本：`0.4.2`
 
-## Setup
+## 功能概览
 
-### Conda Setup
+- 局内物品查价：鼠标悬停物品，等待 Tarkov 显示名称 tooltip 后按热键查询价格。
+- 中文优先显示：默认显示官方中文物品名，可在设置中切换为英文。
+- PvE / PvP 手动选择：默认 PvE，避免额外 OCR 判断和误判。
+- 价格缓存：启动时或手动刷新 tarkov.dev 数据，局内查询走本地缓存。
+- 价值颜色：按单格价值显示白、绿、蓝、紫、金、红和彩色高价值提示。
+- 枪械特殊标记：枪械用迷彩绿色提示，不按单格价值误导评估。
+- 右上角浮窗：最多保留三条查价结果，定时淡出。
+- 商人补货提醒：保留 OCR 倒计时和本地提醒功能，仍属于实验功能。
 
-1. Install Miniconda or Anaconda on Windows 11.
-2. Open Anaconda Prompt, then run:
+## 下载与运行
+
+从 GitHub Release 下载压缩包后：
+
+1. 完整解压整个 zip。
+2. 进入解压后的文件夹。
+3. 双击运行 `EFT Raid Assistant.exe`。
+
+不要只复制或单独发送 exe。程序运行需要旁边的 `_internal`、`cache`、`data`、`assets` 等目录。
+
+如果 Windows SmartScreen 提示未知发布者，这是未签名个人项目的正常现象。确认来源可信后，可以点击“更多信息”并选择“仍要运行”。
+
+## 默认热键
+
+| 功能 | 默认热键 |
+| --- | --- |
+| 局内物品查价 | `Q` |
+| 识别商人倒计时 | `F8` |
+| 设置选中商人提醒 | `F10` |
+
+所有热键都可以在 Settings 中修改。
+
+## 局内查价流程
+
+1. 打开 Tarkov 装备、背包或容器界面。
+2. 把鼠标悬停到要查询的物品上。
+3. 等游戏显示完整物品名称 tooltip。
+4. 保持 Tarkov 为前台窗口，按 `Q`。
+5. 程序会截取鼠标附近的小区域，定位 tooltip，OCR 物品名，并查询本地价格缓存。
+6. 结果会显示在主界面日志和右上角浮窗中。
+
+如果 OCR 结果明显不对，可以在主界面的手动输入框中输入物品名重新查询。
+
+## 价格和颜色
+
+普通物品默认按单格价值分级：
+
+| 单格价值 | 颜色 |
+| --- | --- |
+| 0 - 1 万 | 白色 |
+| 1 - 2 万 | 绿色 |
+| 2 - 5 万 | 蓝色 |
+| 5 - 10 万 | 紫色 |
+| 10 - 25 万 | 金色 |
+| 25 - 50 万 | 红色 |
+| 50 万以上 | 彩色渐变 |
+
+枪械价值通常来自配件，而不是下机匣本身的单格价值，所以枪械使用独立的迷彩绿色提示，由玩家自行评估配件价值。
+
+## OCR 引擎
+
+当前默认使用 RapidOCR。设置中可以选择：
+
+- RapidOCR only：默认推荐，速度快。
+- RapidOCR v5 only：实验选项，使用 `ch_PP-OCRv5_rec_mobile`，中文识别略有提升。
+- RapidOCR + Tesseract fallback：备用组合，速度较慢。
+- Tesseract only：旧方案，主要用于对照和调试。
+
+0.4.2 还加入了简繁字符归一化，用于处理 OCR 将 `猫` 识别为 `貓`、`黄` 识别为 `黃` 等情况。
+
+## 数据来源
+
+物品价格和基础数据来自公开的 tarkov.dev GraphQL API。
+
+本地缓存文件位于：
+
+```text
+cache/tarkov_items_regular.json
+cache/tarkov_items_pve.json
+```
+
+如果价格异常或数据过期，可以在 Data 面板中刷新价格缓存。
+
+## 日志与调试
+
+主界面只显示关键结果，例如：
+
+- 查价成功
+- 没有匹配物品
+- Tarkov 不是前台窗口
+- 当前界面不适合查价
+
+完整运行日志保存在：
+
+```text
+debug/latest_run.log
+```
+
+最近一次截图和 OCR 调试图保存在 `debug` 目录。反馈 OCR 问题时，建议同时提供 `debug` 目录和 `debug/latest_run.log`。
+
+## 安全边界
+
+本工具只做以下事情：
+
+- 截图
+- OCR 识别
+- 查询本地价格缓存
+- 显示浮窗
+- 本地提醒
+
+本工具不会：
+
+- 自动点击或移动鼠标
+- 自动购买、出售或整理物品
+- 读取游戏内存
+- 注入游戏进程
+- 修改游戏文件
+- 与反作弊做任何交互
+
+## 从源码运行
+
+推荐 Windows 11 + Python 3.11。
+
+### Conda
 
 ```powershell
 cd "C:\Users\zetia\Documents\EFT Reminder"
@@ -18,192 +137,65 @@ conda activate eft-raid-assistant
 python main.py
 ```
 
-If you later change `environment.yml`, update the existing environment:
+如果环境已经存在：
 
 ```powershell
 conda env update -f environment.yml --prune
+conda activate eft-raid-assistant
+python main.py
 ```
 
-### Python venv Setup
-
-1. Install Python 3.11 or newer on Windows 11.
-2. Create and activate a virtual environment:
+### venv
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-3. Install dependencies:
-
-```powershell
 pip install -r requirements.txt
-```
-
-4. Install Tesseract OCR for Windows:
-
-Download an installer from the UB Mannheim builds:
-
-https://github.com/UB-Mannheim/tesseract/wiki
-
-The usual executable path is:
-
-```text
-C:\Program Files\Tesseract-OCR\tesseract.exe
-```
-
-Paste that path into the app's `Tesseract path` field if OCR fails to find it automatically.
-
-## Run
-
-```powershell
 python main.py
 ```
 
-The main window keeps daily controls visible. Configuration lives under
-`设置 > 打开设置`.
+源码运行 Tesseract fallback 时需要本机安装 Tesseract OCR。Release 版本已经内置相关运行文件。
 
-## Basic Usage
+## 打包
 
-### Trader Reminders
-
-1. Open the Tarkov trader screen.
-2. Use borderless windowed mode when possible. Exclusive fullscreen can make screenshots, hotkeys, or popups unreliable.
-3. Press `F8` or click `识别倒计时`.
-4. Check the editable `Countdown / manual fix` fields. OCR is only a starting point in this MVP.
-5. Select the traders you want to watch.
-6. Press `F10` or click `设置选中提醒`.
-7. Leave the app running. It checks reminders once per second.
-
-### Item Price Lookup
-
-1. Move the mouse onto an item and wait for Tarkov to show the full hover name near the cursor.
-2. After the name box is visible, press the item price hotkey, default `F9`, while Tarkov is still the foreground window.
-3. The app first checks that the current foreground window looks like Tarkov. If another app, Alt-Tab, or the assistant window is in front, it cancels without taking a screenshot.
-4. The app immediately captures a larger tooltip search area near the cursor, locates the tooltip border, crops the final name box, OCRs the item name, then looks it up from the local price cache.
-5. If OCR is wrong, correct the editable item name field manually and click `查询手动名称`.
-6. If enabled in settings, the app OCR-checks that an inventory/details UI is open.
-7. Keep `显示置顶价格浮窗` enabled to show the result in a small overlay near the top-right of the primary monitor.
-
-For normal use, prefer the hotkey while the game remains focused. Clicking `识别物品并查价` in the app is mainly for debugging; if your mouse is on the app window, hover recognition will capture the app instead of the game.
-
-The hover tooltip crop can be tuned in `设置 > 打开设置 > 截图`:
-
-- `物品识别方式`: default is `鼠标悬停提示`; `固定物品名 ROI` keeps the older fixed-crop behavior.
-- `悬停等待毫秒`: optional extra wait before capture. Keep it at `0` if you press the hotkey after the game name box is already visible.
-- `悬停搜索边距`: large search area around the cursor, ordered left/right/up/down. The default searches farther upward so long hover names and container names are less likely to be clipped.
-- `名称框留白`: padding added after OCR finds the tooltip text bounds.
-- `悬停提示偏移`: crop start offset from the cursor.
-- `悬停提示尺寸`: crop width and height.
-- `装备页签 ROI`: crop of the top-left active `装备` tab. If this crop contains the active equipment tab, the app treats the inventory page as open.
-
-## Chinese Item Names
-
-tarkov.dev currently returns item IDs, English names, normalized names, and prices, but not Chinese item names. For Chinese game UI OCR, this app uses a local alias table:
-
-```text
-data/item_aliases_zh.json
-```
-
-Each real entry maps a Chinese in-game name or common nickname to a tarkov.dev `id`, `normalizedName`, English full name, or English short name:
-
-```json
-{
-  "显卡": "graphics-card",
-  "LEDX皮肤透照仪": "ledx-skin-transilluminator"
-}
-```
-
-After editing the file, use `数据 > 重新加载中文别名` without restarting the app. Use `数据 > 打开中文别名文件` to open the file from the app.
-
-For Chinese OCR, set `物品 OCR 语言` to `chi_sim+eng` in settings. If Tesseract does not have the Chinese traineddata installed, the app falls back to the default language, but Chinese item recognition will be much worse. In that case, install or copy `chi_sim.traineddata` into your Tesseract `tessdata` folder.
-
-For the conda environment, both Chinese and English traineddata should be in:
-
-```text
-%CONDA_PREFIX%\Library\share\tessdata
-```
-
-Check what is installed:
+项目使用 PyInstaller：
 
 ```powershell
-dir "%CONDA_PREFIX%\Library\share\tessdata\*.traineddata"
+conda activate eft-raid-assistant
+pyinstaller --clean --noconfirm "EFT Raid Assistant.spec"
 ```
 
-If `eng.traineddata` is missing, download it:
-
-```powershell
-curl.exe -L "https://github.com/tesseract-ocr/tessdata_fast/raw/main/eng.traineddata" -o "%CONDA_PREFIX%\Library\share\tessdata\eng.traineddata"
-```
-
-Then verify:
-
-```powershell
-set TESSDATA_PREFIX=%CONDA_PREFIX%\Library\share\tessdata
-tesseract --list-langs
-```
-
-## Price Cache
-
-On startup, the app requests the full item list from the public tarkov.dev GraphQL API for both PvP and PvE prices and stores them in:
+构建产物位于：
 
 ```text
-cache/tarkov_items_regular.json
-cache/tarkov_items_pve.json
+dist/EFT Raid Assistant/
 ```
 
-Raid-time lookup uses the local cache instead of making a network request per item. The app OCRs the bottom-left game mode marker (`PvE`/`PvP`) from the full screenshot before lookup and chooses the matching cache. Use
-`数据 > 刷新价格缓存` to refresh it manually.
+发布时将整个目录压缩为 zip，而不是只分发 exe。
 
-If the bottom-left mode marker is not detected, the fallback mode comes from `设置 > 打开设置 > 价格 > 识别失败默认价格模式`.
+## 常见问题
 
-## Debug Files
+### 按热键没有反应
 
-After every capture, the app writes:
+确认程序正在运行，热键没有被其他软件占用。可以到 Settings 中换成其他按键。
 
-- `debug/last_full_screenshot.png`
-- `debug/last_timer_strip.png`
-- `debug/last_item_hover_search.png`
-- `debug/last_item_name.png`
-- `debug/last_inventory_tab.png`
-- `debug/last_game_mode.png`
+### 查价提示不是 Tarkov 前台窗口
 
-If OCR is shifted or wrong, open the debug crop and adjust the ROI base fields:
+重新点击 Tarkov，让游戏成为前台窗口后再按查价热键。
 
-```text
-x0, y0, x1, y1
-default: 0, 150, 1500, 240
-```
+### OCR 识别错物品
 
-The ROI is expressed in base coordinates for a `2048x1152` reference image and is scaled to the captured or manually overridden resolution.
+等待 tooltip 完整显示后再按热键。若仍然错误，请保留 `debug` 目录和 `debug/latest_run.log` 用于排查。
 
-The fixed item price ROI uses the same base-coordinate system:
+### 价格模式不对
 
-```text
-default: 670, 120, 1420, 260
-```
+在主界面手动选择 PvE 或 PvP。当前版本默认 PvE，不再依赖 OCR 自动判断模式。
 
-Open `debug/last_item_hover_search.png` after a lookup to confirm the broad search area contains the tooltip. Then check `debug/last_item_name.png`; it should contain only the dark tooltip name box. The app first looks for the tooltip's light rectangular border, then falls back to OCR text clustering if the border cannot be found. Tune the hover search margins or name-box padding if either image is off.
+### exe 无法单独运行
 
-If item lookup says the equipment page was not detected, open `debug/last_inventory_tab.png`. It should contain the active top-left `装备` tab. If it is shifted, adjust `装备页签 ROI` in settings.
+这是正常的。PyInstaller 包需要 exe 和 `_internal` 等目录一起存在。
 
-If item lookup uses the wrong PvE/PvP price mode, open `debug/last_game_mode.png`. It should contain the bottom-left version strip with the `PvE` or `PvP` marker. If it is shifted, adjust `模式标记 ROI` in settings.
-
-## Troubleshooting
-
-- OCR detects wrong times: correct the timer fields manually, then schedule. Try changing the ROI fields and capture again.
-- Debug crop is shifted: use the manual resolution override or adjust ROI values.
-- Hotkey does not work: open `设置 > 打开设置`, try a simpler hotkey like `F8`, save, and make sure the app has permission to listen for global hotkeys.
-- Chinese item lookup fails: add or correct the item in `data/item_aliases_zh.json`, then use `数据 > 重新加载中文别名`.
-- Price lookup fails: use `数据 > 刷新价格缓存` while online, then try a manual item name.
-- Inventory detection is too strict: first tune `装备页签 ROI`; if needed, open `设置 > 打开设置 > 价格` and disable `查价前先检测背包/详情界面`.
-- Price lookup cancels before screenshot: Tarkov was not the foreground window. Click back into Tarkov, wait for the hover name box, then press the hotkey. If your Tarkov window title or process is not detected correctly, open `设置 > 打开设置 > 价格` and disable `截图前要求 Tarkov 是前台窗口`.
-- Wrong item matched: correct the `Item name` manually, or include more of the detail-window item title in the item ROI.
-- Fullscreen screenshot is black: use borderless windowed mode.
-- Multi-monitor capture chooses the wrong screen: choose `Primary monitor` or move the cursor to the correct monitor and choose `Monitor under cursor`.
-- Tarkov window mode does not work: install `pywin32`, or use `Auto`, `Monitor under cursor`, or `Primary monitor`.
-
-## Project Layout
+## 项目结构
 
 ```text
 main.py
@@ -211,16 +203,24 @@ app/
   gui.py
   capture.py
   item_ocr.py
-  ocr.py
   prices.py
   reminders.py
   hotkeys.py
   config.py
   models.py
+data/
 cache/
 debug/
 assets/
-environment.yml
-requirements.txt
+scripts/
+EFT Raid Assistant.spec
 README.md
+CHANGELOG.md
+VERSION
 ```
+
+## License
+
+本项目代码使用 MIT License，详见 [LICENSE](LICENSE)。
+
+第三方依赖、OCR 模型、Qt/PySide6 运行库、Tesseract 运行库和 tarkov.dev 数据源仍遵循各自的上游许可证或服务条款，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

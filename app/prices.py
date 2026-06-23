@@ -19,6 +19,34 @@ LEGACY_ITEM_CACHE_PATH = CACHE_DIR / "tarkov_items.json"
 DATA_DIR = APP_DIR / "data"
 CHINESE_ALIASES_PATH = DATA_DIR / "item_aliases_zh.json"
 GAME_MODES = ("regular", "pve")
+_CJK_VARIANT_TRANSLATION = str.maketrans(
+    {
+        "\u8c93": "\u732b",
+        "\u9ec3": "\u9ec4",
+        "\u88fd": "\u5236",
+        "\u5c4d": "\u5c38",
+        "\u639b": "\u6302",
+        "\u9ce5": "\u9e1f",
+        "\u99ac": "\u9a6c",
+        "\u9f8d": "\u9f99",
+        "\u9f9c": "\u9f9f",
+        "\u9f52": "\u9f7f",
+        "\u8eca": "\u8f66",
+        "\u96fb": "\u7535",
+        "\u5f48": "\u5f39",
+        "\u69cd": "\u67aa",
+        "\u93e1": "\u955c",
+        "\u982d": "\u5934",
+        "\u8b77": "\u62a4",
+        "\u9ad4": "\u4f53",
+        "\u7d05": "\u7ea2",
+        "\u85cd": "\u84dd",
+        "\u7da0": "\u7eff",
+        "\u88dd": "\u88c5",
+        "\u5099": "\u5907",
+        "\u8907": "\u590d",
+    }
+)
 
 ITEMS_QUERY = """
 query ItemPrices($gameMode: GameMode, $lang: LanguageCode) {
@@ -27,6 +55,9 @@ query ItemPrices($gameMode: GameMode, $lang: LanguageCode) {
     name
     normalizedName
     shortName
+    width
+    height
+    types
     lastLowPrice
     avg24hPrice
     basePrice
@@ -66,6 +97,9 @@ class TarkovPriceClient:
             mode: {} for mode in GAME_MODES
         }
         self._name_lookup_by_mode: dict[str, dict[str, int]] = {mode: {} for mode in GAME_MODES}
+        self._full_name_lookup_by_mode: dict[str, dict[str, int]] = {
+            mode: {} for mode in GAME_MODES
+        }
         self._lookup_cache: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
         self._aliases: dict[str, str] = {}
         for mode in GAME_MODES:
@@ -90,7 +124,9 @@ class TarkovPriceClient:
         if cached is not None:
             match, confidence = cached
         else:
-            match, confidence = self._find_exact_name_match(normalized_query, items, mode)
+            match, confidence = self._find_exact_full_name_match(query, items, mode)
+            if match is None:
+                match, confidence = self._find_exact_name_match(normalized_query, items, mode)
             if match is None:
                 match, confidence = self._find_alias_match(normalized_query, items, normalized=True)
             if match is None:
@@ -100,16 +136,67 @@ class TarkovPriceClient:
         if match is None:
             raise PriceLookupError(f"没有匹配到塔科夫物品：'{query}'。")
 
+        return self._to_item_price(match, confidence, query, mode)
+
+    def lookup_candidates(self, queries: list[str], game_mode: str | None = None) -> ItemPrice:
+        candidates = _dedupe_query_candidates(queries)
+        if not candidates:
+            raise PriceLookupError("物品名为空。")
+
+        mode = _normalize_game_mode(game_mode or self.current_game_mode)
+        items = self._get_items(mode)
+        ordered_candidates = sorted(candidates, key=_candidate_specificity_score, reverse=True)
+
+        for query in ordered_candidates:
+            match, confidence = self._find_exact_full_name_match(query, items, mode)
+            if match is not None:
+                return self._to_item_price(match, confidence, query, mode)
+
+        for query in ordered_candidates:
+            match, confidence = self._find_alias_match(_normalize(query), items, normalized=True)
+            if match is not None:
+                return self._to_item_price(match, confidence, query, mode)
+
+        errors: list[str] = []
+        for query in ordered_candidates:
+            try:
+                return self.lookup(query, mode)
+            except PriceLookupError as exc:
+                errors.append(str(exc))
+
+        raise PriceLookupError(errors[0] if errors else "没有匹配到塔科夫物品。")
+
+    def _to_item_price(
+        self,
+        match: dict[str, Any],
+        confidence: float,
+        query: str,
+        mode: str,
+    ) -> ItemPrice:
         best_vendor = _best_vendor_offer(match.get("sellFor") or [])
+        avg_24h_price = _as_int(match.get("avg24hPrice"))
+        width = _as_int(match.get("width"))
+        height = _as_int(match.get("height"))
+        slots = _item_slots(width, height)
+        item_types = _item_types(match)
+        is_firearm = _is_firearm_item(match, item_types)
         return ItemPrice(
             game_mode=mode,
             name=str(match.get("name") or ""),
             short_name=str(match.get("shortName") or ""),
+            zh_name=str(match.get("zhName") or ""),
+            zh_short_name=str(match.get("zhShortName") or ""),
             matched_name=query,
             confidence=min(confidence, 1.0),
             last_low_price=_as_int(match.get("lastLowPrice")),
-            avg_24h_price=_as_int(match.get("avg24hPrice")),
+            avg_24h_price=avg_24h_price,
             base_price=_as_int(match.get("basePrice")),
+            width=width,
+            height=height,
+            slots=slots,
+            value_per_slot=_value_per_slot(avg_24h_price, slots),
+            item_types=item_types,
+            is_firearm=is_firearm,
             best_vendor_name=best_vendor[0],
             best_vendor_price=best_vendor[1],
             best_vendor_currency=best_vendor[2],
@@ -278,6 +365,7 @@ class TarkovPriceClient:
                     continue
                 score = _match_score(normalized_query, _normalize(name))
                 score = _apply_feature_adjustments(normalized_query, str(name), item, score)
+                score = _apply_short_name_anchor(normalized_query, item, score)
                 if score > best_score:
                     best_item = item
                     best_score = score
@@ -290,6 +378,7 @@ class TarkovPriceClient:
         items = self._items_by_mode.get(game_mode) or []
         index: dict[str, set[int]] = {}
         name_lookup: dict[str, int] = {}
+        full_name_lookup: dict[str, set[int]] = {}
         for item_index, item in enumerate(items):
             for token in _item_index_tokens(item):
                 index.setdefault(token, set()).add(item_index)
@@ -297,8 +386,17 @@ class TarkovPriceClient:
                 normalized = _normalize(value)
                 if normalized:
                     name_lookup.setdefault(normalized, item_index)
+            for value in _item_full_name_values(item):
+                compact = _compact_exact_name_text(value)
+                if compact:
+                    full_name_lookup.setdefault(compact, set()).add(item_index)
         self._search_index_by_mode[game_mode] = index
         self._name_lookup_by_mode[game_mode] = name_lookup
+        self._full_name_lookup_by_mode[game_mode] = {
+            compact: next(iter(indexes))
+            for compact, indexes in full_name_lookup.items()
+            if len(indexes) == 1
+        }
 
     def _candidate_items_for_query(
         self,
@@ -374,8 +472,20 @@ class TarkovPriceClient:
             return None, 0.0
         return items[item_index], 1.0
 
+    def _find_exact_full_name_match(
+        self,
+        query: str,
+        items: list[dict[str, Any]],
+        game_mode: str,
+    ) -> tuple[dict[str, Any] | None, float]:
+        lookup = self._full_name_lookup_by_mode.get(game_mode) or {}
+        item_index = lookup.get(_compact_exact_name_text(query))
+        if item_index is None or item_index >= len(items):
+            return None, 0.0
+        return items[item_index], 1.0
+
 def _normalize(value: str) -> str:
-    value = value.casefold().replace("-", " ")
+    value = value.translate(_CJK_VARIANT_TRANSLATION).casefold().replace("-", " ")
     value = value.replace("×", "x")
     value = re.sub(r"(?<=\d)\s+(?=[\u4e00-\u9fff])", "", value)
     value = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", value)
@@ -385,6 +495,31 @@ def _normalize(value: str) -> str:
 
 def _compact_alias_text(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", _normalize(value))
+
+
+def _compact_exact_name_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", _normalize(value))
+
+
+def _dedupe_query_candidates(queries: list[str]) -> list[str]:
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        value = str(query).strip()
+        key = _compact_exact_name_text(value)
+        if value and key not in seen:
+            seen.add(key)
+            candidates.append(value)
+    return candidates
+
+
+def _candidate_specificity_score(value: str) -> tuple[int, int, int]:
+    normalized = _normalize(value)
+    compact = _compact_exact_name_text(normalized)
+    model_count = len(_extract_models(normalized))
+    caliber_count = len(_extract_calibers(normalized))
+    token_count = len(_match_tokens(normalized))
+    return model_count + caliber_count, token_count, len(compact)
 
 
 def _merge_localized_items(
@@ -467,6 +602,39 @@ def _match_score(query: str, candidate: str) -> float:
     return max(sequence_score, sequence_score * 0.55 + token_score * 0.45)
 
 
+def _apply_short_name_anchor(
+    normalized_query: str,
+    item: dict[str, Any],
+    score: float,
+) -> float:
+    short_name = item.get("shortName")
+    if not isinstance(short_name, str) or not short_name.strip():
+        return score
+    normalized_short = _normalize(short_name)
+    short_tokens = [
+        token
+        for token in _match_tokens(normalized_short)
+        if len(token) >= 4 and not token.isdigit()
+    ]
+    if not short_tokens:
+        return score
+    query_tokens = _match_tokens(normalized_query)
+    shared = set(short_tokens) & query_tokens
+    if not shared:
+        compact_query = _compact_alias_text(normalized_query)
+        shared = {token for token in short_tokens if token in compact_query}
+    if not shared:
+        return score
+    anchored = 0.82
+    name = str(item.get("name") or "").casefold()
+    normalized_name = str(item.get("normalizedName") or "").casefold()
+    if "figurine" in name or "figurine" in normalized_name:
+        anchored += 0.06
+    if normalized_query.startswith(next(iter(shared))):
+        anchored += 0.04
+    return max(score, min(anchored, 0.96))
+
+
 def _match_tokens(value: str) -> set[str]:
     value = _normalize(value)
     tokens = set(re.findall(r"[a-z0-9.]+|[\u4e00-\u9fff]+", value))
@@ -474,6 +642,7 @@ def _match_tokens(value: str) -> set[str]:
     for token in tokens:
         if len(token) > 1 or token.isdigit():
             expanded.add(token)
+        expanded.update(_attached_ocr_token_parts(token))
         expanded.update(_model_tokens_from_token(token))
         if re.search(r"[\u4e00-\u9fff]", token):
             expanded.update(token[index : index + 2] for index in range(max(0, len(token) - 1)))
@@ -509,6 +678,18 @@ def _item_name_values(item: dict[str, Any]) -> list[str]:
             item.get("normalizedName"),
             item.get("zhName"),
             item.get("zhShortName"),
+        ]
+        if isinstance(value, str) and value.strip()
+    ]
+
+
+def _item_full_name_values(item: dict[str, Any]) -> list[str]:
+    return [
+        str(value)
+        for value in [
+            item.get("name"),
+            item.get("normalizedName"),
+            item.get("zhName"),
         ]
         if isinstance(value, str) and value.strip()
     ]
@@ -603,8 +784,9 @@ def _apply_feature_adjustments(
 
 def _extract_calibers(value: str) -> set[str]:
     normalized = _normalize(value).replace(" ", "")
-    calibers = set(re.findall(r"\d(?:\.\d{2})?x\d{2,3}", normalized))
-    return {_normalize_caliber(caliber) for caliber in calibers}
+    raw_calibers = re.findall(r"(?<![\d.])(?:\d\.\d{2}|\d{1,2})x\d{2,3}(?!\d)", normalized)
+    calibers = {_normalize_caliber(caliber) for caliber in raw_calibers}
+    return {caliber for caliber in calibers if _is_likely_caliber(caliber)}
 
 
 def _normalize_caliber(value: str) -> str:
@@ -614,6 +796,12 @@ def _normalize_caliber(value: str) -> str:
     if match:
         return f"{match.group(1)}.{match.group(2)}"
     return value
+
+
+def _is_likely_caliber(value: str) -> bool:
+    if "." in value:
+        return True
+    return value in {"9x18", "9x19", "9x21", "9x39", "12x70", "20x70", "23x75", "30x29", "40x46"}
 
 
 def _extract_capacities(value: str) -> set[str]:
@@ -643,6 +831,8 @@ def _model_tokens_from_token(token: str) -> set[str]:
     token = token.casefold()
     if not re.search(r"\d", token):
         return set()
+    if re.fullmatch(r"(?:i|ii|iii|iv|v|vi|vii|viii|ix|x)\d+", token):
+        return set()
 
     models: set[str] = set()
     if re.fullmatch(r"[a-z]{1,6}\d{1,4}[a-z0-9]*", token):
@@ -655,6 +845,21 @@ def _model_tokens_from_token(token: str) -> set[str]:
         models.add(embedded.group(1))
 
     return models
+
+
+def _attached_ocr_token_parts(token: str) -> set[str]:
+    token = token.casefold()
+    parts: set[str] = set()
+
+    roman_digit = re.fullmatch(r"(i|ii|iii|iv|v|vi|vii|viii|ix|x)(\d+)", token)
+    if roman_digit:
+        parts.update(roman_digit.groups())
+
+    compact_scope = re.fullmatch(r"(\d{1,2}x\d{2})(\d{2})", token)
+    if compact_scope:
+        parts.update(compact_scope.groups())
+
+    return parts
 
 
 def _has_near_model_match(query: str, candidate: str) -> bool:
@@ -746,3 +951,121 @@ def _as_int(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _item_slots(width: int | None, height: int | None) -> int | None:
+    if width is None or height is None:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width * height
+
+
+def _value_per_slot(value: int | None, slots: int | None) -> int | None:
+    if value is None or slots is None or slots <= 0:
+        return None
+    return round(value / slots)
+
+
+def _item_types(item: dict[str, Any]) -> tuple[str, ...]:
+    raw_types = item.get("types")
+    if not isinstance(raw_types, list):
+        return ()
+    values: list[str] = []
+    for value in raw_types:
+        if isinstance(value, str) and value.strip():
+            values.append(value.strip())
+    return tuple(values)
+
+
+FIREARM_TYPE_TERMS = {
+    "gun",
+    "guns",
+    "weapon",
+    "weapons",
+    "firearm",
+    "firearms",
+}
+
+FIREARM_NAME_TERMS = (
+    "assault rifle",
+    "assault carbine",
+    "marksman rifle",
+    "sniper rifle",
+    "bolt-action rifle",
+    "submachine gun",
+    "machine gun",
+    "shotgun",
+    "revolver",
+    "pistol",
+    "grenade launcher",
+    "卡宾枪",
+    "突击步枪",
+    "射手步枪",
+    "狙击步枪",
+    "栓动步枪",
+    "冲锋枪",
+    "机枪",
+    "霰弹枪",
+    "手枪",
+    "左轮",
+    "榴弹发射器",
+)
+
+FIREARM_EXCLUDE_TERMS = (
+    "magazine",
+    "round",
+    "ammo",
+    "ammunition",
+    "cartridge",
+    "receiver",
+    "upper",
+    "lower",
+    "barrel",
+    "handguard",
+    "stock",
+    "grip",
+    "sight",
+    "scope",
+    "mount",
+    "muzzle",
+    "suppressor",
+    "adapter",
+    "弹匣",
+    "弹药",
+    "子弹",
+    "机匣",
+    "上机匣",
+    "下机匣",
+    "枪管",
+    "护木",
+    "枪托",
+    "握把",
+    "瞄具",
+    "瞄准镜",
+    "基座",
+    "消音",
+)
+
+
+def _is_firearm_item(item: dict[str, Any], item_types: tuple[str, ...]) -> bool:
+    normalized_types = {_normalize(value) for value in item_types}
+    if normalized_types & FIREARM_TYPE_TERMS:
+        return True
+
+    text = " ".join(
+        str(value)
+        for value in (
+            item.get("name"),
+            item.get("shortName"),
+            item.get("normalizedName"),
+            item.get("zhName"),
+            item.get("zhShortName"),
+        )
+        if value
+    )
+    lowered = text.casefold()
+    normalized_text = _normalize(text)
+    if any(term in lowered or term in normalized_text for term in FIREARM_EXCLUDE_TERMS):
+        return False
+    return any(term in lowered or term in normalized_text for term in FIREARM_NAME_TERMS)

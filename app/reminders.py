@@ -41,6 +41,10 @@ class ReminderManager(QObject):
     def clear(self) -> None:
         self._reminders.clear()
 
+    def shutdown(self) -> None:
+        self._timer.stop()
+        self._reminders.clear()
+
     def active(self) -> dict[str, TraderReminder]:
         return dict(self._reminders)
 
