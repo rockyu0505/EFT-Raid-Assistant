@@ -10,7 +10,7 @@ from PIL import Image, ImageEnhance, ImageOps
 from app.config import APP_DIR
 from app.models import ParsedItemName
 from app.ocr import OcrUnavailableError, OcrVariant
-from app.tesseract_runtime import configure_tesseract
+from app.rapid_ocr import RapidOcrUnavailableError, run_rapid_text
 
 
 UI_NOISE = {
@@ -38,95 +38,12 @@ UI_NOISE = {
     "成就",
 }
 
-INVENTORY_KEYWORDS = {
-    "overall",
-    "gear",
-    "health",
-    "skills",
-    "map",
-    "tasks",
-    "traders",
-    "hideout",
-    "pockets",
-    "backpack",
-    "tactical rig",
-    "pouch",
-    "loot",
-    "inspect",
-    "linked search",
-    "required search",
-    "filter by item",
-    "总览",
-    "装备",
-    "健康",
-    "技能",
-    "地图",
-    "任务",
-    "成就",
-    "返回",
-    "搜索",
-    "整理栏位",
-    "背包",
-    "快捷栏",
-    "角色",
-    "商人",
-    "跳蚤市场",
-}
-
-DETAIL_KEYWORDS = {
-    "inspect",
-    "linked search",
-    "required search",
-    "filter by item",
-}
-
-DEFAULT_INVENTORY_TAB_BOX = (105, 0, 235, 48)
-DEFAULT_GAME_MODE_BOX = (0, 1088, 360, 1152)
-BASE_SCREEN_SIZE = (2048, 1152)
 INVENTORY_TAB_DEBUG_PATH = APP_DIR / "debug" / "last_inventory_tab.png"
-GAME_MODE_DEBUG_PATH = APP_DIR / "debug" / "last_game_mode.png"
-
-BAD_CAPTURE_KEYWORDS = {
-    "塔科夫局内助手",
-    "识别物品并查价",
-    "查询手动名称",
-    "Anaconda Prompt",
-    "Google Chrome",
-    "MainWindow",
-    "Codex",
-    "Escapefromtarkov",
-    "EscapeFromTarkov",
-}
-
-_RAPIDOCR_ENGINES: dict[str, object] = {}
-
-
-def detect_bad_capture_overlay(
-    screenshot_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-) -> tuple[bool, list[str], str]:
-    """Detect desktop overlays or this app window covering the game capture."""
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    image = Image.open(screenshot_path)
-    image.thumbnail((1600, 900), Image.Resampling.LANCZOS)
-    text = _ocr_detection_crop(pytesseract, image, language, "--psm 11")
-    normalized = _normalize_detection_text(text)
-    found = _matching_keywords(normalized, BAD_CAPTURE_KEYWORDS)
-    return bool(found), found, text
 
 
 def refine_tooltip_name_crop(
     search_path: Path,
     output_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
     padding: tuple[int, int, int, int] = (10, 8, 10, 8),
     cursor_anchor: tuple[int, int] | None = None,
     cursor_bottom_gap: int = 20,
@@ -149,33 +66,8 @@ def refine_tooltip_name_crop(
             details.append(f"cursor-gap:{cursor_anchor[1] - y1}/{cursor_bottom_gap}")
         return True, details
 
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    boxes = _ocr_word_boxes(pytesseract, image, language)
-    if not boxes:
-        return False, []
-
-    clusters = _cluster_text_boxes(boxes)
-    if not clusters:
-        return False, []
-
-    cluster = max(clusters, key=_cluster_score)
-    x0 = min(box["left"] for box in cluster)
-    y0 = min(box["top"] for box in cluster)
-    x1 = max(box["left"] + box["width"] for box in cluster)
-    y1 = max(box["top"] + box["height"] for box in cluster)
-    pad_left, pad_top, pad_right, pad_bottom = padding
-    crop_box = _fit_box(
-        (x0 - pad_left, y0 - pad_top, x1 + pad_right, y1 + pad_bottom),
-        image.size,
-    )
-    image.crop(crop_box).save(output_path)
-    return True, [str(box["text"]) for box in cluster]
+    image.save(output_path)
+    return False, []
 
 
 def _find_tooltip_border_box(
@@ -395,201 +287,15 @@ def _inset_box(
     return _fit_box((x0 + inset, y0 + inset, x1 - inset, y1 - inset), image_size)
 
 
-def _ocr_word_boxes(
-    pytesseract: object,
-    image: Image.Image,
-    language: str,
-) -> list[dict[str, int | str]]:
-    scale = 2
-    gray = ImageOps.grayscale(image)
-    upscaled = gray.resize((gray.width * scale, gray.height * scale), Image.Resampling.LANCZOS)
-    contrasted = ImageOps.autocontrast(ImageEnhance.Contrast(upscaled).enhance(2.2))
-    data = _image_to_data(pytesseract, contrasted, language, "--psm 11")
-
-    boxes: list[dict[str, int | str]] = []
-    count = len(data.get("text", []))
-    for index in range(count):
-        text = _clean_line(str(data["text"][index]))
-        if not text:
-            continue
-        lowered = text.lower()
-        if lowered in UI_NOISE or any(noise in lowered for noise in UI_NOISE):
-            continue
-        if not re.search(r"[A-Za-z\u4e00-\u9fff]", text):
-            continue
-        try:
-            confidence = float(data.get("conf", ["-1"])[index])
-        except (TypeError, ValueError):
-            confidence = -1.0
-        if confidence < 0:
-            continue
-
-        left = round(int(data["left"][index]) / scale)
-        top = round(int(data["top"][index]) / scale)
-        width = max(1, round(int(data["width"][index]) / scale))
-        height = max(1, round(int(data["height"][index]) / scale))
-        boxes.append(
-            {
-                "text": text,
-                "left": left,
-                "top": top,
-                "width": width,
-                "height": height,
-            }
-        )
-    return boxes
-
-
-def _cluster_text_boxes(boxes: list[dict[str, int | str]]) -> list[list[dict[str, int | str]]]:
-    lines: list[list[dict[str, int | str]]] = []
-    for box in sorted(boxes, key=lambda value: (int(value["top"]), int(value["left"]))):
-        placed = False
-        center_y = int(box["top"]) + int(box["height"]) // 2
-        for line in lines:
-            line_top = min(int(item["top"]) for item in line)
-            line_bottom = max(int(item["top"]) + int(item["height"]) for item in line)
-            if line_top - 6 <= center_y <= line_bottom + 6:
-                line.append(box)
-                placed = True
-                break
-        if not placed:
-            lines.append([box])
-
-    for line in lines:
-        line.sort(key=lambda value: int(value["left"]))
-    lines.sort(key=lambda line: min(int(item["top"]) for item in line))
-
-    clusters: list[list[dict[str, int | str]]] = []
-    for line in lines:
-        if not clusters:
-            clusters.append(line)
-            continue
-        previous = clusters[-1]
-        previous_bottom = max(int(item["top"]) + int(item["height"]) for item in previous)
-        line_top = min(int(item["top"]) for item in line)
-        horizontal_overlap = _line_horizontal_overlap(previous, line)
-        if line_top - previous_bottom <= 14 and horizontal_overlap:
-            previous.extend(line)
-        else:
-            clusters.append(line)
-    return clusters
-
-
-def _line_horizontal_overlap(
-    first: list[dict[str, int | str]],
-    second: list[dict[str, int | str]],
-) -> bool:
-    first_left = min(int(item["left"]) for item in first)
-    first_right = max(int(item["left"]) + int(item["width"]) for item in first)
-    second_left = min(int(item["left"]) for item in second)
-    second_right = max(int(item["left"]) + int(item["width"]) for item in second)
-    overlap = min(first_right, second_right) - max(first_left, second_left)
-    return overlap > -24
-
-
-def _cluster_score(cluster: list[dict[str, int | str]]) -> float:
-    text_length = sum(len(str(box["text"])) for box in cluster)
-    width = max(int(box["left"]) + int(box["width"]) for box in cluster) - min(
-        int(box["left"]) for box in cluster
-    )
-    height = max(int(box["top"]) + int(box["height"]) for box in cluster) - min(
-        int(box["top"]) for box in cluster
-    )
-    return text_length * 12 + width * 0.08 + height * 0.04
-
-
 def run_item_name_ocr(
     crop_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-    engine: str = "tesseract",
+    model_version: str = "v5",
 ) -> ParsedItemName:
     """OCR a UI crop and return likely item-name candidates."""
-    engine_key = engine.strip().casefold()
-    if engine_key in {
-        "rapidocr",
-        "rapidocr_v4",
-        "rapidocr-v4",
-        "rapidocr_v5",
-        "rapidocr-v5",
-        "rapidocr+tesseract",
-        "rapidocr_with_tesseract",
-    }:
-        rapid_model = "v5" if engine_key in {"rapidocr_v5", "rapidocr-v5"} else "v4"
-        rapid_result = _run_rapidocr_item_name(crop_path, rapid_model)
-        if engine_key in {"rapidocr", "rapidocr_v4", "rapidocr-v4", "rapidocr_v5", "rapidocr-v5"}:
-            return rapid_result
-        tesseract_result = _run_tesseract_item_name(crop_path, tesseract_cmd, language)
-        return ParsedItemName(
-            raw_text=f"RapidOCR:\n{rapid_result.raw_text}\n\nTesseract:\n{tesseract_result.raw_text}",
-            candidates=_merge_candidates(rapid_result.candidates, tesseract_result.candidates),
-            variant_name=f"{rapid_result.variant_name}+{tesseract_result.variant_name}",
-        )
-
-    return _run_tesseract_item_name(crop_path, tesseract_cmd, language)
-
-
-def _run_tesseract_item_name(
-    crop_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-) -> ParsedItemName:
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    image = Image.open(crop_path)
-    variants = _build_item_variants(image)
-
-    best = ParsedItemName(raw_text="", candidates=[], variant_name="none")
-    for variant in variants:
-        text = _image_to_string(pytesseract, variant.image, language, "--psm 6")
-        candidates = parse_item_name_candidates(text)
-        if _score_candidates(candidates) > _score_candidates(best.candidates):
-            best = ParsedItemName(raw_text=text, candidates=candidates, variant_name=variant.name)
-
-    return best
-
-
-def _merge_candidates(*candidate_groups: list[str]) -> list[str]:
-    merged: list[str] = []
-    seen: set[str] = set()
-    for candidates in candidate_groups:
-        for candidate in candidates:
-            key = _normalize_candidate_key(candidate)
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(candidate)
-    return merged[:8]
+    return _run_rapidocr_item_name(crop_path, model_version)
 
 
 def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v4") -> ParsedItemName:
-    try:
-        import numpy as np  # type: ignore
-        from rapidocr import OCRVersion, RapidOCR  # type: ignore
-    except ImportError as exc:
-        return ParsedItemName(
-            raw_text=f"RapidOCR unavailable: {exc}",
-            candidates=[],
-            variant_name="rapidocr-unavailable",
-        )
-
-    engine_key = "v5" if model_version == "v5" else "v4"
-    if engine_key not in _RAPIDOCR_ENGINES:
-        started = time.perf_counter()
-        params: dict[str, Any] | None = None
-        if engine_key == "v5":
-            params = {"Rec.ocr_version": OCRVersion.PPOCRV5}
-        _RAPIDOCR_ENGINES[engine_key] = RapidOCR(params=params)
-        init_ms = round((time.perf_counter() - started) * 1000)
-    else:
-        init_ms = 0
-    rapidocr_engine = _RAPIDOCR_ENGINES[engine_key]
-
     image = Image.open(crop_path).convert("RGB")
     line_images = _split_text_line_images(image)
     variants = _build_item_variants(image)
@@ -611,29 +317,25 @@ def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v4") -> Parse
             texts: list[str] = []
             scores: list[float] = []
             for _, line_image in variant_payload:
-                result = rapidocr_engine(
-                    np.array(line_image.convert("RGB")),
+                rapid = run_rapid_text(
+                    line_image,
+                    model_version=model_version,
                     use_det=False,
                     use_cls=False,
                     use_rec=True,
                 )
-                texts.extend(
-                    str(text)
-                    for text in (getattr(result, "txts", None) or [])
-                    if str(text).strip()
-                )
-                scores.extend(float(score) for score in (getattr(result, "scores", None) or []))
+                texts.extend(rapid.lines)
+                scores.extend(rapid.scores)
         else:
-            result = rapidocr_engine(
-                np.array(variant_payload.convert("RGB")),
+            rapid = run_rapid_text(
+                variant_payload,
+                model_version=model_version,
                 use_det=False,
                 use_cls=False,
                 use_rec=True,
             )
-            texts = [
-                str(text) for text in (getattr(result, "txts", None) or []) if str(text).strip()
-            ]
-            scores = [float(score) for score in (getattr(result, "scores", None) or [])]
+            texts = rapid.lines
+            scores = rapid.scores
         elapsed_ms = round((time.perf_counter() - started) * 1000)
         text = "\n".join(texts)
         raw_parts.append(f"{variant_name}:{elapsed_ms}ms:{text}")
@@ -646,7 +348,7 @@ def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v4") -> Parse
             best = ParsedItemName(
                 raw_text=text,
                 candidates=candidates,
-                variant_name=f"rapidocr-{engine_key}:{variant_name}:{elapsed_ms}ms:init{init_ms}ms",
+                variant_name=f"rapidocr:{variant_name}:{elapsed_ms}ms",
             )
 
     if best.candidates:
@@ -654,7 +356,7 @@ def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v4") -> Parse
     return ParsedItemName(
         raw_text="\n".join(raw_parts),
         candidates=[],
-        variant_name=f"rapidocr-{engine_key}:none:init{init_ms}ms",
+        variant_name="rapidocr:none",
     )
 
 
@@ -717,48 +419,7 @@ def _split_text_line_images(image: Image.Image) -> list[Image.Image]:
     return line_images
 
 
-def detect_inventory_screen(
-    screenshot_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-    tab_box: tuple[int, int, int, int] = DEFAULT_INVENTORY_TAB_BOX,
-) -> tuple[bool, list[str], str]:
-    """Use the top-left active equipment tab to detect the inventory screen."""
-    image = Image.open(screenshot_path)
-    tab_crop = image.crop(_fit_box(_scale_box(tab_box, image.size), image.size))
-    INVENTORY_TAB_DEBUG_PATH.parent.mkdir(exist_ok=True)
-    tab_crop.save(INVENTORY_TAB_DEBUG_PATH)
-    tab_visual_score = _active_tab_visual_score(tab_crop)
-    if tab_visual_score >= 1.0:
-        return True, [f"tab:visual:{tab_visual_score:.2f}"], ""
-
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    tab_text = _ocr_detection_crop(pytesseract, tab_crop, language, "--psm 7")
-    normalized_tab = _normalize_detection_text(tab_text)
-    tab_found = _matching_keywords(normalized_tab, {"装备", "gear"})
-    if tab_found:
-        return True, [f"tab:{keyword}" for keyword in tab_found], tab_text
-
-    broad = image.copy()
-    broad.thumbnail((1600, 900), Image.Resampling.LANCZOS)
-    text = _ocr_detection_crop(pytesseract, broad, language, "--psm 11")
-    normalized = _normalize_detection_text(text)
-    found = _matching_keywords(normalized, INVENTORY_KEYWORDS)
-    has_detail_marker = any(keyword in found for keyword in DETAIL_KEYWORDS)
-    return has_detail_marker or len(found) >= 2, found, tab_text + "\n" + text
-
-
-def detect_inventory_tab_crop(
-    crop_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-) -> tuple[bool, list[str], str]:
+def detect_inventory_tab_crop(crop_path: Path) -> tuple[bool, list[str], str]:
     """Detect the inventory screen from an already-captured top-left tab crop."""
     tab_crop = Image.open(crop_path)
     INVENTORY_TAB_DEBUG_PATH.parent.mkdir(exist_ok=True)
@@ -769,18 +430,10 @@ def detect_inventory_tab_crop(
     if tab_visual_score >= 1.0:
         return True, [f"tab:visual:{tab_visual_score:.2f}"], ""
 
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    tab_text = _ocr_detection_crop(pytesseract, tab_crop, language, "--psm 7")
+    tab_text = _ocr_detection_crop(tab_crop)
     normalized_tab = _normalize_detection_text(tab_text)
-    tab_found = _matching_keywords(normalized_tab, {"瑁呭", "gear"})
+    tab_found = _matching_keywords(normalized_tab, {"装备", "gear"})
     return bool(tab_found), [f"tab:{keyword}" for keyword in tab_found], tab_text
-
 
 def _active_tab_visual_score(image: Image.Image) -> float:
     """Score the selected equipment tab by its bright highlighted tab background."""
@@ -801,109 +454,14 @@ def _active_tab_visual_score(image: Image.Image) -> float:
     return score
 
 
-def detect_game_mode(
-    screenshot_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-    mode_box: tuple[int, int, int, int] = DEFAULT_GAME_MODE_BOX,
-) -> tuple[str | None, str]:
-    """Detect PvE/PvP from the bottom-left game version strip."""
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    image = Image.open(screenshot_path)
-    crop = image.crop(_fit_box(_scale_box(mode_box, image.size), image.size))
-    GAME_MODE_DEBUG_PATH.parent.mkdir(exist_ok=True)
-    crop.save(GAME_MODE_DEBUG_PATH)
-
-    texts = _ocr_game_mode_variants(pytesseract, crop, language)
-    joined = "\n".join(texts)
-    normalized = _normalize_game_mode_text(joined)
-    if "pve" in normalized or "ve" in normalized:
-        return "pve", joined
-    if "pvp" in normalized or "vp" in normalized:
-        return "regular", joined
-    return None, joined
-
-
-def detect_game_mode_crop(
-    crop_path: Path,
-    tesseract_cmd: str = "",
-    language: str = "chi_sim+eng",
-) -> tuple[str | None, str]:
-    """Detect PvE/PvP from an already-captured bottom-left mode crop."""
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
-    crop = Image.open(crop_path)
-    GAME_MODE_DEBUG_PATH.parent.mkdir(exist_ok=True)
-    if crop_path != GAME_MODE_DEBUG_PATH:
-        crop.save(GAME_MODE_DEBUG_PATH)
-
-    texts = _ocr_game_mode_variants(pytesseract, crop, language)
-    joined = "\n".join(texts)
-    normalized = _normalize_game_mode_text(joined)
-    if "pve" in normalized or "ve" in normalized:
-        return "pve", joined
-    if "pvp" in normalized or "vp" in normalized:
-        return "regular", joined
-    return None, joined
-
-
-def _ocr_game_mode_variants(
-    pytesseract: object,
-    image: Image.Image,
-    language: str,
-) -> list[str]:
-    gray = ImageOps.grayscale(image)
-    upscaled = gray.resize((gray.width * 6, gray.height * 6), Image.Resampling.LANCZOS)
-    contrasted = ImageOps.autocontrast(ImageEnhance.Contrast(upscaled).enhance(3.0))
-    sharpened = ImageEnhance.Sharpness(contrasted).enhance(1.8)
-    variants = [
-        sharpened,
-        ImageOps.invert(sharpened),
-        upscaled.point(lambda pixel: 255 if pixel > 90 else 0),
-        ImageOps.invert(upscaled.point(lambda pixel: 255 if pixel > 60 else 0)),
-    ]
-
-    texts: list[str] = []
-    for variant in variants:
-        for config in ("--psm 7", "--psm 8", "--psm 11"):
-            text = _image_to_string(pytesseract, variant, language, config)
-            if text.strip():
-                texts.append(text)
-    return texts
-
-
-def _normalize_game_mode_text(text: str) -> str:
-    value = text.casefold()
-    value = value.replace("上", "e")
-    value = value.replace("巳", "e")
-    value = value.replace("曰", "e")
-    value = value.replace("|", "")
-    value = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value)
-    return value
-
-
-def _ocr_detection_crop(
-    pytesseract: object,
-    image: Image.Image,
-    language: str,
-    config: str,
-) -> str:
+def _ocr_detection_crop(image: Image.Image) -> str:
     gray = ImageOps.grayscale(image)
     upscaled = gray.resize((gray.width * 3, gray.height * 3), Image.Resampling.LANCZOS)
     contrasted = ImageOps.autocontrast(ImageEnhance.Contrast(upscaled).enhance(2.0))
-    return _image_to_string(pytesseract, contrasted, language, config)
-
+    try:
+        return run_rapid_text(contrasted, model_version="v5", use_det=True).raw_text
+    except RapidOcrUnavailableError as exc:
+        raise OcrUnavailableError(str(exc)) from exc
 
 def _normalize_detection_text(text: str) -> str:
     return " ".join(text.casefold().split())
@@ -911,22 +469,6 @@ def _normalize_detection_text(text: str) -> str:
 
 def _matching_keywords(text: str, keywords: set[str]) -> list[str]:
     return [keyword for keyword in keywords if keyword.casefold() in text]
-
-
-def _scale_box(
-    box: tuple[int, int, int, int],
-    current_size: tuple[int, int],
-    base_size: tuple[int, int] = BASE_SCREEN_SIZE,
-) -> tuple[int, int, int, int]:
-    x_scale = current_size[0] / base_size[0]
-    y_scale = current_size[1] / base_size[1]
-    x0, y0, x1, y1 = box
-    return (
-        round(x0 * x_scale),
-        round(y0 * y_scale),
-        round(x1 * x_scale),
-        round(y1 * y_scale),
-    )
 
 
 def _fit_box(
@@ -1034,56 +576,6 @@ def _trim_tail_after_last_cjk(value: str) -> str:
     if re.search(r"[\u4e00-\u9fff]", tail):
         return value
     return value[:last_cjk_end].strip(" .,:;()/[]{}-")
-
-
-def _image_to_string(
-    pytesseract: object,
-    image: Image.Image,
-    language: str,
-    config: str,
-) -> str:
-    last_language_error: Exception | None = None
-    for lang in _language_fallbacks(language):
-        try:
-            if lang:
-                return pytesseract.image_to_string(image, lang=lang, config=config)
-            return pytesseract.image_to_string(image, config=config)
-        except Exception as exc:
-            if not _is_tesseract_language_error(exc):
-                raise
-            last_language_error = exc
-    if last_language_error is not None:
-        raise last_language_error
-    return pytesseract.image_to_string(image, config=config)
-
-
-def _image_to_data(
-    pytesseract: object,
-    image: Image.Image,
-    language: str,
-    config: str,
-) -> dict[str, list[Any]]:
-    output_type = pytesseract.Output.DICT
-    last_language_error: Exception | None = None
-    for lang in _language_fallbacks(language):
-        try:
-            if lang:
-                return pytesseract.image_to_data(
-                    image,
-                    lang=lang,
-                    config=config,
-                    output_type=output_type,
-                )
-            return pytesseract.image_to_data(image, config=config, output_type=output_type)
-        except Exception as exc:
-            if not _is_tesseract_language_error(exc):
-                raise
-            last_language_error = exc
-    if last_language_error is not None:
-        raise last_language_error
-    return pytesseract.image_to_data(image, config=config, output_type=output_type)
-
-
 def _language_fallbacks(language: str) -> list[str]:
     requested = language.strip()
     options: list[str] = []
@@ -1103,18 +595,6 @@ def _language_fallbacks(language: str) -> list[str]:
             seen.add(key)
             deduped.append(value)
     return deduped
-
-
-def _is_tesseract_language_error(exc: Exception) -> bool:
-    error = str(exc)
-    return (
-        "Failed loading language" in error
-        or "Tesseract couldn't load" in error
-        or "Error opening data file" in error
-        or "Could not initialize tesseract" in error
-    )
-
-
 def _score_candidates(candidates: list[str]) -> int:
     if not candidates:
         return 0

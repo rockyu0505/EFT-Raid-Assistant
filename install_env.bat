@@ -92,11 +92,11 @@ if errorlevel 1 (
     echo Creating conda environment... >> "!LOG_FILE!"
     echo Removing any broken old environment first... >> "!LOG_FILE!"
     "!CONDA_EXE!" env remove -n "%ENV_NAME%" -y >> "!LOG_FILE!" 2>&1
-    "!CONDA_EXE!" create -y -n "%ENV_NAME%" -c conda-forge python=3.11 pip tesseract >> "!LOG_FILE!" 2>&1
+    "!CONDA_EXE!" create -y -n "%ENV_NAME%" -c conda-forge python=3.11 pip >> "!LOG_FILE!" 2>&1
 ) else (
     echo Updating conda packages...
     echo Updating conda packages... >> "!LOG_FILE!"
-    "!CONDA_EXE!" install -y -n "%ENV_NAME%" -c conda-forge python=3.11 pip tesseract >> "!LOG_FILE!" 2>&1
+    "!CONDA_EXE!" install -y -n "%ENV_NAME%" -c conda-forge python=3.11 pip >> "!LOG_FILE!" 2>&1
 )
 
 if errorlevel 1 (
@@ -147,24 +147,6 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-
-set "TESSDATA_DIR=%CONDA_PREFIX%\Library\share\tessdata"
-if not exist "!TESSDATA_DIR!" mkdir "!TESSDATA_DIR!"
-
-echo.
-echo Installing Tesseract language data...
-echo Installing Tesseract language data... >> "!LOG_FILE!"
-if not exist "!TESSDATA_DIR!\eng.traineddata" (
-    curl.exe -L --fail -o "!TESSDATA_DIR!\eng.traineddata" "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/eng.traineddata" >> "!LOG_FILE!" 2>&1
-)
-if not exist "!TESSDATA_DIR!\chi_sim.traineddata" (
-    curl.exe -L --fail -o "!TESSDATA_DIR!\chi_sim.traineddata" "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/chi_sim.traineddata" >> "!LOG_FILE!" 2>&1
-)
-
-echo.
-echo Installed OCR languages:
-tesseract --list-langs
-tesseract --list-langs >> "!LOG_FILE!" 2>&1
 
 echo.
 echo Setup complete. You can now run start_eft_raid_assistant.bat.

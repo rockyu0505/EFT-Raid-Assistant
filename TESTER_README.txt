@@ -19,10 +19,7 @@ What the installer does
 -----------------------
 - Creates or updates the conda environment from environment.yml.
 - Installs Python dependencies.
-- Installs Tesseract OCR through conda.
-- Downloads Tesseract language data:
-  - eng.traineddata
-  - chi_sim.traineddata
+- Installs RapidOCR and ONNX Runtime Python dependencies.
 
 Useful hotkeys
 --------------
@@ -38,4 +35,3 @@ Notes
 - If OCR is bad, send the files under debug/ together with the app log text.
 - Price caches are included for testing. Use Data > Refresh price cache in the app
   if current prices look stale.
-

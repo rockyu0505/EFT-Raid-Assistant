@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image, ImageEnhance, ImageOps
 
 from app.models import ParsedOcr
-from app.tesseract_runtime import configure_tesseract
+from app.rapid_ocr import RapidOcrUnavailableError, run_rapid_text
 
 
 TIMER_RE = re.compile(r"\b(\d{1,2})\s*:\s*(\d{2})\s*:\s*(\d{2})\b")
@@ -23,27 +23,25 @@ class OcrVariant:
     image: Image.Image
 
 
-def run_ocr(crop_path: Path, tesseract_cmd: str = "") -> ParsedOcr:
+def run_ocr(crop_path: Path) -> ParsedOcr:
     """Run OCR on a timer strip and return the best parsed countdowns."""
-    try:
-        import pytesseract  # type: ignore
-    except ImportError as exc:
-        raise OcrUnavailableError("pytesseract is not installed.") from exc
-
-    configure_tesseract(pytesseract, tesseract_cmd)
-
     image = Image.open(crop_path)
     variants = _build_variants(image)
 
     best = ParsedOcr(raw_text="", timers=[], variant_name="none")
     for variant in variants:
-        text = pytesseract.image_to_string(
-            variant.image,
-            config="--psm 6 -c tessedit_char_whitelist=0123456789:",
-        )
+        try:
+            rapid = run_rapid_text(variant.image, model_version="v5", use_det=True)
+        except RapidOcrUnavailableError as exc:
+            raise OcrUnavailableError(str(exc)) from exc
+        text = rapid.raw_text
         timers = parse_timers(text)
         if len(timers) > len(best.timers):
-            best = ParsedOcr(raw_text=text, timers=timers, variant_name=variant.name)
+            best = ParsedOcr(
+                raw_text=text,
+                timers=timers,
+                variant_name=f"{variant.name}:{rapid.variant_name}",
+            )
         if len(timers) >= 9:
             break
 

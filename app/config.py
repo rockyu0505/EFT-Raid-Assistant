@@ -12,10 +12,18 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 CONFIG_PATH = APP_DIR / "config.json"
 
 
+REMOVED_CONFIG_KEYS = {
+    "item_ocr_engine",
+    "item_ocr_language",
+    "tesseract_cmd",
+}
+
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "selected_traders": TRADERS.copy(),
     "capture_hotkey": "F8",
     "item_lookup_hotkey": "Q",
+    "hideout_scan_hotkey": "F6",
     "schedule_hotkey": "F10",
     "capture_mode": "Auto",
     "manual_resolution_enabled": False,
@@ -33,14 +41,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tooltip_cursor_reference_height": 2160,
     "hover_wait_ms": 0,
     "button_capture_delay_seconds": 0,
-    "item_ocr_engine": "rapidocr",
-    "item_ocr_language": "chi_sim+eng",
     "inventory_tab_roi_base": [105, 0, 235, 48],
     "price_game_mode_default": "pve",
     "state_detection_cache_seconds": 2,
     "require_tarkov_foreground": True,
     "price_overlay_enabled": True,
     "price_overlay_seconds": 10,
+    "close_to_tray": True,
     "item_display_language": "zh",
     "price_value_basis": "slot",
     "firearm_value_color": "#8FA35A",
@@ -66,7 +73,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "repeat_alert_seconds": 0,
     "sound_enabled": True,
     "popup_enabled": True,
-    "tesseract_cmd": "",
 }
 
 
@@ -82,12 +88,15 @@ def load_config() -> dict[str, Any]:
 
     merged = DEFAULT_CONFIG.copy()
     merged.update(data)
+    for key in REMOVED_CONFIG_KEYS:
+        merged.pop(key, None)
     return merged
 
 
 def save_config(config: dict[str, Any]) -> None:
     """Persist user settings to config.json in the project directory."""
+    cleaned = {key: value for key, value in config.items() if key not in REMOVED_CONFIG_KEYS}
     CONFIG_PATH.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
+        json.dumps(cleaned, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )

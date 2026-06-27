@@ -10,6 +10,7 @@ from app.gui import MainWindow
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Tarkov Raid Assistant")
+    app.setQuitOnLastWindowClosed(False)
 
     window = MainWindow()
     window.show()

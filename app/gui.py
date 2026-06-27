@@ -8,14 +8,16 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent
+from PySide6.QtCore import QModelIndex, QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QBrush, QCloseEvent, QColor, QIcon, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -27,25 +29,31 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStackedWidget,
     QSpinBox,
+    QStyle,
+    QSystemTrayIcon,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
 
 from app.capture import (
     Region,
+    capture_hideout_screen,
     capture_hover_item_name_region,
     capture_inventory_tab_region,
     capture_item_name_region,
     capture_timer_strip,
     debug_paths,
+    hideout_debug_path,
     hover_search_debug_path,
     inventory_tab_debug_path,
     is_tarkov_foreground,
@@ -54,9 +62,10 @@ from app.capture import (
     scale_metric,
 )
 from app.config import APP_DIR, load_config, save_config
+from app.hideout import HideoutDataError, HideoutTracker
+from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
 from app.hotkeys import HotkeyManager
 from app.item_ocr import (
-    detect_inventory_screen,
     detect_inventory_tab_crop,
     refine_tooltip_name_crop,
     run_item_name_ocr,
@@ -70,9 +79,13 @@ from app.reminders import ReminderManager
 class MainWindow(QMainWindow):
     capture_requested = Signal()
     item_lookup_requested = Signal()
+    hideout_scan_requested = Signal()
     schedule_requested = Signal()
     price_result_ready = Signal(object, str)
+    price_history_ready = Signal(object, object, str)
     cache_refresh_ready = Signal(str)
+    hideout_scan_ready = Signal(object, str)
+    hideout_cache_ready = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -83,6 +96,7 @@ class MainWindow(QMainWindow):
         self.hotkeys = HotkeyManager()
         self.reminders = ReminderManager()
         self.price_client = TarkovPriceClient()
+        self.hideout_tracker = HideoutTracker()
         self.current_price_game_mode = str(self.config.get("price_game_mode_default", "pve"))
         self.price_client.set_game_mode(self.current_price_game_mode)
         self.price_overlay = PriceOverlay()
@@ -96,6 +110,12 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._workers: set[threading.Thread] = set()
         self._workers_lock = threading.Lock()
+        self._force_exit = False
+        self._tray_notice_shown = False
+        self._active_price_key = ""
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.item_completion_model = QStandardItemModel(0, 2, self)
+        self.item_completion_lookup: dict[str, str] = {}
         self.panel_buttons: list[QPushButton] = []
 
         self.watch_checks: dict[str, QCheckBox] = {}
@@ -106,17 +126,37 @@ class MainWindow(QMainWindow):
         self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
         self.capture_requested.connect(self.capture_and_ocr)
         self.item_lookup_requested.connect(self.capture_item_price)
+        self.hideout_scan_requested.connect(self.capture_hideout_progress)
         self.schedule_requested.connect(self.schedule_selected)
         self.price_result_ready.connect(self._on_price_result_ready)
+        self.price_history_ready.connect(self._on_price_history_ready)
         self.cache_refresh_ready.connect(self._on_cache_refresh_ready)
+        self.hideout_scan_ready.connect(self._on_hideout_scan_ready)
+        self.hideout_cache_ready.connect(self._on_hideout_cache_ready)
 
         self._build_ui()
+        self._build_tray_icon()
+        self._refresh_item_completer()
         self._register_hotkeys()
         self._update_cache_status_label()
         if bool(self.config.get("refresh_prices_on_startup", True)):
             self.refresh_price_cache(background=True)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._should_minimize_to_tray():
+            action = self._confirm_close_action()
+            if action == "tray":
+                event.ignore()
+                self.hide_to_tray()
+                return
+            if action == "exit":
+                self._force_exit = True
+                self.shutdown()
+                event.accept()
+                QApplication.quit()
+                return
+            event.ignore()
+            return
         self.shutdown()
         super().closeEvent(event)
 
@@ -128,9 +168,12 @@ class MainWindow(QMainWindow):
         self.hotkeys.unregister(join_timeout=1.0)
         self.reminders.shutdown()
         self.price_overlay.hide()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         self._join_workers(timeout=1.0)
 
     def _build_ui(self) -> None:
+        self.setWindowIcon(_load_app_icon(self))
         self._build_menu()
 
         root = QWidget()
@@ -143,12 +186,97 @@ class MainWindow(QMainWindow):
         self.panel_stack.addWidget(self._build_price_panel())
         self.panel_stack.addWidget(self._build_trader_panel())
         self.panel_stack.addWidget(self._build_data_panel())
+        self.panel_stack.addWidget(self._build_hideout_panel())
         self.panel_stack.setCurrentIndex(0)
         self._select_panel(0)
 
         layout.addWidget(sidebar)
         layout.addWidget(self.panel_stack, 1)
         self.setCentralWidget(root)
+
+    def _build_tray_icon(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._log("System tray is not available; close-to-tray is disabled.")
+            return
+        icon = _load_app_icon(self)
+        self.setWindowIcon(icon)
+
+        menu = QMenu(self)
+        show_action = QAction("显示主窗口", self)
+        show_action.triggered.connect(self.show_from_tray)
+        price_action = QAction("立即查价", self)
+        price_action.triggered.connect(lambda: self.item_lookup_requested.emit())
+        settings_action = QAction("设置", self)
+        settings_action.triggered.connect(self.open_settings)
+        exit_action = QAction("退出", self)
+        exit_action.triggered.connect(self.request_exit)
+        menu.addAction(show_action)
+        menu.addAction(price_action)
+        menu.addAction(settings_action)
+        menu.addSeparator()
+        menu.addAction(exit_action)
+
+        self.tray_icon = QSystemTrayIcon(icon, self)
+        self.tray_icon.setToolTip("EFT Raid Assistant")
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _should_minimize_to_tray(self) -> bool:
+        return (
+            not self._force_exit
+            and bool(self.config.get("close_to_tray", True))
+            and self.tray_icon is not None
+            and self.tray_icon.isVisible()
+        )
+
+    def _confirm_close_action(self) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("关闭 EFT Raid Assistant")
+        dialog.setText("要把程序最小化到托盘，还是直接退出？")
+        dialog.setInformativeText("最小化到托盘后，热键、查价和提醒会继续在后台运行。")
+        tray_button = dialog.addButton("最小化到托盘", QMessageBox.ButtonRole.AcceptRole)
+        exit_button = dialog.addButton("退出程序", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(tray_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked == tray_button:
+            return "tray"
+        if clicked == exit_button:
+            return "exit"
+        if clicked == cancel_button:
+            return "cancel"
+        return "cancel"
+
+    def hide_to_tray(self) -> None:
+        self.hide()
+        if self.tray_icon is not None and not self._tray_notice_shown:
+            self.tray_icon.showMessage(
+                "EFT Raid Assistant 仍在运行",
+                "窗口已最小化到托盘，热键和查价后台继续可用。右键托盘图标可退出。",
+                QSystemTrayIcon.MessageIcon.Information,
+                3500,
+            )
+            self._tray_notice_shown = True
+        self._log("主窗口已最小化到托盘，后台热键保持运行。")
+
+    def show_from_tray(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def request_exit(self) -> None:
+        self._force_exit = True
+        self.close()
+        QApplication.quit()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_from_tray()
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
@@ -164,6 +292,12 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda checked=False, page=index: self._select_panel(page))
             self.panel_buttons.append(button)
             layout.addWidget(button)
+        button = QPushButton("藏身处")
+        button.setCheckable(True)
+        button.setMinimumHeight(38)
+        button.clicked.connect(lambda checked=False, page=3: self._select_panel(page))
+        self.panel_buttons.append(button)
+        layout.addWidget(button)
         layout.addStretch(1)
 
         settings_button = QPushButton("设置")
@@ -213,6 +347,56 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
+    def _build_hideout_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        actions = QGroupBox("藏身处升级识别")
+        actions_layout = QGridLayout(actions)
+        self.hideout_status_label = QLabel("藏身处: 尚未识别")
+        self.hideout_status_label.setWordWrap(True)
+        scan_button = QPushButton("识别藏身处升级")
+        scan_button.clicked.connect(self.capture_hideout_progress)
+        refresh_button = QPushButton("刷新需求数据")
+        refresh_button.clicked.connect(lambda: self.refresh_hideout_cache(background=True))
+        open_screenshot_button = QPushButton("打开藏身处截图")
+        open_screenshot_button.clicked.connect(self.open_hideout_screenshot)
+        open_ocr_button = QPushButton("打开 OCR 文本")
+        open_ocr_button.clicked.connect(self.open_hideout_ocr_text)
+        actions_layout.addWidget(self.hideout_status_label, 0, 0, 1, 4)
+        actions_layout.addWidget(scan_button, 1, 0)
+        actions_layout.addWidget(refresh_button, 1, 1)
+        actions_layout.addWidget(open_screenshot_button, 1, 2)
+        actions_layout.addWidget(open_ocr_button, 1, 3)
+
+        self.hideout_table = QTableWidget(0, 6)
+        self.hideout_table.setHorizontalHeaderLabels(
+            ["设施", "当前等级", "升级等级", "识别数量", "升级需求", "更新时间"]
+        )
+        self.hideout_table.verticalHeader().setVisible(False)
+        self.hideout_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.hideout_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.hideout_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.hideout_table.horizontalHeader().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.hideout_table.horizontalHeader().setSectionResizeMode(
+            3, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.hideout_table.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.Stretch
+        )
+        self.hideout_table.horizontalHeader().setSectionResizeMode(
+            5, QHeaderView.ResizeMode.ResizeToContents
+        )
+
+        layout.addWidget(actions)
+        layout.addWidget(self.hideout_table, 1)
+        self._update_hideout_table()
+        return panel
+
     def _build_menu(self) -> None:
         settings_action = QAction("打开设置", self)
         settings_action.triggered.connect(self.open_settings)
@@ -223,7 +407,7 @@ class MainWindow(QMainWindow):
         open_aliases_action = QAction("打开中文别名文件", self)
         open_aliases_action.triggered.connect(self.open_chinese_aliases)
         quit_action = QAction("退出", self)
-        quit_action.triggered.connect(self.close)
+        quit_action.triggered.connect(self.request_exit)
 
         settings_menu = self.menuBar().addMenu("设置")
         settings_menu.addAction(settings_action)
@@ -252,6 +436,22 @@ class MainWindow(QMainWindow):
 
         self.item_name_field = QLineEdit()
         self.item_name_field.setPlaceholderText("OCR 结果或手动输入物品名")
+        self.item_name_field.returnPressed.connect(self.lookup_manual_item_name)
+        completer = QCompleter(self.item_completion_model, self)
+        completer.setCompletionColumn(0)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        completion_popup = QTreeView(self.item_name_field)
+        completion_popup.setRootIsDecorated(False)
+        completion_popup.setUniformRowHeights(True)
+        completion_popup.setHeaderHidden(True)
+        completion_popup.setAlternatingRowColors(True)
+        completion_popup.setMinimumWidth(680)
+        self._configure_item_completion_popup(completion_popup)
+        completer.setPopup(completion_popup)
+        completer.activated[QModelIndex].connect(self._on_item_completion_index_activated)
+        self.item_name_field.setCompleter(completer)
         self.price_mode_combo = QComboBox()
         self.price_mode_combo.addItem("PvE", "pve")
         self.price_mode_combo.addItem("PvP", "regular")
@@ -367,12 +567,14 @@ class MainWindow(QMainWindow):
         self._register_hotkeys()
         self._log("设置已更新。")
         self._update_cache_status_label()
+        self._refresh_item_completer()
         if bool(self.config.get("refresh_prices_on_startup", True)):
             self.refresh_price_cache(background=True)
 
     def reload_chinese_aliases(self) -> None:
         count = self.price_client.reload_aliases()
         self._update_cache_status_label()
+        self._refresh_item_completer()
         self._log(f"中文别名已重新加载：{count} 条。")
 
     def open_chinese_aliases(self) -> None:
@@ -400,6 +602,7 @@ class MainWindow(QMainWindow):
         self.config["price_game_mode_default"] = self.current_price_game_mode
         save_config(self.config)
         self._update_cache_status_label()
+        self._refresh_item_completer()
         self._log(f"Price mode set manually: {_game_mode_label(self.current_price_game_mode)}.")
 
     def _register_hotkeys(self) -> None:
@@ -411,6 +614,8 @@ class MainWindow(QMainWindow):
                 lambda: self.schedule_requested.emit(),
                 str(self.config.get("item_lookup_hotkey", "Q")),
                 lambda: self.item_lookup_requested.emit(),
+                str(self.config.get("hideout_scan_hotkey", "F6")),
+                lambda: self.hideout_scan_requested.emit(),
             )
         except Exception as exc:
             self._log(f"热键注册失败：{exc}")
@@ -419,6 +624,7 @@ class MainWindow(QMainWindow):
             "热键已注册："
             f"倒计时={self.config.get('capture_hotkey', 'F8')}，"
             f"物品查价={self.config.get('item_lookup_hotkey', 'Q')}，"
+            f"藏身处={self.config.get('hideout_scan_hotkey', 'F6')}，"
             f"设置提醒={self.config.get('schedule_hotkey', 'F10')}"
         )
 
@@ -452,6 +658,133 @@ class MainWindow(QMainWindow):
             return
         self._log(status)
         self._update_cache_status_label()
+        self._refresh_item_completer()
+
+    def refresh_hideout_cache(self, background: bool = False) -> None:
+        if background:
+            self.hideout_status_label.setText("藏身处: 正在刷新需求数据...")
+            self._start_worker("hideout-cache-refresh", self._refresh_hideout_cache_worker)
+            return
+        self._refresh_hideout_cache_worker()
+
+    def _refresh_hideout_cache_worker(self) -> None:
+        if self._closing:
+            return
+        try:
+            count = self.hideout_tracker.refresh_requirements()
+        except HideoutDataError as exc:
+            status = f"藏身处需求数据刷新失败：{exc}"
+        except Exception as exc:
+            status = f"藏身处需求数据刷新异常：{exc}"
+        else:
+            status = f"藏身处需求数据已刷新：{count} 个设施。"
+        if not self._closing:
+            self.hideout_cache_ready.emit(status)
+
+    def _on_hideout_cache_ready(self, status: str) -> None:
+        if self._closing:
+            return
+        self.hideout_status_label.setText(status)
+        self._log(status)
+
+    def capture_hideout_progress(self) -> None:
+        if self._closing:
+            return
+        self._save_config()
+        if not self._ensure_tarkov_foreground("hideout scan"):
+            return
+        capture_mode = str(self.config.get("capture_mode", "Auto"))
+        try:
+            _, size, region_name = capture_hideout_screen(capture_mode)
+        except Exception as exc:
+            self._log(f"Hideout screenshot failed: {exc}")
+            QMessageBox.warning(self, "Hideout screenshot failed", str(exc))
+            return
+
+        self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
+        self.hideout_status_label.setText("藏身处: 已截图，正在 OCR...")
+        self._log(f"Captured hideout screen: {size[0]}x{size[1]}, source: {region_name}.")
+        self._start_worker("hideout-scan", self._hideout_scan_worker, hideout_debug_path())
+
+    def _hideout_scan_worker(self, screenshot_path: Path) -> None:
+        if self._closing:
+            return
+        try:
+            self.hideout_tracker.ensure_requirements()
+            scan = run_hideout_ocr(
+                screenshot_path,
+                self.hideout_tracker.station_names(),
+            )
+            record = self.hideout_tracker.record_scan(scan)
+        except Exception as exc:
+            if not self._closing:
+                self.hideout_scan_ready.emit(None, str(exc))
+            return
+        if not self._closing:
+            self.hideout_scan_ready.emit(record, "")
+
+    def _on_hideout_scan_ready(self, record: object, error: str) -> None:
+        if self._closing:
+            return
+        if error:
+            message = f"藏身处识别失败：{error}"
+            self.hideout_status_label.setText(message)
+            self._log_event(message)
+            self._log(f"Hideout OCR text saved to: {hideout_ocr_text_path()}")
+            return
+        if not isinstance(record, dict):
+            message = "藏身处识别失败：没有可用记录。"
+            self.hideout_status_label.setText(message)
+            self._log_event(message)
+            return
+        self._update_hideout_table()
+        station_name = str(record.get("station_name") or "")
+        current_level = record.get("current_level")
+        target_level = record.get("target_level")
+        recognized = record.get("recognized_quantity_count")
+        expected = record.get("expected_quantity_count")
+        item_summary = _format_hideout_item_summary(record)
+        message = (
+            f"藏身处已记录：{station_name} L{current_level}->L{target_level}，"
+            f"识别 {recognized}/{expected} 项。\n"
+            f"本次升级需求：{item_summary}"
+        )
+        self.hideout_status_label.setText(message)
+        self._log_event(message)
+
+    def _update_hideout_table(self) -> None:
+        if not hasattr(self, "hideout_table"):
+            return
+        records = self.hideout_tracker.records()
+        self.hideout_table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            values = [
+                str(record.get("station_name") or ""),
+                str(record.get("current_level") or ""),
+                str(record.get("target_level") or ""),
+                f"{record.get('recognized_quantity_count')}/{record.get('expected_quantity_count')}",
+                _format_hideout_item_summary(record),
+                str(record.get("updated_at") or ""),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.hideout_table.setItem(row, column, item)
+        self.hideout_table.resizeRowsToContents()
+
+    def open_hideout_screenshot(self) -> None:
+        path = hideout_debug_path()
+        if path.exists():
+            os.startfile(path)  # type: ignore[attr-defined]
+            return
+        QMessageBox.information(self, "No hideout screenshot", "还没有藏身处截图。")
+
+    def open_hideout_ocr_text(self) -> None:
+        path = hideout_ocr_text_path()
+        if path.exists():
+            os.startfile(path)  # type: ignore[attr-defined]
+            return
+        QMessageBox.information(self, "No hideout OCR text", "还没有藏身处 OCR 文本。")
 
     def _update_cache_status_label(self) -> None:
         self.cache_status_label.setText(
@@ -482,7 +815,7 @@ class MainWindow(QMainWindow):
 
         _, crop_path = debug_paths()
         try:
-            result = run_ocr(crop_path, str(self.config.get("tesseract_cmd", "")))
+            result = run_ocr(crop_path)
         except OcrUnavailableError as exc:
             self._log(str(exc))
             QMessageBox.warning(self, "OCR 不可用", str(exc))
@@ -608,8 +941,6 @@ class MainWindow(QMainWindow):
                 refined, words = refine_tooltip_name_crop(
                     hover_search_debug_path(),
                     item_debug_path(),
-                    str(self.config.get("tesseract_cmd", "")),
-                    str(self.config.get("item_ocr_language", "chi_sim+eng")),
                     tuple(self.config.get("hover_name_padding", [10, 8, 10, 8])),
                     hover_cursor_anchor,
                     tooltip_gap,
@@ -625,12 +956,7 @@ class MainWindow(QMainWindow):
                 self._log("Tooltip name box not located; using wider OCR crop.")
 
         try:
-            result = run_item_name_ocr(
-                item_debug_path(),
-                str(self.config.get("tesseract_cmd", "")),
-                str(self.config.get("item_ocr_language", "chi_sim+eng")),
-                str(self.config.get("item_ocr_engine", "tesseract")),
-            )
+            result = run_item_name_ocr(item_debug_path())
         except OcrUnavailableError as exc:
             self._log(str(exc))
             QMessageBox.warning(self, "OCR unavailable", str(exc))
@@ -665,6 +991,10 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         name = self.item_name_field.text().strip()
+        lookup_name = self.item_completion_lookup.get(name, name)
+        if lookup_name != name:
+            name = lookup_name
+            self.item_name_field.setText(name)
         if not name:
             self.item_price_label.setText("价格: 请先输入物品名")
             self._log_event("已跳过查价：物品名为空。")
@@ -677,6 +1007,51 @@ class MainWindow(QMainWindow):
         self.item_price_label.setText(f"价格: 正在查询 {label} / {name}...")
         self._log(f"正在从本地 {label} 缓存查价：{name}")
         self._start_worker("price-lookup", self._lookup_price_worker, name, mode)
+
+    def _refresh_item_completer(self) -> None:
+        if not hasattr(self, "item_completion_model"):
+            return
+        entries = self.price_client.completion_entries(self._selected_price_game_mode())
+        self.item_completion_lookup = {}
+        self.item_completion_model.clear()
+        self.item_completion_model.setColumnCount(2)
+        for entry in entries:
+            self.item_completion_lookup.setdefault(entry.display, entry.lookup)
+            name_item = QStandardItem(entry.display)
+            tag_item = QStandardItem(entry.tag)
+            for item in (name_item, tag_item):
+                item.setEditable(False)
+            name_item.setData(entry.lookup, Qt.ItemDataRole.UserRole)
+            tag_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            tag_item.setBackground(QBrush(QColor(entry.tag_color)))
+            tag_item.setForeground(QBrush(QColor(entry.tag_text_color)))
+            self.item_completion_model.appendRow([name_item, tag_item])
+        self._configure_item_completion_popup()
+
+    def _on_item_completion_activated(self, value: str) -> None:
+        lookup = self.item_completion_lookup.get(value, value)
+        self.item_name_field.setText(lookup)
+
+    def _configure_item_completion_popup(self, popup: QTreeView | None = None) -> None:
+        if popup is None:
+            completer = self.item_name_field.completer() if hasattr(self, "item_name_field") else None
+            popup = completer.popup() if completer is not None else None
+        if not isinstance(popup, QTreeView):
+            return
+        header = popup.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        popup.setColumnWidth(1, 86)
+        popup.setMinimumWidth(max(620, self.item_name_field.width() + 260))
+
+    def _on_item_completion_index_activated(self, index: QModelIndex) -> None:
+        lookup = index.data(Qt.ItemDataRole.UserRole)
+        if isinstance(lookup, str) and lookup.strip():
+            self.item_name_field.setText(lookup.strip())
+            return
+        value = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        self._on_item_completion_activated(value)
 
     def _lookup_item_candidates(self, names: list[str]) -> None:
         candidates: list[str] = []
@@ -730,6 +1105,20 @@ class MainWindow(QMainWindow):
         if not self._closing:
             self.price_result_ready.emit(price, "")
 
+    def _price_history_worker(self, price: object) -> None:
+        if self._closing:
+            return
+        item_id = str(getattr(price, "item_id", "") or "")
+        game_mode = str(getattr(price, "game_mode", self.current_price_game_mode) or self.current_price_game_mode)
+        try:
+            summary = self.price_client.historical_price_summary(item_id, game_mode, days=2, sample_limit=5)
+        except Exception as exc:
+            if not self._closing:
+                self.price_history_ready.emit(price, None, str(exc))
+            return
+        if not self._closing:
+            self.price_history_ready.emit(price, summary, "")
+
     def _detect_inventory_from_capture(
         self,
         capture_mode: str,
@@ -750,11 +1139,7 @@ class MainWindow(QMainWindow):
             tuple(self.config.get("inventory_tab_roi_base", [105, 0, 235, 48])),
             capture_region,
         )
-        detected, found, _ = detect_inventory_tab_crop(
-            inventory_tab_debug_path(),
-            str(self.config.get("tesseract_cmd", "")),
-            str(self.config.get("item_ocr_language", "chi_sim+eng")),
-        )
+        detected, found, _ = detect_inventory_tab_crop(inventory_tab_debug_path())
         self._inventory_check_cache = (time.monotonic(), signature, detected, found)
         return detected, found
 
@@ -812,13 +1197,27 @@ class MainWindow(QMainWindow):
             self.price_overlay.clear_prices()
             return
 
+        price_key = _price_overlay_key(price)
+        self._active_price_key = price_key
         display_language = str(self.config.get("item_display_language", "zh"))
         raw_tiers = self.config.get("price_value_tiers", [])
         tiers = raw_tiers if isinstance(raw_tiers, list) else []
         basis = str(self.config.get("price_value_basis", "slot"))
         firearm_color = str(self.config.get("firearm_value_color", "#00D1D1"))
         firearm_accent = str(self.config.get("firearm_value_accent", firearm_color))
-        view = _build_price_view(price, display_language, tiers, basis, firearm_color, firearm_accent)
+        hideout_lines = self.hideout_tracker.item_demand_lines(str(getattr(price, "item_id", "")))
+        needs_history = _is_high_volatility(price)
+        view = _build_price_view(
+            price,
+            display_language,
+            tiers,
+            basis,
+            firearm_color,
+            firearm_accent,
+            hideout_lines,
+            volatility_notice=needs_history,
+            toast_key=price_key,
+        )
         self.item_price_label.setText(view.label_html)
         self.item_price_label.setTextFormat(Qt.TextFormat.RichText)
         self._log_event(view.log_text)
@@ -830,6 +1229,55 @@ class MainWindow(QMainWindow):
             self.price_overlay.show_price(view, seconds)
         else:
             self.price_overlay.clear_prices()
+        if needs_history:
+            self._start_worker("price-history", self._price_history_worker, price)
+
+    def _on_price_history_ready(self, price: object, summary: object, error: str) -> None:
+        if self._closing:
+            return
+        price_key = _price_overlay_key(price)
+        if price_key != self._active_price_key:
+            return
+        if error:
+            self._log(f"Historical price lookup failed: {error}")
+            return
+
+        display_language = str(self.config.get("item_display_language", "zh"))
+        raw_tiers = self.config.get("price_value_tiers", [])
+        tiers = raw_tiers if isinstance(raw_tiers, list) else []
+        basis = str(self.config.get("price_value_basis", "slot"))
+        firearm_color = str(self.config.get("firearm_value_color", "#00D1D1"))
+        firearm_accent = str(self.config.get("firearm_value_accent", firearm_color))
+        hideout_lines = self.hideout_tracker.item_demand_lines(str(getattr(price, "item_id", "")))
+        enhanced = _build_price_view(
+            price,
+            display_language,
+            tiers,
+            basis,
+            firearm_color,
+            firearm_accent,
+            hideout_lines,
+            history_summary=summary,
+            toast_key=price_key,
+        )
+        detail = _build_price_history_view(
+            price,
+            summary,
+            display_language,
+            enhanced.tier_color,
+            enhanced.tier_accent,
+            toast_key=f"{price_key}:history",
+        )
+        self.item_price_label.setText(enhanced.label_html)
+        self.item_price_label.setTextFormat(Qt.TextFormat.RichText)
+        self._log_event(detail.log_text)
+        if bool(self.config.get("price_overlay_enabled", True)):
+            try:
+                seconds = int(self.config.get("price_overlay_seconds", 10))
+            except (TypeError, ValueError):
+                seconds = 10
+            self.price_overlay.show_price(enhanced, seconds, replace_key=price_key)
+            self.price_overlay.show_price(detail, seconds, replace_key=detail.toast_key)
 
     def schedule_selected(self) -> None:
         self._save_config()
@@ -937,6 +1385,47 @@ class MainWindow(QMainWindow):
         self._log(message, visible=True)
 
 
+def _format_hideout_item_summary(record: dict[str, object]) -> str:
+    items = record.get("items")
+    if not isinstance(items, list):
+        return "无材料记录"
+
+    parts: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("short_name") or "未知材料")
+        required = _safe_int(item.get("required"))
+        owned = _safe_int(item.get("owned"))
+        remaining = _safe_int(item.get("remaining"))
+        required_text = "?" if required is None else str(required)
+        owned_text = "?" if owned is None else str(owned)
+        if remaining is None:
+            detail = "未识别已有数量" if owned is None else ""
+        elif remaining > 0:
+            detail = f"缺 {remaining}"
+        else:
+            detail = "已够"
+        if detail:
+            parts.append(f"{name}: {owned_text}/{required_text}（{detail}）")
+        else:
+            parts.append(f"{name}: {owned_text}/{required_text}")
+    return "；".join(parts) if parts else "无材料记录"
+
+
+def _safe_int(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config: dict[str, object], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1034,26 +1523,19 @@ class SettingsDialog(QDialog):
         layout = QFormLayout(tab)
         self.capture_hotkey = QLineEdit()
         self.item_lookup_hotkey = QLineEdit()
+        self.hideout_scan_hotkey = QLineEdit()
         self.schedule_hotkey = QLineEdit()
-        self.tesseract_cmd = QLineEdit()
-        self.item_ocr_engine = QComboBox()
-        self.item_ocr_engine.addItem("RapidOCR only", "rapidocr")
-        self.item_ocr_engine.addItem("RapidOCR v5 only", "rapidocr_v5")
-        self.item_ocr_engine.addItem("RapidOCR + Tesseract fallback", "rapidocr+tesseract")
-        self.item_ocr_engine.addItem("Tesseract only", "tesseract")
-        self.item_ocr_language = QLineEdit()
         layout.addRow("识别倒计时", self.capture_hotkey)
         layout.addRow("物品查价", self.item_lookup_hotkey)
+        layout.addRow("识别藏身处", self.hideout_scan_hotkey)
         layout.addRow("设置提醒", self.schedule_hotkey)
-        layout.addRow("Tesseract 路径", self.tesseract_cmd)
-        layout.addRow("物品 OCR 引擎", self.item_ocr_engine)
-        layout.addRow("物品 OCR 语言", self.item_ocr_language)
         return tab
 
     def _build_prices_tab(self) -> QWidget:
         tab = QWidget()
         layout = QFormLayout(tab)
         self.price_overlay_enabled = QCheckBox("显示置顶价格浮窗")
+        self.close_to_tray = QCheckBox("点击关闭按钮时询问最小化到托盘或退出")
         self.require_tarkov_foreground = QCheckBox("截图前要求 Tarkov 是前台窗口")
         self.require_inventory_check = QCheckBox("查价前先检测背包/详情界面")
         self.refresh_prices_on_startup = QCheckBox("启动时刷新全量物品价格缓存")
@@ -1066,6 +1548,7 @@ class SettingsDialog(QDialog):
         self.price_game_mode_default.addItem("PvE", "pve")
         self.price_game_mode_default.addItem("PvP", "regular")
         layout.addRow(self.price_overlay_enabled)
+        layout.addRow(self.close_to_tray)
         layout.addRow(self.require_tarkov_foreground)
         layout.addRow(self.require_inventory_check)
         layout.addRow(self.refresh_prices_on_startup)
@@ -1157,15 +1640,11 @@ class SettingsDialog(QDialog):
 
         self.capture_hotkey.setText(str(self._config.get("capture_hotkey", "F8")))
         self.item_lookup_hotkey.setText(str(self._config.get("item_lookup_hotkey", "Q")))
+        self.hideout_scan_hotkey.setText(str(self._config.get("hideout_scan_hotkey", "F6")))
         self.schedule_hotkey.setText(str(self._config.get("schedule_hotkey", "F10")))
-        self.tesseract_cmd.setText(str(self._config.get("tesseract_cmd", "")))
-        ocr_engine_index = self.item_ocr_engine.findData(
-            str(self._config.get("item_ocr_engine", "tesseract"))
-        )
-        self.item_ocr_engine.setCurrentIndex(max(0, ocr_engine_index))
-        self.item_ocr_language.setText(str(self._config.get("item_ocr_language", "chi_sim+eng")))
 
         self.price_overlay_enabled.setChecked(bool(self._config.get("price_overlay_enabled", True)))
+        self.close_to_tray.setChecked(bool(self._config.get("close_to_tray", True)))
         self.require_tarkov_foreground.setChecked(
             bool(self._config.get("require_tarkov_foreground", True))
         )
@@ -1192,6 +1671,7 @@ class SettingsDialog(QDialog):
         return {
             "capture_hotkey": self.capture_hotkey.text().strip() or "F8",
             "item_lookup_hotkey": self.item_lookup_hotkey.text().strip() or "Q",
+            "hideout_scan_hotkey": self.hideout_scan_hotkey.text().strip() or "F6",
             "schedule_hotkey": self.schedule_hotkey.text().strip() or "F10",
             "capture_mode": self.capture_mode.currentData() or "Auto",
             "item_capture_mode": self.item_capture_mode.currentData() or "Hover tooltip",
@@ -1206,10 +1686,9 @@ class SettingsDialog(QDialog):
             "hover_search_margins": [spin.value() for spin in self.hover_search_margin_fields],
             "hover_name_padding": [spin.value() for spin in self.hover_name_padding_fields],
             "hover_wait_ms": self.hover_wait_ms.value(),
-            "item_ocr_engine": self.item_ocr_engine.currentData() or "tesseract",
-            "item_ocr_language": self.item_ocr_language.text().strip() or "chi_sim+eng",
             "price_overlay_enabled": self.price_overlay_enabled.isChecked(),
             "price_overlay_seconds": self.price_overlay_seconds.value(),
+            "close_to_tray": self.close_to_tray.isChecked(),
             "item_display_language": self.item_display_language.currentData() or "zh",
             "require_tarkov_foreground": self.require_tarkov_foreground.isChecked(),
             "require_inventory_check": self.require_inventory_check.isChecked(),
@@ -1219,7 +1698,6 @@ class SettingsDialog(QDialog):
             "repeat_alert_seconds": self.repeat_seconds.value(),
             "sound_enabled": self.sound_enabled.isChecked(),
             "popup_enabled": self.popup_enabled.isChecked(),
-            "tesseract_cmd": self.tesseract_cmd.text().strip(),
         }
 
     def _apply_resolution_preset(self, value: str) -> None:
@@ -1240,17 +1718,29 @@ def _centered(widget: QWidget) -> QWidget:
     return container
 
 
+def _load_app_icon(widget: QWidget) -> QIcon:
+    for name in ("app_icon.ico", "app_icon.png"):
+        path = APP_DIR / "assets" / name
+        if path.exists():
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
+    return widget.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+
 @dataclass(frozen=True)
 class PriceView:
     title: str
     subtitle: str
     detail: str
     value_text: str
+    secondary_value_text: str
     tier_label: str
     tier_color: str
     tier_accent: str
     label_html: str
     log_text: str
+    toast_key: str = ""
 
 
 def _build_price_view(
@@ -1260,71 +1750,114 @@ def _build_price_view(
     value_basis: str,
     firearm_color: str = "#00D1D1",
     firearm_accent: str = "#00D1D1",
+    hideout_lines: list[str] | None = None,
+    history_summary: object | None = None,
+    volatility_notice: bool = False,
+    toast_key: str = "",
 ) -> PriceView:
     game_mode = _game_mode_label(str(getattr(price, "game_mode", "regular")))
     title = _display_item_name(price, display_language)
     confidence = getattr(price, "confidence", 0.0)
-    avg_24h = _money(getattr(price, "avg_24h_price", None), "RUB")
     vendor_name = getattr(price, "best_vendor_name", None)
     vendor_currency = getattr(price, "best_vendor_currency", "RUB")
-    vendor_price = _money(getattr(price, "best_vendor_price", None), vendor_currency)
+    vendor_price = _money(_safe_int(getattr(price, "best_vendor_price", None)), vendor_currency)
     vendor = f"{vendor_name}: {vendor_price}" if vendor_name else vendor_price
-    slots = getattr(price, "slots", None)
-    value_per_slot = getattr(price, "value_per_slot", None)
-    avg_value = getattr(price, "avg_24h_price", None)
+    slots = _safe_int(getattr(price, "slots", None))
+    avg_value = _safe_int(getattr(price, "avg_24h_price", None))
+    reference_value = _safe_int(getattr(history_summary, "median_price", None)) or avg_value
+    total_value, total_source = _best_total_value(price, reference_value)
+    value_per_slot = _slot_value(total_value, slots)
     is_firearm = bool(getattr(price, "is_firearm", False))
+
     if is_firearm:
         tier_label = "枪械"
         tier_color = _safe_color(firearm_color, "#00D1D1")
         tier_accent = _safe_accent(firearm_accent, tier_color)
     else:
-        value_for_tier = value_per_slot if value_basis == "slot" else avg_value
-        value_basis_label = "单格"
+        value_for_tier = value_per_slot if value_basis == "slot" else total_value
         if value_for_tier is None and value_basis == "slot":
-            value_for_tier = avg_value
-            value_basis_label = "总价"
+            value_for_tier = total_value
         tier_label, tier_color, tier_accent = _price_tier(value_for_tier, tiers)
 
-    slot_suffix = f" / {slots} 格" if slots else ""
-    if is_firearm:
-        value_text = "枪械：按配件评估"
-    elif value_per_slot is not None:
-        value_text = f"{_money(value_per_slot, 'RUB')}/格"
-    elif avg_value is not None:
-        value_text = f"总价 {_money(avg_value, 'RUB')}"
+    if total_value is not None:
+        value_text = f"{total_source}: {_money(total_value, 'RUB')}"
     else:
-        value_text = "价值: -"
-    subtitle = f"[{game_mode}] 24h 均价 {avg_24h}{slot_suffix}"
-    detail = (
-        f"枪械价格包含配件 · 商人 {vendor} · 匹配 {confidence:.0%}"
-        if is_firearm
-        else f"{value_basis_label}分级 · 商人 {vendor} · 匹配 {confidence:.0%}"
+        value_text = "最优价: -"
+    if is_firearm:
+        secondary_value_text = "枪械：单格价值不参与分级"
+    elif value_per_slot is not None:
+        secondary_value_text = f"单格价值: {_money(value_per_slot, 'RUB')}/格"
+    else:
+        secondary_value_text = "单格价值: -"
+
+    detail_line_1 = (
+        f"[{game_mode}] · "
+        f"24h均价 {_money(avg_value, 'RUB')} · "
+        f"当前最低 {_money(_safe_int(getattr(price, 'last_low_price', None)), 'RUB')}"
     )
+    detail_line_2 = f"商人 {vendor} · 匹配 {confidence:.0%}"
+    extra_parts: list[str] = []
+    history_median = _safe_int(getattr(history_summary, "median_price", None))
+    if history_median is not None:
+        extra_parts.append(f"历史中位 {_money(history_median, 'RUB')}")
+    price_low_24h = _safe_int(getattr(price, "low_24h_price", None))
+    price_high_24h = _safe_int(getattr(price, "high_24h_price", None))
+    low_24h = price_low_24h if price_low_24h is not None else _safe_int(getattr(history_summary, "low_price", None))
+    high_24h = price_high_24h if price_high_24h is not None else _safe_int(getattr(history_summary, "high_price", None))
+    range_label = "24h" if price_low_24h is not None or price_high_24h is not None else "历史"
+    if low_24h is not None or high_24h is not None:
+        extra_parts.append(f"{range_label}区间 {_money(low_24h, 'RUB')} - {_money(high_24h, 'RUB')}")
+    offer_count = _safe_int(getattr(price, "last_offer_count", None))
+    if offer_count is not None:
+        extra_parts.append(f"挂单 {offer_count}")
+    change = _safe_float(getattr(price, "change_48h_percent", None))
+    if change is not None:
+        extra_parts.append(f"48h {change:+.1f}%")
+    if volatility_notice:
+        extra_parts.append("疑似高波动物品，正在联网查询详细价格")
+    detail_lines = [detail_line_1, detail_line_2]
+    if extra_parts:
+        detail_lines.append(" · ".join(extra_parts))
+    detail = "\n".join(detail_lines)
+
+    hideout_text = "；".join(hideout_lines or [])
+    display_detail = detail
+    hideout_html = ""
+    if hideout_text:
+        display_detail = f"{detail}\n藏身处: {hideout_text}"
+        hideout_html = (
+            f"<br><span style='color:#9EE6A8;'>"
+            f"藏身处: {html.escape(hideout_text)}"
+            f"</span>"
+        )
+    detail_html = "<br>".join(html.escape(line) for line in detail.splitlines())
     label_html = (
         f"<div style='line-height:1.35;'>"
-        f"<b>{html.escape(title)}</b> "
-        f"<span style='color:{tier_color}; font-weight:700;'>{html.escape(value_text)}</span><br>"
-        f"<span>{html.escape(subtitle)}</span><br>"
-        f"<span>{html.escape(detail)}</span>"
+        f"<b>{html.escape(title)}</b><br>"
+        f"<span style='color:{tier_color}; font-size:18px; font-weight:800;'>{html.escape(value_text)}</span><br>"
+        f"<span style='color:{tier_color}; font-size:14px; font-weight:700;'>{html.escape(secondary_value_text)}</span><br>"
+        f"<span>{detail_html}</span>"
+        f"{hideout_html}"
         f"</div>"
     )
-    if is_firearm:
-        value_log = "枪械按配件评估"
-    else:
-        value_log = f"单格 {value_text}" if value_per_slot is not None else value_text
-    log_text = f"[{game_mode}] {title} | 24h {avg_24h} | {value_log} | 商人 {vendor}"
+    log_text = f"[{game_mode}] {title} | {value_text} | {secondary_value_text} | 商人 {vendor}"
+    if volatility_notice:
+        log_text = f"{log_text} | 疑似高波动物品，正在联网查询详细价格"
+    if hideout_text:
+        log_text = f"{log_text} | 藏身处 {hideout_text}"
     return PriceView(
         title=title,
-        subtitle=subtitle,
-        detail=detail,
+        subtitle="",
+        detail=display_detail,
         value_text=value_text,
+        secondary_value_text=secondary_value_text,
         tier_label=tier_label,
         tier_color=tier_color,
         tier_accent=tier_accent,
         label_html=label_html,
         log_text=log_text,
+        toast_key=toast_key,
     )
-
 
 def _display_item_name(price: object, display_language: str) -> str:
     name = str(getattr(price, "name", "") or "")
@@ -1341,6 +1874,105 @@ def _money(value: int | None, currency: str | None = "RUB") -> str:
     if value is None:
         return "-"
     return f"{value:,} {currency or 'RUB'}"
+
+
+def _safe_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_value(value: int | None, slots: int | None) -> int | None:
+    if value is None or slots is None or slots <= 0:
+        return None
+    return round(value / slots)
+
+
+def _best_total_value(price: object, reference_value: int | None) -> tuple[int | None, str]:
+    vendor_rub = _safe_int(getattr(price, "best_vendor_price_rub", None))
+    if reference_value is not None and vendor_rub is not None:
+        if vendor_rub > reference_value:
+            return vendor_rub, "最优价(商人)"
+        return reference_value, "参考价"
+    if reference_value is not None:
+        return reference_value, "参考价"
+    if vendor_rub is not None:
+        return vendor_rub, "最优价(商人)"
+    last_low = _safe_int(getattr(price, "last_low_price", None))
+    if last_low is not None:
+        return last_low, "当前最低"
+    return None, "最优价"
+
+
+def _is_high_volatility(price: object, threshold: float = 0.50) -> bool:
+    avg_value = _safe_int(getattr(price, "avg_24h_price", None))
+    last_low = _safe_int(getattr(price, "last_low_price", None))
+    if avg_value is None or avg_value <= 0 or last_low is None:
+        return False
+    return abs(last_low - avg_value) / avg_value >= threshold
+
+
+def _price_overlay_key(price: object) -> str:
+    item_id = str(getattr(price, "item_id", "") or "")
+    mode = str(getattr(price, "game_mode", "") or "")
+    return f"price:{mode}:{item_id}"
+
+
+def _build_price_history_view(
+    price: object,
+    summary: object,
+    display_language: str,
+    tier_color: str,
+    tier_accent: str,
+    toast_key: str = "",
+) -> PriceView:
+    title = f"{_display_item_name(price, display_language)} · 详细评估"
+    median = _safe_int(getattr(summary, "median_price", None))
+    sample_count = _safe_int(getattr(summary, "sample_count", None))
+    latest = _safe_int(getattr(summary, "latest_price", None))
+    latest_min = _safe_int(getattr(summary, "latest_min_price", None))
+    latest_offer = _safe_int(getattr(summary, "latest_offer_count", None))
+    price_low_24h = _safe_int(getattr(price, "low_24h_price", None))
+    price_high_24h = _safe_int(getattr(price, "high_24h_price", None))
+    low_24h = price_low_24h if price_low_24h is not None else _safe_int(getattr(summary, "low_price", None))
+    high_24h = price_high_24h if price_high_24h is not None else _safe_int(getattr(summary, "high_price", None))
+    range_label = "24h" if price_low_24h is not None or price_high_24h is not None else "历史"
+    value_text = f"历史中位: {_money(median, 'RUB')}"
+    secondary_value_text = (
+        f"最近 {sample_count or 0} 个历史点 · 最新 {_money(latest, 'RUB')}"
+    )
+    detail_parts = [
+        f"{range_label}最低 {_money(low_24h, 'RUB')}",
+        f"{range_label}最高 {_money(high_24h, 'RUB')}",
+        f"最新最低 {_money(latest_min, 'RUB')}",
+    ]
+    if latest_offer is not None:
+        detail_parts.append(f"最新挂单 {latest_offer}")
+    detail = " · ".join(detail_parts)
+    label_html = (
+        f"<div style='line-height:1.35;'>"
+        f"<b>{html.escape(title)}</b><br>"
+        f"<span style='color:{tier_color}; font-size:18px; font-weight:800;'>{html.escape(value_text)}</span><br>"
+        f"<span style='color:{tier_color}; font-size:14px; font-weight:700;'>{html.escape(secondary_value_text)}</span><br>"
+        f"<span>{html.escape(detail)}</span>"
+        f"</div>"
+    )
+    return PriceView(
+        title=title,
+        subtitle="",
+        detail=detail,
+        value_text=value_text,
+        secondary_value_text=secondary_value_text,
+        tier_label="历史",
+        tier_color=tier_color,
+        tier_accent=tier_accent,
+        label_html=label_html,
+        log_text=f"{title} | {value_text} | {secondary_value_text} | {detail}",
+        toast_key=toast_key,
+    )
 
 
 def _safe_color(value: str, fallback: str) -> str:
@@ -1395,7 +2027,14 @@ class PriceOverlay(QWidget):
         super().__init__()
         self._toasts: list[PriceToast] = []
 
-    def show_price(self, view: PriceView, seconds: int = 10) -> None:
+    def show_price(self, view: PriceView, seconds: int = 10, replace_key: str = "") -> None:
+        if replace_key:
+            for toast in self._toasts:
+                if toast.toast_key == replace_key:
+                    toast.update_view(view)
+                    toast.show_for(seconds)
+                    self._position_toasts()
+                    return
         toast = PriceToast(view)
         toast.closed_callback = lambda item=toast: self._forget_toast(item)
         self._toasts.insert(0, toast)
@@ -1434,9 +2073,11 @@ class PriceOverlay(QWidget):
 class PriceToast(QWidget):
     def __init__(self, view: PriceView) -> None:
         super().__init__()
+        self.toast_key = view.toast_key
         self.closed_callback: object | None = None
         self._closing = False
         self._animation: QPropertyAnimation | None = None
+        self._timer_generation = 0
         self.setWindowTitle("塔科夫物品价格")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -1473,22 +2114,18 @@ class PriceToast(QWidget):
         content_layout.setContentsMargins(13, 10, 14, 11)
         content_layout.setSpacing(4)
 
-        title = QLabel(view.title)
-        title.setWordWrap(True)
-        title.setStyleSheet("font-size: 15px; font-weight: 700; color: #FBFAF4;")
-        value = QLabel(view.value_text)
-        value.setStyleSheet(f"font-size: 14px; font-weight: 700; color: {view.tier_color};")
-        subtitle = QLabel(view.subtitle)
-        subtitle.setWordWrap(True)
-        subtitle.setStyleSheet("font-size: 12px; color: rgba(245, 242, 232, 0.82);")
-        detail = QLabel(view.detail)
-        detail.setWordWrap(True)
-        detail.setStyleSheet("font-size: 12px; color: rgba(245, 242, 232, 0.68);")
+        self._accent = accent
+        self._title_label = QLabel()
+        self._title_label.setWordWrap(True)
+        self._value_label = QLabel()
+        self._secondary_value_label = QLabel()
+        self._detail_label = QLabel()
+        self._detail_label.setWordWrap(True)
 
-        content_layout.addWidget(title)
-        content_layout.addWidget(value)
-        content_layout.addWidget(subtitle)
-        content_layout.addWidget(detail)
+        content_layout.addWidget(self._title_label)
+        content_layout.addWidget(self._value_label)
+        content_layout.addWidget(self._secondary_value_label)
+        content_layout.addWidget(self._detail_label)
         card_layout.addWidget(content, 1)
         outer.addWidget(card)
 
@@ -1499,12 +2136,44 @@ class PriceToast(QWidget):
             "border-radius: 8px;"
             "}"
         )
+        self.update_view(view)
+
+    def update_view(self, view: PriceView) -> None:
+        self.toast_key = view.toast_key or self.toast_key
+        self._accent.setStyleSheet(
+            f"background: {view.tier_accent};"
+            "border-top-left-radius: 8px;"
+            "border-bottom-left-radius: 8px;"
+        )
+        self._title_label.setText(view.title)
+        self._title_label.setStyleSheet("font-size: 15px; font-weight: 700; color: #FBFAF4;")
+        self._value_label.setText(view.value_text)
+        self._value_label.setStyleSheet(
+            f"font-size: 18px; font-weight: 800; color: {view.tier_color};"
+        )
+        self._secondary_value_label.setText(view.secondary_value_text)
+        self._secondary_value_label.setStyleSheet(
+            f"font-size: 13px; font-weight: 700; color: {view.tier_color};"
+        )
+        self._detail_label.setText(view.detail)
+        self._detail_label.setStyleSheet("font-size: 12px; color: rgba(245, 242, 232, 0.68);")
+        self.adjustSize()
 
     def show_for(self, seconds: int) -> None:
+        self._closing = False
+        self._timer_generation += 1
+        generation = self._timer_generation
+        if self._animation is not None:
+            self._animation.stop()
+            self._opacity.setOpacity(1.0)
         self.show()
         self.raise_()
         duration_ms = max(1, int(seconds)) * 1000
-        QTimer.singleShot(duration_ms, self.fade_out)
+        QTimer.singleShot(duration_ms, lambda: self._fade_out_if_current(generation))
+
+    def _fade_out_if_current(self, generation: int) -> None:
+        if generation == self._timer_generation:
+            self.fade_out()
 
     def fade_out(self, duration_ms: int = 450) -> None:
         if self._closing:

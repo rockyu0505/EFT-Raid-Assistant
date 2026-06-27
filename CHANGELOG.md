@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0 - 2026-06-27
+
+- Added an initial hideout upgrade tracking panel with full-screen hideout OCR capture.
+- Added a configurable hideout scan hotkey, defaulting to `F6`.
+- Added local hideout requirement caching from tarkov.dev and local progress records per scanned facility.
+- Added current-upgrade and max-level hideout demand lines to item price results when a matched item is needed by recorded facilities.
+- Added quantity-sequence alignment so noisy full-screen OCR can skip unrelated `x/y` values before recording hideout item counts.
+- Changed hideout recognition to locate the right-side upgrade panel by its white border, then OCR targeted title, requirement, and quantity crops.
+- Added game-order overrides for hideout levels where tarkov.dev API order does not match the in-game material row.
+- Added a system tray mode with a close confirmation dialog: minimize to tray, exit, or cancel.
+- Added the first app icon and wired it into the main window, tray icon, and PyInstaller executable.
+- Added item-name autocomplete for manual price lookup, showing Chinese item names with colored category tags.
+- Changed all OCR paths to use RapidOCR v5 and removed the old Tesseract runtime, settings, packaging, and documentation.
+- Removed unused legacy OCR helpers for full-screen inventory detection and automatic PvE/PvP detection.
+- Changed price result cards to prioritize total best/reference value, show per-slot value underneath, and request historical price details for high-volatility items.
+
 ## 0.4.2 - 2026-06-22
 
 - Changed the default in-raid item price lookup hotkey to `Q`.

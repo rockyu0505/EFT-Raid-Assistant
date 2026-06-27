@@ -1,7 +1,6 @@
 PySide6
 mss
 Pillow
-pytesseract
 pynput
 pywin32
 rapidocr

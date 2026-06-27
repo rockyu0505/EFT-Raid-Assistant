@@ -9,7 +9,7 @@ How to run
 2. Double-click:
    EFT Raid Assistant.exe
 
-No Miniconda, Python, or separate Tesseract installation is required for this
+No Miniconda, Python, or separate OCR installation is required for this
 portable build.
 
 Notes
@@ -21,4 +21,3 @@ Notes
   mouse, read game memory, or interact with the game process.
 - If OCR or item lookup is wrong, send the debug folder and the app log text
   back to the developer.
-

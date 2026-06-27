@@ -18,6 +18,8 @@ class HotkeyManager:
         on_schedule: Callable[[], None],
         item_lookup_hotkey: str = "",
         on_item_lookup: Callable[[], None] | None = None,
+        hideout_scan_hotkey: str = "",
+        on_hideout_scan: Callable[[], None] | None = None,
     ) -> None:
         self.unregister()
         try:
@@ -31,6 +33,8 @@ class HotkeyManager:
         }
         if item_lookup_hotkey.strip() and on_item_lookup is not None:
             bindings[normalize_hotkey(item_lookup_hotkey)] = _threaded(on_item_lookup)
+        if hideout_scan_hotkey.strip() and on_hideout_scan is not None:
+            bindings[normalize_hotkey(hideout_scan_hotkey)] = _threaded(on_hideout_scan)
         self._listener = keyboard.GlobalHotKeys(bindings)
         self._listener.start()
 

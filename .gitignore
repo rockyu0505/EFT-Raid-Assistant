@@ -7,6 +7,7 @@ debug/
 
 cache/
 config.json
+data/hideout_progress.json
 startup_log*.txt
 install_log.txt
 

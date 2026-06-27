@@ -2,7 +2,7 @@
 
 一个面向中文玩家的 Escape from Tarkov 局内辅助工具。它专注于截图、OCR、本地查价和提醒，不会点击鼠标、移动鼠标、读取游戏内存、注入游戏进程或自动化游戏操作。
 
-当前版本：`0.4.2`
+当前版本：`0.5.0`
 
 ## 功能概览
 
@@ -32,6 +32,7 @@
 | 功能 | 默认热键 |
 | --- | --- |
 | 局内物品查价 | `Q` |
+| 识别藏身处升级 | `F6` |
 | 识别商人倒计时 | `F8` |
 | 设置选中商人提醒 | `F10` |
 
@@ -66,14 +67,9 @@
 
 ## OCR 引擎
 
-当前默认使用 RapidOCR。设置中可以选择：
+当前统一使用 RapidOCR v5，使用 `ch_PP-OCRv5_rec_mobile` 识别局内物品名、倒计时和藏身处升级信息。
 
-- RapidOCR only：默认推荐，速度快。
-- RapidOCR v5 only：实验选项，使用 `ch_PP-OCRv5_rec_mobile`，中文识别略有提升。
-- RapidOCR + Tesseract fallback：备用组合，速度较慢。
-- Tesseract only：旧方案，主要用于对照和调试。
-
-0.4.2 还加入了简繁字符归一化，用于处理 OCR 将 `猫` 识别为 `貓`、`黄` 识别为 `黃` 等情况。
+0.5.0 统一使用 RapidOCR v5，并保留简繁字符归一化，用于处理 OCR 将 `猫` 识别为 `貓`、`黄` 识别为 `黃` 等情况。
 
 ## 数据来源
 
@@ -154,7 +150,7 @@ pip install -r requirements.txt
 python main.py
 ```
 
-源码运行 Tesseract fallback 时需要本机安装 Tesseract OCR。Release 版本已经内置相关运行文件。
+源码运行只需要安装 `requirements.txt` 中列出的 Python 依赖。
 
 ## 打包
 
@@ -223,4 +219,4 @@ VERSION
 
 本项目代码使用 MIT License，详见 [LICENSE](LICENSE)。
 
-第三方依赖、OCR 模型、Qt/PySide6 运行库、Tesseract 运行库和 tarkov.dev 数据源仍遵循各自的上游许可证或服务条款，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+第三方依赖、OCR 模型、Qt/PySide6 运行库和 tarkov.dev 数据源仍遵循各自的上游许可证或服务条款，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

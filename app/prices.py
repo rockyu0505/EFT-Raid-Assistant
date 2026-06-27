@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 from app.config import APP_DIR
-from app.models import ItemPrice
+from app.models import HistoricalPriceSummary, ItemPrice
 
 
 TARKOV_DEV_GRAPHQL = "https://api.tarkov.dev/graphql"
@@ -59,12 +61,17 @@ query ItemPrices($gameMode: GameMode, $lang: LanguageCode) {
     height
     types
     lastLowPrice
+    low24hPrice
+    high24hPrice
     avg24hPrice
+    changeLast48hPercent
+    lastOfferCount
     basePrice
     wikiLink
     updated
     sellFor {
       price
+      priceRUB
       source
       currency
       vendor {
@@ -75,9 +82,30 @@ query ItemPrices($gameMode: GameMode, $lang: LanguageCode) {
 }
 """
 
+HISTORICAL_PRICES_QUERY = """
+query HistoricalItemPrices($id: ID!, $gameMode: GameMode, $days: Int) {
+  historicalItemPrices(id: $id, gameMode: $gameMode, days: $days) {
+    price
+    priceMin
+    offerCount
+    offerCountMin
+    timestamp
+  }
+}
+"""
+
 
 class PriceLookupError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class CompletionEntry:
+    display: str
+    lookup: str
+    tag: str
+    tag_color: str
+    tag_text_color: str = "#F5F7FA"
 
 
 class TarkovPriceClient:
@@ -181,6 +209,7 @@ class TarkovPriceClient:
         item_types = _item_types(match)
         is_firearm = _is_firearm_item(match, item_types)
         return ItemPrice(
+            item_id=str(match.get("id") or ""),
             game_mode=mode,
             name=str(match.get("name") or ""),
             short_name=str(match.get("shortName") or ""),
@@ -189,7 +218,11 @@ class TarkovPriceClient:
             matched_name=query,
             confidence=min(confidence, 1.0),
             last_low_price=_as_int(match.get("lastLowPrice")),
+            low_24h_price=_as_int(match.get("low24hPrice")),
+            high_24h_price=_as_int(match.get("high24hPrice")),
             avg_24h_price=avg_24h_price,
+            change_48h_percent=_as_float(match.get("changeLast48hPercent")),
+            last_offer_count=_as_int(match.get("lastOfferCount")),
             base_price=_as_int(match.get("basePrice")),
             width=width,
             height=height,
@@ -199,9 +232,43 @@ class TarkovPriceClient:
             is_firearm=is_firearm,
             best_vendor_name=best_vendor[0],
             best_vendor_price=best_vendor[1],
-            best_vendor_currency=best_vendor[2],
+            best_vendor_price_rub=best_vendor[2],
+            best_vendor_currency=best_vendor[3],
             wiki_link=match.get("wikiLink"),
             updated=match.get("updated"),
+        )
+
+    def historical_price_summary(
+        self,
+        item_id: str,
+        game_mode: str | None = None,
+        days: int = 2,
+        sample_limit: int = 5,
+    ) -> HistoricalPriceSummary:
+        item_id = item_id.strip()
+        if not item_id:
+            raise PriceLookupError("物品 ID 为空，无法查询历史价格。")
+        mode = _normalize_game_mode(game_mode or self.current_game_mode)
+        points = self._fetch_historical_prices(item_id, mode, days)
+        usable = [point for point in points if _as_int(point.get("price")) is not None]
+        recent = usable[-max(1, sample_limit):]
+        prices = [_as_int(point.get("price")) for point in recent]
+        clean_prices = [price for price in prices if price is not None]
+        median_price = round(statistics.median(clean_prices)) if clean_prices else None
+        all_prices = [_as_int(point.get("price")) for point in usable]
+        clean_all_prices = [price for price in all_prices if price is not None]
+        latest = recent[-1] if recent else (usable[-1] if usable else {})
+        return HistoricalPriceSummary(
+            item_id=item_id,
+            game_mode=mode,
+            median_price=median_price,
+            sample_count=len(clean_prices),
+            latest_price=_as_int(latest.get("price")) if isinstance(latest, dict) else None,
+            latest_min_price=_as_int(latest.get("priceMin")) if isinstance(latest, dict) else None,
+            latest_offer_count=_as_int(latest.get("offerCount")) if isinstance(latest, dict) else None,
+            low_price=min(clean_all_prices) if clean_all_prices else None,
+            high_price=max(clean_all_prices) if clean_all_prices else None,
+            days=days,
         )
 
     def refresh_items(self, game_mode: str | None = None) -> int:
@@ -237,6 +304,38 @@ class TarkovPriceClient:
                 value = "已加载"
             parts.append(f"{label}:{value}")
         return " / ".join(parts)
+
+    def completion_entries(self, game_mode: str | None = None) -> list[CompletionEntry]:
+        mode = _normalize_game_mode(game_mode or self.current_game_mode)
+        try:
+            items = self._get_items(mode)
+        except PriceLookupError:
+            return []
+
+        entries: list[CompletionEntry] = []
+        for item in items:
+            zh_name = str(item.get("zhName") or "").strip()
+            name = str(item.get("name") or "").strip()
+            short_name = str(item.get("shortName") or "").strip()
+            normalized_name = str(item.get("normalizedName") or "").strip()
+
+            lookup = zh_name or name or short_name or normalized_name
+            if not lookup:
+                continue
+
+            display = zh_name or name or short_name or normalized_name
+            tag, tag_color, tag_text_color = _completion_tag(item)
+
+            entries.append(
+                CompletionEntry(
+                    display=display,
+                    lookup=lookup,
+                    tag=tag,
+                    tag_color=tag_color,
+                    tag_text_color=tag_text_color,
+                )
+            )
+        return sorted(entries, key=lambda entry: entry.display.casefold())
 
     def reload_aliases(self) -> int:
         self._aliases = {}
@@ -309,6 +408,41 @@ class TarkovPriceClient:
             raise PriceLookupError("价格 API 响应中没有物品列表。")
 
         return [item for item in items if isinstance(item, dict)]
+
+    def _fetch_historical_prices(
+        self,
+        item_id: str,
+        game_mode: str,
+        days: int,
+    ) -> list[dict[str, Any]]:
+        payload = json.dumps(
+            {
+                "query": HISTORICAL_PRICES_QUERY,
+                "variables": {"id": item_id, "gameMode": game_mode, "days": max(1, int(days))},
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            self.endpoint,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "EFT-Reminder-Price-Overlay/0.1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise PriceLookupError(f"历史价格 API 请求失败：{exc}") from exc
+
+        if data.get("errors"):
+            raise PriceLookupError(f"历史价格 API 返回错误：{data['errors']}")
+
+        points = data.get("data", {}).get("historicalItemPrices")
+        if not isinstance(points, list):
+            raise PriceLookupError("历史价格 API 响应中没有价格点。")
+        return [point for point in points if isinstance(point, dict)]
 
     def _load_disk_cache(self, game_mode: str) -> None:
         cache_path = _cache_path_for_mode(game_mode)
@@ -914,8 +1048,10 @@ def _extract_item_type_terms(value: str) -> set[str]:
     return found
 
 
-def _best_vendor_offer(offers: list[dict[str, Any]]) -> tuple[str | None, int | None, str | None]:
-    vendor_offers: list[tuple[str, int, str]] = []
+def _best_vendor_offer(
+    offers: list[dict[str, Any]],
+) -> tuple[str | None, int | None, int | None, str | None]:
+    vendor_offers: list[tuple[str, int, int, str]] = []
     for offer in offers:
         if not isinstance(offer, dict):
             continue
@@ -927,21 +1063,24 @@ def _best_vendor_offer(offers: list[dict[str, Any]]) -> tuple[str | None, int | 
         price = _as_int(offer.get("price"))
         if price is None:
             continue
+        price_rub = _as_int(offer.get("priceRUB")) or price
         vendor_offers.append(
             (
                 str(name or offer.get("source") or "Vendor"),
                 price,
+                price_rub,
                 str(offer.get("currency") or "RUB"),
             )
         )
 
-    rub_offers = [offer for offer in vendor_offers if offer[2].casefold() == "rub"]
-    comparable_offers = rub_offers or vendor_offers
-    if not comparable_offers:
-        return None, None, None
+    if not vendor_offers:
+        return None, None, None, None
 
-    best_name, best_price, best_currency = max(comparable_offers, key=lambda offer: offer[1])
-    return best_name, best_price, best_currency
+    best_name, best_price, best_price_rub, best_currency = max(
+        vendor_offers,
+        key=lambda offer: offer[2],
+    )
+    return best_name, best_price, best_price_rub, best_currency
 
 
 def _as_int(value: object) -> int | None:
@@ -949,6 +1088,15 @@ def _as_int(value: object) -> int | None:
         return None
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -976,6 +1124,104 @@ def _item_types(item: dict[str, Any]) -> tuple[str, ...]:
         if isinstance(value, str) and value.strip():
             values.append(value.strip())
     return tuple(values)
+
+
+def _completion_tag(item: dict[str, Any]) -> tuple[str, str, str]:
+    item_types = {_normalize(value) for value in _item_types(item)}
+    text = " ".join(
+        str(value)
+        for value in (
+            item.get("name"),
+            item.get("shortName"),
+            item.get("normalizedName"),
+            item.get("zhName"),
+            item.get("zhShortName"),
+        )
+        if value
+    )
+    lowered = text.casefold()
+    normalized = _normalize(text)
+
+    if "gun" in item_types:
+        return "枪械", "#506B3F", "#F5FFE8"
+    if "preset" in item_types:
+        return "预设", "#53606D", "#F2F5F8"
+    if "ammo" in item_types:
+        if "grenade" in item_types:
+            return "投掷物", "#7D6040", "#FFF4E0"
+        return "弹药", "#3D5F9E", "#F2F6FF"
+    if "ammobox" in item_types:
+        return "弹药包", "#4B6EAF", "#F2F6FF"
+    if "keys" in item_types:
+        return "钥匙", "#8B6F33", "#FFF5D6"
+    if "meds" in item_types:
+        return "医疗用品", "#8B3B48", "#FFECEF"
+    if "injectors" in item_types:
+        return "注射器", "#9A4051", "#FFECEF"
+    if "provisions" in item_types:
+        return "食物饮水", "#6B7D38", "#FAFFE8"
+    if "container" in item_types or "markedonly" in item_types:
+        return "容器", "#5E526F", "#F7F0FF"
+    if "backpack" in item_types:
+        return "背包", "#3F6B5A", "#ECFFF8"
+    if "rig" in item_types:
+        return "胸挂", "#4C655B", "#ECFFF8"
+    if "armorplate" in item_types:
+        return "插板", "#5A6670", "#F0F6FA"
+    if "armor" in item_types:
+        return "护甲", "#5A6670", "#F0F6FA"
+    if "helmet" in item_types:
+        return "头盔", "#5B5F65", "#F3F6F8"
+    if "headphones" in item_types:
+        return "耳机", "#496E75", "#EFFFFF"
+    if "glasses" in item_types:
+        return "眼部", "#506A82", "#F0F8FF"
+    if "specialslot" in item_types:
+        return "特殊", "#6B607C", "#F7F0FF"
+    if "mods" in item_types:
+        return _mod_completion_tag(lowered, normalized)
+    if "barter" in item_types:
+        return _barter_completion_tag(lowered, normalized)
+    if "poster" in item_types:
+        return "海报", "#7A5D7D", "#FFF2FF"
+    if "noflea" in item_types:
+        return "禁售", "#62676F", "#F3F5F7"
+    return "物品", "#4F5D6B", "#F5F7FA"
+
+
+def _mod_completion_tag(lowered: str, normalized: str) -> tuple[str, str, str]:
+    checks = (
+        (("flashlight", "tactical device", "laser", "anpeq", "an/peq", "手电", "战术设备", "镭射"), "战术", "#2E6F73", "#EFFFFF"),
+        (("suppressor", "silencer", "消音"), "消音", "#536A57", "#F1FFF3"),
+        (("muzzle", "compensator", "flash hider", "brake", "制退", "消焰", "枪口"), "枪口", "#5F684C", "#FAFFE8"),
+        (("barrel", "枪管"), "枪管", "#6A5845", "#FFF5EA"),
+        (("magazine", "mag ", "弹匣"), "弹匣", "#565F86", "#F2F4FF"),
+        (("receiver", "upper", "lower", "机匣"), "机匣", "#66606A", "#F8F4FF"),
+        (("scope", "sight", "optic", "瞄准镜", "准星", "照门"), "瞄具", "#4E6580", "#F0F8FF"),
+        (("mount", "rail", "ring", "基座", "导轨"), "基座", "#59636A", "#F5FAFF"),
+        (("handguard", "护木"), "护木", "#526A4B", "#F2FFE8"),
+        (("stock", "buffer tube", "枪托", "缓冲管"), "枪托", "#5B624E", "#FAFFE8"),
+        (("grip", "握把"), "握把", "#686047", "#FFF8E8"),
+        (("charging handle", "拉机柄"), "拉机柄", "#5E6470", "#F4F7FB"),
+    )
+    for terms, label, color, text_color in checks:
+        if any(term in lowered or term in normalized for term in terms):
+            return label, color, text_color
+    return "配件", "#505F69", "#F5FAFF"
+
+
+def _barter_completion_tag(lowered: str, normalized: str) -> tuple[str, str, str]:
+    checks = (
+        (("bolt", "screw", "nail", "hose", "tube", "tape", "plexiglass", "foam", "sealant", "wire", "cord", "bulb", "建筑", "螺丝", "螺栓", "钉", "软管", "胶带", "电线", "灯泡"), "建材", "#7A6740", "#FFF7E5"),
+        (("circuit", "capacitor", "battery", "powerbank", "cpu", "ram", "ssd", "motor", "relay", "电子", "电容", "电池", "马达", "继电器"), "电子", "#3F6E78", "#EFFFFF"),
+        (("wrench", "screwdriver", "pliers", "tool", "drill", "工具", "扳手", "螺丝刀", "钳", "电钻"), "工具", "#766042", "#FFF4E5"),
+        (("figurine", "chainlet", "bitcoin", "coin", "skull", "vase", "statue", "gold", "雕像", "金币", "金链", "花瓶"), "贵重", "#8C6A28", "#FFF5D0"),
+        (("fuel", "propane", "燃料", "丙烷"), "燃料", "#7A4F3B", "#FFF0E8"),
+    )
+    for terms, label, color, text_color in checks:
+        if any(term in lowered or term in normalized for term in terms):
+            return label, color, text_color
+    return "可交换", "#6A6455", "#FFF9EB"
 
 
 FIREARM_TYPE_TERMS = {

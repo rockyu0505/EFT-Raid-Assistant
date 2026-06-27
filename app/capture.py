@@ -25,6 +25,7 @@ ITEM_NAME_PATH = DEBUG_DIR / "last_item_name.png"
 ITEM_HOVER_SEARCH_PATH = DEBUG_DIR / "last_item_hover_search.png"
 INVENTORY_TAB_PATH = DEBUG_DIR / "last_inventory_tab.png"
 GAME_MODE_PATH = DEBUG_DIR / "last_game_mode.png"
+HIDEOUT_SCREENSHOT_PATH = DEBUG_DIR / "last_hideout_screenshot.png"
 
 
 @dataclass(frozen=True)
@@ -249,6 +250,15 @@ def capture_game_mode_region(
     return crop, (region.width, region.height), region.name
 
 
+def capture_hideout_screen(capture_mode: str) -> tuple[Image.Image, tuple[int, int], str]:
+    """Capture the full selected region for hideout upgrade OCR."""
+    DEBUG_DIR.mkdir(exist_ok=True)
+    region = _resolve_region(capture_mode)
+    image = _grab_region(region)
+    image.save(HIDEOUT_SCREENSHOT_PATH)
+    return image, (region.width, region.height), region.name
+
+
 def resolve_capture_region(capture_mode: str) -> Region:
     return _resolve_region(capture_mode)
 
@@ -409,3 +419,7 @@ def inventory_tab_debug_path() -> Path:
 
 def game_mode_debug_path() -> Path:
     return GAME_MODE_PATH
+
+
+def hideout_debug_path() -> Path:
+    return HIDEOUT_SCREENSHOT_PATH

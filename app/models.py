@@ -51,6 +51,7 @@ class ParsedItemName:
 
 @dataclass(frozen=True)
 class ItemPrice:
+    item_id: str
     game_mode: str
     name: str
     short_name: str
@@ -59,7 +60,11 @@ class ItemPrice:
     matched_name: str
     confidence: float
     last_low_price: int | None
+    low_24h_price: int | None
+    high_24h_price: int | None
     avg_24h_price: int | None
+    change_48h_percent: float | None
+    last_offer_count: int | None
     base_price: int | None
     width: int | None
     height: int | None
@@ -69,6 +74,21 @@ class ItemPrice:
     is_firearm: bool
     best_vendor_name: str | None
     best_vendor_price: int | None
+    best_vendor_price_rub: int | None
     best_vendor_currency: str | None
     wiki_link: str | None
     updated: str | None
+
+
+@dataclass(frozen=True)
+class HistoricalPriceSummary:
+    item_id: str
+    game_mode: str
+    median_price: int | None
+    sample_count: int
+    latest_price: int | None
+    latest_min_price: int | None
+    latest_offer_count: int | None
+    low_price: int | None
+    high_price: int | None
+    days: int

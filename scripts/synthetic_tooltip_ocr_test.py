@@ -47,9 +47,9 @@ def main() -> int:
     )
     parser.add_argument("--mode", default="pve", choices=["pve", "regular"])
     parser.add_argument(
-        "--engines",
-        default="rapidocr,tesseract",
-        help="Comma-separated engines: rapidocr,rapidocr_v5,tesseract,rapidocr+tesseract",
+        "--models",
+        default="v5",
+        help="Comma-separated RapidOCR model versions: v4,v5.",
     )
     parser.add_argument(
         "--name-source",
@@ -77,7 +77,7 @@ def main() -> int:
         cases = cases[: args.limit]
 
     font = _load_font(args.font_size)
-    engines = [engine.strip() for engine in args.engines.split(",") if engine.strip()]
+    models = [model.strip() for model in args.models.split(",") if model.strip()]
     prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     csv_path = OUT_DIR / f"{prefix}{args.mode}_{args.name_source}_results.csv"
     summary_path = OUT_DIR / f"{prefix}{args.mode}_{args.name_source}_summary.json"
@@ -89,14 +89,14 @@ def main() -> int:
         image = render_tooltip(case.render_name, font, max_width=args.max_width)
         image.save(TEMP_IMAGE)
 
-        for engine in engines:
+        for model in models:
             started = time.perf_counter()
-            ocr_result = run_item_name_ocr(TEMP_IMAGE, "", "chi_sim+eng", engine)
+            ocr_result = run_item_name_ocr(TEMP_IMAGE, model)
             elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
             match = _lookup_candidates(client, ocr_result.candidates, args.mode, items)
             status = _status_for_match(case, match)
             row = {
-                "engine": engine,
+                "engine": model,
                 "status": status,
                 "elapsed_ms": elapsed_ms,
                 "variant": ocr_result.variant_name,
@@ -115,7 +115,7 @@ def main() -> int:
 
             if args.save_failures and status != "ok":
                 safe_id = _safe_filename(case.item_id or str(index))
-                image.save(FAILURE_IMAGE_DIR / f"{engine}_{status}_{safe_id}.png")
+                image.save(FAILURE_IMAGE_DIR / f"{model}_{status}_{safe_id}.png")
 
         if index % 25 == 0 or index == len(cases):
             elapsed = time.perf_counter() - started_all
@@ -125,7 +125,7 @@ def main() -> int:
             )
 
     _write_csv(csv_path, rows)
-    summary = _summarize(rows, len(cases), engines)
+    summary = _summarize(rows, len(cases), models)
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     suggestions = _build_alias_suggestions(rows)
     suggestions_path.write_text(

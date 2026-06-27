@@ -23,9 +23,6 @@ exact version you ship.
 | OpenCV Python | Image processing dependency | Apache-2.0 |
 | NumPy | Numerical array runtime | BSD-3-Clause and bundled third-party licenses |
 | Pillow | Image processing | MIT-CMU |
-| pytesseract | Python wrapper for Tesseract | Apache-2.0 |
-| Tesseract OCR | OCR fallback executable/runtime | Apache-2.0 |
-| tessdata language files | Tesseract OCR language data | Apache-2.0 or upstream tessdata terms |
 | pynput | Global hotkeys | LGPLv3 |
 | mss | Screenshot capture | MIT |
 | pywin32 | Windows integration | PSF |
