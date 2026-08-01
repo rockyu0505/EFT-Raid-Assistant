@@ -48,8 +48,10 @@ terminology belong to their respective rights holders.
 
 Versioned craft and trader-barter snapshots in `data/recipes.json` are also
 generated from the public tarkov.dev JSON API (`/regular/crafts`,
-`/regular/barters`, `/pve/crafts`, and `/pve/barters`). The snapshot is bundled
-for offline lookup and is not presented as original project-owned game data.
+`/regular/barters`, `/pve/crafts`, and `/pve/barters`), plus the corresponding
+`tasks`, `tasks_en`, `tasks_zh`, `traders`, and `traders_en` data needed for
+localized unlock notes and English trader names. The snapshot is bundled for
+offline lookup and is not presented as original project-owned game data.
 Upstream project and schema information:
 
 - https://json.tarkov.dev/endpoints

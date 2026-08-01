@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import unittest
 from copy import deepcopy
@@ -14,14 +15,17 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from app.config import DEFAULT_CONFIG
-from app.gui import MainWindow, PriceToast, _build_price_view
+from app.gui import MainWindow, PriceToast, SettingsDialog, _build_price_view
 from app.recipes import (
     RecipeCatalog,
     RecipeNotice,
+    recipe_acquisition_text,
     recipe_requirement_rows,
     recipe_search_text,
     recipe_source_text,
+    recipe_unlock_note,
 )
+from app.ui.theme import apply_app_theme
 
 
 class _RecipeSmokeWindow(MainWindow):
@@ -55,6 +59,14 @@ class RecipeCatalogTests(unittest.TestCase):
             "kind": "craft",
             "source": "工作台",
             "level": 2,
+            "duration": 3661,
+            "task_unlock": True,
+            "unlock_task": {
+                "id": "task-1",
+                "trader": "Mechanic",
+                "name_en": "Test Drive",
+                "name_zh": "试驾",
+            },
             "product": {
                 "id": "product",
                 "name": "测试弹药",
@@ -75,7 +87,7 @@ class RecipeCatalogTests(unittest.TestCase):
         self.path.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "generated_at": "2026-08-01T00:00:00Z",
                     "source": "test",
                     "handbook_categories": {
@@ -109,11 +121,31 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertIn("测试弹药", search_text)
         self.assertIn("工作台", search_text)
         self.assertIn("火药", search_text)
+        self.assertIn("试驾", search_text)
+        self.assertIn("test drive", search_text)
 
         path = RecipeCatalog(self.path).category_path(record)
         self.assertEqual([category["name"] for category in path], ["弹药", "子弹"])
 
         self.assertEqual(recipe_source_text(record), "工作台 Lv2 制作")
+        self.assertEqual(recipe_acquisition_text(record), "01:01:01")
+        self.assertEqual(
+            recipe_unlock_note(record, "zh"),
+            "完成 Mechanic 的“试驾”任务后解锁",
+        )
+        self.assertEqual(
+            recipe_unlock_note(record, "en"),
+            "完成 Mechanic 的“Test Drive”任务后解锁",
+        )
+        record["unlock_task"]["name_zh"] = ""
+        self.assertEqual(
+            recipe_unlock_note(record, "zh"),
+            "完成 Mechanic 的“Test Drive”任务后解锁",
+        )
+        self.assertEqual(
+            recipe_acquisition_text({"kind": "barter", "buy_limit": 3}),
+            "限购 ×3",
+        )
         requirement = recipe_requirement_rows(record)[0]
         self.assertEqual(requirement.display_name, "火药（等级≥15；需可用）")
         self.assertTrue(requirement.is_tool)
@@ -185,11 +217,13 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertEqual(window.recipe_color_label.text(), "#3366AA")
         self.assertGreaterEqual(window.minimumWidth(), 1080)
         self.assertEqual(window.recipe_result_tree.headerItem().text(1), "工具")
+        self.assertEqual(window.recipe_result_tree.headerItem().text(3), "耗时 / 限购")
+        self.assertEqual(window.recipe_result_tree.headerItem().text(4), "备注")
 
         product_item = window.recipe_result_tree.topLevelItem(0)
         self.assertTrue(product_item.text(0).endswith(f"（{product_item.childCount()}）"))
         recipe_item = product_item.child(0)
-        self.assertRegex(recipe_item.text(0), r"(制作|兑换)(（任务解锁）)?$")
+        self.assertRegex(recipe_item.text(0), r"(制作|兑换)$")
         self.assertEqual(recipe_item.text(1), "")
         self.assertTrue(recipe_item.text(2).startswith("产出 ×"))
         self.assertEqual(recipe_item.foreground(2).color().name(), "#e8c47a")
@@ -209,6 +243,51 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertTrue(any(item.text(1) == "✓" for item in requirement_items))
         self.assertTrue(any("（等级≥" in item.text(0) for item in requirement_items))
 
+        recipe_items = [
+            product_item.child(recipe_index)
+            for product_index in range(window.recipe_result_tree.topLevelItemCount())
+            for product_item in [window.recipe_result_tree.topLevelItem(product_index)]
+            for recipe_index in range(product_item.childCount())
+        ]
+        self.assertTrue(
+            any(
+                item.text(0).endswith("制作")
+                and re.fullmatch(r"\d{2,3}:\d{2}:\d{2}", item.text(3))
+                for item in recipe_items
+            )
+        )
+        self.assertTrue(
+            any(
+                item.text(0).endswith("兑换")
+                and item.text(3).startswith(("限购", "不限购"))
+                for item in recipe_items
+            )
+        )
+        self.assertTrue(
+            any(
+                item.text(4).startswith("完成 ")
+                and item.text(4).endswith("任务后解锁")
+                for item in recipe_items
+            )
+        )
+        self.assertTrue(
+            any(
+                item.text(0).startswith(
+                    (
+                        "Prapor",
+                        "Therapist",
+                        "Skier",
+                        "Peacekeeper",
+                        "Mechanic",
+                        "Ragman",
+                        "Jaeger",
+                        "Ref",
+                    )
+                )
+                for item in recipe_items
+            )
+        )
+
         tracked_product = window.tracked_recipe_tree.topLevelItem(0)
         tracked_product.child(0).setSelected(True)
         window._delete_selected_tracked_recipes()
@@ -222,6 +301,25 @@ class RecipeCatalogTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(catalog.handbook_categories), 80)
         self.assertEqual(sum(bool(catalog.category_path(record)) for record in records), 1019)
+        unlocks = [record for record in records if record.get("task_unlock")]
+        self.assertEqual(len(unlocks), 104)
+        self.assertTrue(
+            all(isinstance(record.get("unlock_task"), dict) for record in unlocks)
+        )
+
+    def test_interface_font_setting_applies_live(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["ui_font_size"] = 15
+        dialog = SettingsDialog(config)
+
+        self.assertEqual(dialog.ui_font_size.value(), 15)
+        dialog.ui_font_size.setValue(17)
+        self.assertEqual(dialog.values()["ui_font_size"], 17)
+        apply_app_theme(self.app, 17)
+        self.assertEqual(self.app.font().pointSize(), 17)
+
+        apply_app_theme(self.app, int(DEFAULT_CONFIG["ui_font_size"]))
+        dialog.close()
 
 
 if __name__ == "__main__":

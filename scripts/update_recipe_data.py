@@ -14,17 +14,6 @@ OUTPUT_PATH = ROOT / "data" / "recipes.json"
 GAME_MODES = ("regular", "pve")
 MINIMUM_SOURCE_COUNTS = {"crafts": 100, "barters": 400}
 
-TRADER_NAMES = {
-    "54cb50c76803fa8b248b4571": "普拉波",
-    "54cb57776803fa99248b456e": "医生",
-    "579dc571d53a0658a154fbec": "围栏",
-    "58330581ace78e27b8b10cee": "滑雪者",
-    "5935c25fb3acc3127c3d8cd9": "和平使者",
-    "5a7c2eca46aef81a7ca2145d": "机械师",
-    "5ac3b934156ae10c4430e83c": "服装商",
-    "5c0647fdd443bc2504c2d371": "耶格",
-    "6617beeaa9cfa777ca915b7c": "Ref",
-}
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -41,23 +30,52 @@ def main() -> int:
     source_etags["regular/items"] = item_etag
     source_etags["regular/items_zh"] = item_zh_etag
     handbook_categories = _handbook_categories(item_document, item_zh_document)
+    trader_document, trader_etag = _fetch_json("regular/traders")
+    trader_en_document, trader_en_etag = _fetch_json("regular/traders_en")
+    source_etags["regular/traders"] = trader_etag
+    source_etags["regular/traders_en"] = trader_en_etag
+    trader_names = _trader_names(trader_document, trader_en_document)
+    task_en_document, task_en_etag = _fetch_json("regular/tasks_en")
+    task_zh_document, task_zh_etag = _fetch_json("regular/tasks_zh")
+    source_etags["regular/tasks_en"] = task_en_etag
+    source_etags["regular/tasks_zh"] = task_zh_etag
     for mode in GAME_MODES:
         item_map = _load_item_map(mode)
+        tasks, task_etag = _fetch_json(f"{mode}/tasks")
         crafts, craft_etag = _fetch_json(f"{mode}/crafts")
         barters, barter_etag = _fetch_json(f"{mode}/barters")
+        source_etags[f"{mode}/tasks"] = task_etag
         source_etags[f"{mode}/crafts"] = craft_etag
         source_etags[f"{mode}/barters"] = barter_etag
+        unlock_tasks = _task_unlocks(
+            tasks,
+            task_en_document,
+            task_zh_document,
+            trader_names,
+        )
         craft_rows = _data_list(crafts)
         barter_rows = _data_list(barters)
         _validate_source_count(mode, "crafts", craft_rows)
         _validate_source_count(mode, "barters", barter_rows)
         records = [
             *(
-                _craft_record(record, item_map, station_names, handbook_categories)
+                _craft_record(
+                    record,
+                    item_map,
+                    station_names,
+                    handbook_categories,
+                    unlock_tasks,
+                )
                 for record in craft_rows
             ),
             *(
-                _barter_record(record, item_map, handbook_categories)
+                _barter_record(
+                    record,
+                    item_map,
+                    handbook_categories,
+                    trader_names,
+                    unlock_tasks,
+                )
                 for record in barter_rows
             ),
         ]
@@ -72,7 +90,7 @@ def main() -> int:
         )
 
     document = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": datetime.now(UTC).isoformat(),
         "source": "tarkov.dev JSON API",
         "source_url": JSON_API,
@@ -212,20 +230,85 @@ def _handbook_categories(
     return categories
 
 
+def _trader_names(
+    trader_document: dict[str, Any], translations_document: dict[str, Any]
+) -> dict[str, str]:
+    traders = trader_document.get("data")
+    translations = translations_document.get("data")
+    if not isinstance(traders, dict) or not isinstance(translations, dict):
+        raise RuntimeError("The traders endpoint did not include English translations.")
+    names: dict[str, str] = {}
+    for trader_id, value in traders.items():
+        if not isinstance(value, dict):
+            continue
+        identifier = str(value.get("id") or trader_id)
+        name_key = str(value.get("name") or "")
+        normalized_name = str(value.get("normalizedName") or "")
+        names[identifier] = str(
+            translations.get(name_key)
+            or normalized_name.replace("-", " ").title()
+            or identifier
+        )
+    if len(names) < 8:
+        raise RuntimeError(f"Refusing to build with only {len(names)} trader names.")
+    return names
+
+
+def _task_unlocks(
+    task_document: dict[str, Any],
+    translations_en_document: dict[str, Any],
+    translations_zh_document: dict[str, Any],
+    trader_names: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    data = task_document.get("data")
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    translations_en = translations_en_document.get("data")
+    translations_zh = translations_zh_document.get("data")
+    if not all(
+        isinstance(value, dict)
+        for value in (tasks, translations_en, translations_zh)
+    ):
+        raise RuntimeError("The tasks endpoint did not include task translations.")
+    result: dict[str, dict[str, str]] = {}
+    for task_id, value in tasks.items():
+        if not isinstance(value, dict):
+            continue
+        identifier = str(value.get("id") or task_id)
+        name_key = str(value.get("name") or "")
+        normalized_name = str(value.get("normalizedName") or "")
+        name_en = str(
+            translations_en.get(name_key)
+            or normalized_name.replace("-", " ").title()
+            or identifier
+        )
+        trader_id = str(value.get("trader") or "")
+        result[identifier] = {
+            "id": identifier,
+            "trader": trader_names.get(trader_id, trader_id or "Unknown trader"),
+            "name_en": name_en,
+            "name_zh": str(translations_zh.get(name_key) or ""),
+        }
+    if len(result) < 400:
+        raise RuntimeError(f"Refusing to build with only {len(result)} tasks.")
+    return result
+
+
 def _craft_record(
     record: dict[str, Any],
     items: dict[str, dict[str, Any]],
     stations: dict[str, str],
     handbook_categories: dict[str, dict[str, Any]],
+    unlock_tasks: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
     station_id = str(record.get("station") or "")
-    return {
+    unlock_task = _unlock_task(record, unlock_tasks)
+    result = {
         "id": str(record.get("id") or ""),
         "kind": "craft",
         "source": stations.get(station_id, station_id or "未知工作站"),
         "level": _int_value(record.get("level")),
         "duration": _int_value(record.get("duration")),
-        "task_unlock": bool(record.get("taskUnlock")),
+        "task_unlock": unlock_task is not None,
         "product": _contained_item(
             record.get("productItem"),
             items,
@@ -237,21 +320,27 @@ def _craft_record(
             if isinstance(item, dict)
         ],
     }
+    if unlock_task is not None:
+        result["unlock_task"] = unlock_task
+    return result
 
 
 def _barter_record(
     record: dict[str, Any],
     items: dict[str, dict[str, Any]],
     handbook_categories: dict[str, dict[str, Any]],
+    trader_names: dict[str, str],
+    unlock_tasks: dict[str, dict[str, str]],
 ) -> dict[str, Any]:
     trader_id = str(record.get("trader") or "")
-    return {
+    unlock_task = _unlock_task(record, unlock_tasks)
+    result = {
         "id": str(record.get("id") or ""),
         "kind": "barter",
-        "source": TRADER_NAMES.get(trader_id, trader_id or "未知商人"),
+        "source": trader_names.get(trader_id, trader_id or "Unknown trader"),
         "level": _int_value(record.get("minTraderLevel")),
         "buy_limit": _number(record.get("buyLimit")),
-        "task_unlock": bool(record.get("taskUnlock")),
+        "task_unlock": unlock_task is not None,
         "product": _contained_item(
             record.get("offeredItem"),
             items,
@@ -263,6 +352,21 @@ def _barter_record(
             if isinstance(item, dict)
         ],
     }
+    if unlock_task is not None:
+        result["unlock_task"] = unlock_task
+    return result
+
+
+def _unlock_task(
+    record: dict[str, Any], unlock_tasks: dict[str, dict[str, str]]
+) -> dict[str, str] | None:
+    task_id = str(record.get("taskUnlock") or "")
+    if not task_id:
+        return None
+    task = unlock_tasks.get(task_id)
+    if task is None:
+        raise RuntimeError(f"Recipe references unresolved unlock task: {task_id}")
+    return task
 
 
 def _contained_item(

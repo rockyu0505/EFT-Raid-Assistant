@@ -116,12 +116,15 @@ from app.recipes import (
     RecipeCatalog,
     RecipeDataError,
     RecipeNotice,
+    recipe_acquisition_text,
     recipe_requirement_rows,
     recipe_search_text,
     recipe_source_text,
+    recipe_unlock_note,
 )
 from app.ui.raid_overlays import RaidControlOverlay, RaidLogOverlay
 from app.ui.state import LogBus, SettingsStore
+from app.ui.theme import apply_app_theme
 
 
 DISPLAY_FILTER_SLIDERS = {
@@ -280,8 +283,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("塔科夫局内助手")
-        self.resize(1280, 820)
-        self.setMinimumSize(1080, 700)
+        self.resize(1440, 860)
+        self.setMinimumSize(1120, 700)
 
         self.config = load_config()
         self.settings_store = SettingsStore(self.config, self)
@@ -760,7 +763,7 @@ class MainWindow(QMainWindow):
 
         search_row = QHBoxLayout()
         self.recipe_search_field = QLineEdit()
-        self.recipe_search_field.setPlaceholderText("搜索产物、来源或所需物品")
+        self.recipe_search_field.setPlaceholderText("搜索产物、来源、任务或所需物品")
         self.recipe_search_field.textChanged.connect(self._populate_recipe_results)
         collapse_button = QPushButton("折叠配方")
         collapse_button.clicked.connect(lambda: self.recipe_result_tree.collapseAll())
@@ -796,7 +799,7 @@ class MainWindow(QMainWindow):
         )
         self.recipe_result_tree.itemChanged.connect(self._on_recipe_item_changed)
         splitter.addWidget(self.recipe_result_tree)
-        splitter.setSizes([310, 850])
+        splitter.setSizes([280, 1000])
         browser_layout.addWidget(splitter, 1)
         self.recipe_tabs.addTab(browser, "按产物浏览")
 
@@ -848,16 +851,20 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _configure_recipe_detail_tree(tree: QTreeWidget, first_header: str) -> None:
-        tree.setHeaderLabels([first_header, "工具", "数量"])
+        tree.setHeaderLabels([first_header, "工具", "数量", "耗时 / 限购", "备注"])
         tree.setAlternatingRowColors(True)
         tree.setUniformRowHeights(True)
         tree.header().setStretchLastSection(False)
         tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         tree.setColumnWidth(1, 58)
+        tree.setColumnWidth(4, 260)
         tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
         tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
+        tree.headerItem().setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)
 
     def _tracked_recipe_ids(self) -> set[str]:
         value = self.config.get("tracked_recipe_ids", [])
@@ -1038,6 +1045,8 @@ class MainWindow(QMainWindow):
                         f"（{len(product_records)}）",
                         "",
                         "",
+                        "",
+                        "",
                     ]
                 )
                 product_font = product_item.font(0)
@@ -1081,14 +1090,31 @@ class MainWindow(QMainWindow):
         source_text = recipe_source_text(record)
         if mode_text:
             source_text = f"{source_text}（{mode_text}）"
+        acquisition_text = recipe_acquisition_text(record)
+        note_text = recipe_unlock_note(
+            record,
+            str(self.config.get("item_display_language", "zh")),
+        )
         recipe_item = QTreeWidgetItem(
-            [source_text, "", _recipe_product_count_text(record)]
+            [
+                source_text,
+                "",
+                _recipe_product_count_text(record),
+                acquisition_text,
+                note_text,
+            ]
         )
         recipe_item.setFlags(recipe_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         recipe_item.setForeground(2, QBrush(QColor("#E8C47A")))
         recipe_item.setTextAlignment(
             2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
+        recipe_item.setForeground(3, QBrush(QColor("#C9D0DA")))
+        recipe_item.setTextAlignment(
+            3, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+        )
+        if note_text:
+            recipe_item.setToolTip(4, note_text)
         recipe_id = str(record.get("id") or "")
         recipe_item.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
         recipe_item.setCheckState(
@@ -1097,7 +1123,7 @@ class MainWindow(QMainWindow):
         for requirement in recipe_requirement_rows(record):
             tool_text = "✓" if requirement.is_tool else ""
             requirement_item = QTreeWidgetItem(
-                [requirement.display_name, tool_text, requirement.count_text]
+                [requirement.display_name, tool_text, requirement.count_text, "", ""]
             )
             requirement_item.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
             requirement_item.setForeground(0, QBrush(QColor("#AAB3BE")))
@@ -1142,6 +1168,8 @@ class MainWindow(QMainWindow):
                         f"（{len(product_entries)}）",
                         "",
                         "",
+                        "",
+                        "",
                     ]
                 )
                 product_font = product_item.font(0)
@@ -1163,7 +1191,7 @@ class MainWindow(QMainWindow):
                 self.tracked_recipe_tree.expandToDepth(1)
             else:
                 self.tracked_recipe_tree.addTopLevelItem(
-                    QTreeWidgetItem(["还没有关注任何配方。", "", ""])
+                    QTreeWidgetItem(["还没有关注任何配方。", "", "", "", ""])
                 )
             self.recipe_tabs.setTabText(1, f"已关注总览 ({len(entries)})")
         finally:
@@ -2151,8 +2179,13 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         previous_features = self._configured_enabled_features()
+        previous_font_size = _safe_int(self.config.get("ui_font_size")) or 11
+        previous_language = str(self.config.get("item_display_language", "zh"))
         self.config.update(dialog.values())
         features_changed = previous_features != self._configured_enabled_features()
+        font_size = _safe_int(self.config.get("ui_font_size")) or 11
+        if font_size != previous_font_size:
+            apply_app_theme(QApplication.instance(), font_size)
         if hasattr(self, "price_mode_combo"):
             mode_index = self.price_mode_combo.findData(
                 str(self.config.get("price_game_mode_default", "pve"))
@@ -2170,6 +2203,12 @@ class MainWindow(QMainWindow):
             self._log_event("功能开关已保存；主界面面板和模块热键会在重启后生效。")
         self._update_cache_status_label()
         self._refresh_item_completer()
+        if (
+            font_size != previous_font_size
+            or previous_language
+            != str(self.config.get("item_display_language", "zh"))
+        ) and hasattr(self, "recipe_category_tree"):
+            self._populate_recipe_tree()
         if self._should_auto_refresh_price_cache():
             self.refresh_price_cache(background=True)
 
@@ -3779,6 +3818,7 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(self._build_hotkeys_tab(), "热键")
+        tabs.addTab(self._build_interface_tab(), "界面")
         tabs.addTab(self._build_features_tab(), "功能")
         tabs.addTab(self._build_reminders_tab(), "提醒")
         tabs.addTab(self._build_prices_tab(), "价格")
@@ -3794,6 +3834,21 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _build_interface_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QFormLayout(tab)
+        self.ui_font_size = QSpinBox()
+        self.ui_font_size.setRange(9, 18)
+        self.ui_font_size.setSuffix(" pt")
+        layout.addRow("主界面字体大小", self.ui_font_size)
+        note = QLabel(
+            "保存后立即应用到主窗口和设置界面；局内悬浮提示保留独立字号，"
+            "避免遮挡游戏画面。"
+        )
+        note.setWordWrap(True)
+        layout.addRow(note)
+        return tab
 
     def _build_capture_tab(self) -> QWidget:
         tab = QWidget()
@@ -4001,7 +4056,7 @@ class SettingsDialog(QDialog):
         layout.addRow(self.require_inventory_check)
         layout.addRow(self.refresh_prices_on_startup)
         layout.addRow("浮窗显示秒数", self.price_overlay_seconds)
-        layout.addRow("物品名称语言", self.item_display_language)
+        layout.addRow("物品与任务名称语言", self.item_display_language)
         layout.addRow("默认价格模式", self.price_game_mode_default)
         return tab
 
@@ -4165,6 +4220,7 @@ class SettingsDialog(QDialog):
             bool(self._config.get("refresh_prices_on_startup", True))
         )
         self.price_overlay_seconds.setValue(int(self._config.get("price_overlay_seconds", 10)))
+        self.ui_font_size.setValue(_safe_int(self._config.get("ui_font_size")) or 11)
         display_language_index = self.item_display_language.findData(
             str(self._config.get("item_display_language", "zh"))
         )
@@ -4236,6 +4292,7 @@ class SettingsDialog(QDialog):
             "price_overlay_enabled": self.price_overlay_enabled.isChecked(),
             "price_overlay_seconds": self.price_overlay_seconds.value(),
             "close_to_tray": self.close_to_tray.isChecked(),
+            "ui_font_size": self.ui_font_size.value(),
             "item_display_language": self.item_display_language.currentData() or "zh",
             "require_tarkov_foreground": self.require_tarkov_foreground.isChecked(),
             "require_inventory_check": self.require_inventory_check.isChecked(),

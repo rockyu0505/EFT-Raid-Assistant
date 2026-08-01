@@ -172,10 +172,22 @@ QToolTip {
 """
 
 
-def apply_app_theme(application: object) -> None:
+def apply_app_theme(application: object, font_size: object = 11) -> None:
+    try:
+        safe_font_size = max(9, min(18, int(font_size)))
+    except (TypeError, ValueError):
+        safe_font_size = 11
     set_style = getattr(application, "setStyle", None)
     if callable(set_style):
         set_style("Fusion")
+    get_font = getattr(application, "font", None)
+    set_font = getattr(application, "setFont", None)
+    if callable(get_font) and callable(set_font):
+        font = get_font()
+        set_point_size = getattr(font, "setPointSize", None)
+        if callable(set_point_size):
+            set_point_size(safe_font_size)
+            set_font(font)
     set_stylesheet = getattr(application, "setStyleSheet", None)
     if callable(set_stylesheet):
         set_stylesheet(APP_STYLESHEET)

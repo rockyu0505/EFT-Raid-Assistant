@@ -151,6 +151,7 @@ class RecipeCatalog:
         if not isinstance(document, dict) or int(document.get("schema_version", 0)) not in {
             1,
             2,
+            3,
         }:
             raise RecipeDataError("本地配方数据版本不受支持。")
         modes = document.get("modes")
@@ -201,6 +202,7 @@ def recipe_search_text(record: dict[str, Any]) -> str:
             str(product.get("short_name") or ""),
             str(record.get("source") or ""),
             str(record.get("category") or ""),
+            _unlock_task_search_text(record),
             requirement_names,
         )
     ).casefold()
@@ -218,8 +220,33 @@ def recipe_source_text(record: dict[str, Any]) -> str:
     source = str(record.get("source") or "未知来源")
     level = int(record.get("level") or 0)
     level_text = f" Lv{level}" if level > 0 else ""
-    unlock = "（任务解锁）" if bool(record.get("task_unlock")) else ""
-    return f"{source}{level_text} {action}{unlock}"
+    return f"{source}{level_text} {action}"
+
+
+def recipe_acquisition_text(record: dict[str, Any]) -> str:
+    if record.get("kind") == "craft":
+        return _format_duration(record.get("duration"))
+    buy_limit = record.get("buy_limit")
+    try:
+        value = float(buy_limit)
+    except (TypeError, ValueError):
+        return "不限购"
+    if value <= 0:
+        return "不限购"
+    return f"限购 ×{_format_count(value)}"
+
+
+def recipe_unlock_note(record: dict[str, Any], display_language: str) -> str:
+    if not bool(record.get("task_unlock")):
+        return ""
+    task = record.get("unlock_task")
+    if not isinstance(task, dict):
+        return "完成对应任务后解锁"
+    name_en = str(task.get("name_en") or task.get("id") or "未知任务")
+    name_zh = str(task.get("name_zh") or "")
+    task_name = name_en if display_language.casefold() == "en" else name_zh or name_en
+    trader = str(task.get("trader") or "Unknown trader")
+    return f"完成 {trader} 的“{task_name}”任务后解锁"
 
 
 def recipe_requirements_text(record: dict[str, Any], *, max_items: int = 5) -> str:
@@ -319,6 +346,25 @@ def _format_count(value: object) -> str:
     if number.is_integer():
         return f"{int(number):,}"
     return f"{number:,.2f}".rstrip("0").rstrip(".")
+
+
+def _format_duration(value: object) -> str:
+    try:
+        total_seconds = max(0, int(float(value)))
+    except (TypeError, ValueError):
+        total_seconds = 0
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _unlock_task_search_text(record: dict[str, Any]) -> str:
+    task = record.get("unlock_task")
+    if not isinstance(task, dict):
+        return ""
+    return " ".join(
+        str(task.get(key) or "") for key in ("trader", "name_en", "name_zh")
+    )
 
 
 def _mode(value: str) -> str:

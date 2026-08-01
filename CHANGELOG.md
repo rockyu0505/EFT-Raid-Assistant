@@ -10,6 +10,8 @@
 - Added an optional offline recipe-tracking module using tarkov.dev's game-handbook category hierarchy, with a category browser and product → concrete recipe → per-material rows.
 - Added a tracked-recipe overview for unified untracking, multi-selection deletion, clearing, and recipe-notice accent-color customization.
 - Simplified recipe rows so product recipe counts and material requirements stay beside their names, recipe actions read naturally as source/level plus craft or barter, tools use a dedicated check column, and output/material quantities use distinct colors.
+- Added a live 9–18pt main-interface font-size setting, with the default raised to 11pt.
+- Added English trader names, `hh:mm:ss` craft durations, barter buy limits, and localized task-unlock notes backed by exact task IDs from the bundled tarkov.dev snapshot.
 - Changed tracked-material price notices into a separately bordered nested section below the normal price content, listing every related product plus trader/station level and current-item quantity.
 - Bundled versioned PvE/PvP craft and trader-barter snapshots generated from tarkov.dev's static JSON endpoints; runtime recipe lookup is local-only.
 - Added a shared UI theme, settings store, and log event bus as the first stage of splitting the desktop shell away from the monolithic main-window implementation.

@@ -67,6 +67,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "price_overlay_enabled": True,
     "price_overlay_seconds": 10,
     "close_to_tray": True,
+    "ui_font_size": 11,
     "item_display_language": "zh",
     "price_value_basis": "slot",
     "firearm_value_color": "#8FA35A",
