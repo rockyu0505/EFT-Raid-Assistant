@@ -17,7 +17,8 @@ FEATURE_DEFINITIONS: dict[str, str] = {
     "price_lookup": "局内查价",
     "trader_reminders": "商人补货",
     "hideout": "藏身处记录",
-    "display_filter": "Gamma 显示调校",
+    "display_filter": "画面增强（Gamma）",
+    "recipe_tracking": "关注制作/兑换配方",
 }
 DEFAULT_ENABLED_FEATURES = ["price_lookup", "trader_reminders", "hideout"]
 
@@ -93,6 +94,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "raid_panel_opacity": 84,
     "raid_log_opacity": 72,
     "raid_log_max_lines": 200,
+    "tracked_recipe_ids": [],
     "sound_enabled": True,
     "popup_enabled": True,
     "performance_mode_enabled": True,

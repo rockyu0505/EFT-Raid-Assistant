@@ -63,6 +63,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -87,11 +89,12 @@ from app.capture import (
 from app.config import APP_DIR, load_config, save_config
 from app.config import CONFIG_PATH, DEFAULT_ENABLED_FEATURES, FEATURE_DEFINITIONS
 from app.display_filter import (
+    DisplayFilterBaseline,
     DisplayFilterError,
-    apply_preset,
     build_gamma_ramp,
-    get_gamma_ramp,
-    set_gamma_ramp,
+    restore_display_filter as restore_system_display_filter,
+    start_display_filter,
+    update_display_filter,
 )
 from app.hideout import HideoutDataError, HideoutTracker
 from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
@@ -105,6 +108,14 @@ from app.models import TRADERS, TraderReminder
 from app.ocr import OcrUnavailableError, run_ocr, timer_to_seconds
 from app.prices import CHINESE_ALIASES_PATH, PriceLookupError, TarkovPriceClient
 from app.reminders import ReminderManager
+from app.recipes import (
+    RecipeCatalog,
+    RecipeDataError,
+    recipe_requirements_text,
+    recipe_search_text,
+    recipe_source_text,
+    recipe_title,
+)
 from app.ui.raid_overlays import RaidControlOverlay, RaidLogOverlay
 from app.ui.state import LogBus, SettingsStore
 
@@ -257,6 +268,13 @@ class MainWindow(QMainWindow):
         self.reminders = ReminderManager() if self._feature_enabled("trader_reminders") else None
         self.price_client = TarkovPriceClient() if self._feature_enabled("price_lookup") else None
         self.hideout_tracker = HideoutTracker() if self._feature_enabled("hideout") else None
+        self.recipe_catalog: RecipeCatalog | None = None
+        self._recipe_data_error = ""
+        if self._feature_enabled("recipe_tracking"):
+            try:
+                self.recipe_catalog = RecipeCatalog()
+            except RecipeDataError as exc:
+                self._recipe_data_error = str(exc)
         self.current_price_game_mode = str(self.config.get("price_game_mode_default", "pve"))
         if self.price_client is not None:
             self.price_client.set_game_mode(self.current_price_game_mode)
@@ -278,7 +296,7 @@ class MainWindow(QMainWindow):
             int(self.config.get("raid_log_opacity", 72))
         )
         self.log_bus.line_ready.connect(self.raid_log_overlay.append_line)
-        self._display_filter_baseline = None
+        self._display_filter_baseline: DisplayFilterBaseline | None = None
         self._display_filter_index = -1
         self._display_filter_controls_loading = False
         self._display_filter_dialog: DisplayFilterControlDialog | None = None
@@ -311,6 +329,7 @@ class MainWindow(QMainWindow):
         self.timer_fields: dict[str, QLineEdit] = {}
         self.restock_items: dict[str, QTableWidgetItem] = {}
         self.status_items: dict[str, QTableWidgetItem] = {}
+        self._recipe_tree_loading = False
 
         if self.reminders is not None:
             self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
@@ -342,6 +361,9 @@ class MainWindow(QMainWindow):
         )
         self.raid_control_overlay.panel_opacity_changed.connect(
             lambda value: self._set_live_setting("raid_panel_opacity", value)
+        )
+        self.raid_control_overlay.gamma_enabled_changed.connect(
+            self._on_raid_gamma_enabled_changed
         )
         self.raid_control_overlay.gamma_values_changed.connect(
             self._on_raid_gamma_values_changed
@@ -442,6 +464,8 @@ class MainWindow(QMainWindow):
             panels.append(("藏身处", self._build_hideout_panel))
         if self._feature_enabled("display_filter"):
             panels.append(("Gamma", self._build_display_filter_panel))
+        if self._feature_enabled("recipe_tracking"):
+            panels.append(("关注配方", self._build_recipe_panel))
         if not panels:
             panels.append(("未启用", self._build_disabled_panel))
         return panels
@@ -695,13 +719,191 @@ class MainWindow(QMainWindow):
         self._update_hideout_table()
         return panel
 
+    def _build_recipe_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        header = QGroupBox("关注制作 / 商人兑换")
+        header_layout = QVBoxLayout(header)
+        intro = QLabel(
+            "勾选感兴趣的具体配方。之后查到其所需物品时，局内价格浮窗会追加对应配方。"
+            "PvE / PvP 商人兑换分别保存，请先切换到对应价格模式。"
+        )
+        intro.setWordWrap(True)
+        header_layout.addWidget(intro)
+
+        search_row = QHBoxLayout()
+        self.recipe_search_field = QLineEdit()
+        self.recipe_search_field.setPlaceholderText("搜索产物、来源或所需物品")
+        self.recipe_search_field.textChanged.connect(self._populate_recipe_tree)
+        collapse_button = QPushButton("全部折叠")
+        collapse_button.clicked.connect(lambda: self.recipe_tree.collapseAll())
+        clear_button = QPushButton("清除全部关注")
+        clear_button.clicked.connect(self._clear_tracked_recipes)
+        search_row.addWidget(self.recipe_search_field, 1)
+        search_row.addWidget(collapse_button)
+        search_row.addWidget(clear_button)
+        header_layout.addLayout(search_row)
+
+        self.recipe_summary_label = QLabel("")
+        self.recipe_summary_label.setWordWrap(True)
+        header_layout.addWidget(self.recipe_summary_label)
+        layout.addWidget(header)
+
+        self.recipe_tree = QTreeWidget()
+        self.recipe_tree.setHeaderLabels(["产物 / 分类", "来源", "所需物品"])
+        self.recipe_tree.setAlternatingRowColors(True)
+        self.recipe_tree.setUniformRowHeights(True)
+        self.recipe_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.recipe_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.recipe_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.recipe_tree.itemChanged.connect(self._on_recipe_item_changed)
+        layout.addWidget(self.recipe_tree, 1)
+        self._populate_recipe_tree()
+        return panel
+
+    def _tracked_recipe_ids(self) -> set[str]:
+        value = self.config.get("tracked_recipe_ids", [])
+        if not isinstance(value, list):
+            return set()
+        return {str(item) for item in value if str(item)}
+
+    def _populate_recipe_tree(self, _search_text: str = "") -> None:
+        if not hasattr(self, "recipe_tree"):
+            return
+        self._recipe_tree_loading = True
+        self.recipe_tree.blockSignals(True)
+        try:
+            self.recipe_tree.clear()
+            if self.recipe_catalog is None or not self.recipe_catalog.available:
+                message = self._recipe_data_error or "本版本没有可用的本地配方数据。"
+                placeholder = QTreeWidgetItem([message, "", ""])
+                self.recipe_tree.addTopLevelItem(placeholder)
+                self.recipe_summary_label.setText(message)
+                return
+
+            mode = self.current_price_game_mode
+            query = (
+                self.recipe_search_field.text().strip().casefold()
+                if hasattr(self, "recipe_search_field")
+                else ""
+            )
+            all_records = self.recipe_catalog.records(mode)
+            mode_ids = {str(record.get("id") or "") for record in all_records}
+            records = all_records
+            if query:
+                records = [record for record in records if query in recipe_search_text(record)]
+            tracked = self._tracked_recipe_ids()
+            tracked_in_mode = tracked & mode_ids
+            roots: dict[str, QTreeWidgetItem] = {}
+            categories: dict[tuple[str, str], QTreeWidgetItem] = {}
+            sources: dict[tuple[str, str, str], QTreeWidgetItem] = {}
+            for record in records:
+                kind = str(record.get("kind") or "barter")
+                root_label = "藏身处制作" if kind == "craft" else "商人兑换"
+                root = roots.get(kind)
+                if root is None:
+                    root = QTreeWidgetItem([root_label, "", ""])
+                    root.setExpanded(True)
+                    roots[kind] = root
+                    self.recipe_tree.addTopLevelItem(root)
+                category_name = str(record.get("category") or "其他")
+                category_key = (kind, category_name)
+                category = categories.get(category_key)
+                if category is None:
+                    category = QTreeWidgetItem([category_name, "", ""])
+                    categories[category_key] = category
+                    root.addChild(category)
+                source_name = str(record.get("source") or "未知来源")
+                level = int(record.get("level") or 0)
+                source_label = f"{source_name} Lv{level}"
+                source_key = (kind, category_name, source_label)
+                source = sources.get(source_key)
+                if source is None:
+                    source = QTreeWidgetItem([source_label, "", ""])
+                    sources[source_key] = source
+                    category.addChild(source)
+                leaf = QTreeWidgetItem(
+                    [
+                        recipe_title(record),
+                        recipe_source_text(record),
+                        recipe_requirements_text(record),
+                    ]
+                )
+                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                recipe_id = str(record.get("id") or "")
+                leaf.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
+                leaf.setCheckState(
+                    0,
+                    Qt.CheckState.Checked
+                    if recipe_id in tracked_in_mode
+                    else Qt.CheckState.Unchecked,
+                )
+                source.addChild(leaf)
+            self.recipe_tree.expandToDepth(1 if not query else 3)
+            total = self.recipe_catalog.record_count(mode)
+            visible = len(records)
+            self.recipe_summary_label.setText(
+                f"{_game_mode_label(mode)}：共 {total} 个配方 · 当前显示 {visible} 个 · "
+                f"本模式已关注 {len(tracked_in_mode)} 个 · 全部模式 {len(tracked)} 个"
+            )
+        finally:
+            self.recipe_tree.blockSignals(False)
+            self._recipe_tree_loading = False
+
+    def _on_recipe_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if self._recipe_tree_loading or column != 0:
+            return
+        recipe_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+        if not recipe_id:
+            return
+        tracked = self._tracked_recipe_ids()
+        if item.checkState(0) == Qt.CheckState.Checked:
+            tracked.add(recipe_id)
+        else:
+            tracked.discard(recipe_id)
+        self.settings_store.set("tracked_recipe_ids", sorted(tracked))
+        self._config_save_timer.start(250)
+        self._update_recipe_summary_only()
+
+    def _update_recipe_summary_only(self) -> None:
+        if not hasattr(self, "recipe_summary_label") or self.recipe_catalog is None:
+            return
+        total = self.recipe_catalog.record_count(self.current_price_game_mode)
+        mode_ids = {
+            str(record.get("id") or "")
+            for record in self.recipe_catalog.records(self.current_price_game_mode)
+        }
+        tracked = self._tracked_recipe_ids()
+        self.recipe_summary_label.setText(
+            f"{_game_mode_label(self.current_price_game_mode)}：共 {total} 个配方 · "
+            f"本模式已关注 {len(tracked & mode_ids)} 个 · 全部模式 {len(tracked)} 个"
+        )
+
+    def _clear_tracked_recipes(self) -> None:
+        if not self._tracked_recipe_ids():
+            return
+        answer = QMessageBox.question(
+            self,
+            "清除全部关注配方",
+            "确定清除所有已关注的制作和兑换配方吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.settings_store.set("tracked_recipe_ids", [])
+        self._config_save_timer.start(250)
+        self._populate_recipe_tree()
+        self._log_event("已清除全部关注配方。")
+
     def _build_display_filter_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        group = QGroupBox("Gamma 显示调校")
+        group = QGroupBox("画面增强（Gamma / 亮度）")
         group_layout = QVBoxLayout(group)
-        self.display_filter_status_label = QLabel("尚未应用显示调校")
+        self.display_filter_status_label = QLabel("画面增强当前已关闭")
         self.display_filter_status_label.setWordWrap(True)
         group_layout.addWidget(self.display_filter_status_label)
 
@@ -751,7 +953,7 @@ class MainWindow(QMainWindow):
         top_layout.addWidget(self.display_filter_curve)
         group_layout.addWidget(top)
 
-        self.display_filter_live_preview = QCheckBox("拖动滑条时实时应用到系统 Gamma")
+        self.display_filter_live_preview = QCheckBox("开启后，拖动滑条立即更新画面")
         self.display_filter_live_preview.setChecked(False)
         group_layout.addWidget(self.display_filter_live_preview)
 
@@ -782,13 +984,13 @@ class MainWindow(QMainWindow):
         hotkey_layout.addRow("当前方案热键", self.display_filter_preset_hotkey)
         group_layout.addWidget(hotkey_row)
 
-        apply_button = QPushButton("应用当前预设")
+        apply_button = QPushButton("开启当前方案")
         apply_button.clicked.connect(self.apply_selected_display_filter)
         next_button = QPushButton("切换到下一个预设")
         next_button.clicked.connect(lambda checked=False: self.cycle_display_filter_preset(notify=False))
-        restore_button = QPushButton("恢复系统原始 Gamma")
+        restore_button = QPushButton("关闭并恢复原始画面")
         restore_button.clicked.connect(lambda checked=False: self.restore_display_filter(show_feedback=False))
-        floating_button = QPushButton("打开局内调节浮窗")
+        floating_button = QPushButton("打开高级独立调节窗")
         floating_button.clicked.connect(self.open_display_filter_control_window)
         buttons = QWidget()
         buttons_layout = QHBoxLayout(buttons)
@@ -1184,18 +1386,34 @@ class MainWindow(QMainWindow):
         name = str(preset.get("name", "Unnamed"))
         try:
             if self._display_filter_baseline is None:
-                self._display_filter_baseline = get_gamma_ramp()
-            apply_preset(preset)
+                self._display_filter_baseline = start_display_filter(preset)
+            else:
+                update_display_filter(preset, self._display_filter_baseline)
         except DisplayFilterError as exc:
+            still_active = self._display_filter_baseline is not None
+            self.raid_control_overlay.set_gamma_active(still_active)
+            message = (
+                f"参数更新失败：{exc}。请点击关闭以恢复原始画面。"
+                if still_active
+                else str(exc)
+            )
+            self.raid_control_overlay.set_gamma_status(message, error=True)
             if hasattr(self, "display_filter_status_label"):
-                self.display_filter_status_label.setText(f"Gamma 调校失败：{exc}")
+                self.display_filter_status_label.setText(f"画面增强失败：{message}")
             if notify:
-                self._log_event(f"Gamma 调校失败：{exc}")
-                self._show_operation_feedback("Gamma 调校失败", name, str(exc), accent_color="#FF5A5F")
+                self._log_event(f"画面增强失败：{message}")
+                self._show_operation_feedback(
+                    "画面增强失败", name, message, accent_color="#FF5A5F"
+                )
             return
         self.config["display_filter_active_preset"] = name
+        self.raid_control_overlay.set_gamma_active(True)
+        backend_label = self._display_filter_baseline.label
+        self.raid_control_overlay.set_gamma_status(
+            f"画面增强已开启 · {backend_label}"
+        )
         if hasattr(self, "display_filter_status_label"):
-            self.display_filter_status_label.setText(f"已应用：{name}")
+            self.display_filter_status_label.setText(f"已应用：{name} · {backend_label}")
         self._start_display_filter_eye_care_timer()
         if notify:
             self._log_event(f"已应用 Gamma 调校：{name}")
@@ -1211,6 +1429,8 @@ class MainWindow(QMainWindow):
             self._log("Gamma 显示调校模块未启用，已跳过恢复 Gamma。")
             return
         if self._display_filter_baseline is None:
+            self.raid_control_overlay.set_gamma_active(False)
+            self.raid_control_overlay.set_gamma_status("画面增强当前处于关闭状态。")
             if show_feedback:
                 self._show_operation_feedback(
                     "Gamma 未修改",
@@ -1220,13 +1440,16 @@ class MainWindow(QMainWindow):
                 )
             return
         try:
-            set_gamma_ramp(self._display_filter_baseline)
+            restore_system_display_filter(self._display_filter_baseline)
         except DisplayFilterError as exc:
+            self.raid_control_overlay.set_gamma_status(str(exc), error=True)
             if show_feedback:
                 self._show_operation_feedback("Gamma 恢复失败", "系统原始 Gamma", str(exc), accent_color="#FF5A5F")
                 self._log_event(f"Gamma 恢复失败：{exc}")
             return
         self._display_filter_baseline = None
+        self.raid_control_overlay.set_gamma_active(False)
+        self.raid_control_overlay.set_gamma_status("画面增强已关闭，显示已恢复。")
         self._stop_display_filter_eye_care_timer()
         self.config["display_filter_active_preset"] = ""
         if hasattr(self, "display_filter_status_label"):
@@ -1266,6 +1489,8 @@ class MainWindow(QMainWindow):
             or not self._display_filter_eye_care_enabled()
         ):
             self._stop_display_filter_eye_care_timer()
+            return
+        if QApplication.applicationState() == Qt.ApplicationState.ApplicationActive:
             return
         is_foreground, _title = is_tarkov_foreground()
         if is_foreground:
@@ -1476,7 +1701,12 @@ class MainWindow(QMainWindow):
 
     def _sync_raid_control_overlay(self) -> None:
         presets = self._display_filter_presets() if self._feature_enabled("display_filter") else []
-        self.raid_control_overlay.sync(self.config, presets, self._raid_status_text())
+        self.raid_control_overlay.sync(
+            self.config,
+            presets,
+            self._raid_status_text(),
+            gamma_active=self._display_filter_baseline is not None,
+        )
 
     def toggle_raid_control_overlay(self) -> None:
         if self._closing:
@@ -1512,6 +1742,8 @@ class MainWindow(QMainWindow):
                 self.price_mode_combo.setCurrentIndex(max(0, index))
         self._update_cache_status_label()
         self._refresh_item_completer()
+        if hasattr(self, "recipe_tree"):
+            self._populate_recipe_tree()
         self.raid_control_overlay.status_label.setText(self._raid_status_text())
         if changed:
             self._config_save_timer.start(350)
@@ -1524,6 +1756,16 @@ class MainWindow(QMainWindow):
             return
         self._apply_display_filter_preset(values, notify=False)
         self._config_save_timer.start(350)
+
+    def _on_raid_gamma_enabled_changed(self, enabled: bool) -> None:
+        if enabled:
+            self._apply_display_filter_preset(
+                self.raid_control_overlay.gamma_values(),
+                notify=True,
+            )
+            return
+        self.restore_display_filter(show_feedback=False)
+        self._log_event("画面增强已关闭，显示已恢复。")
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
@@ -1593,6 +1835,8 @@ class MainWindow(QMainWindow):
         save_config(self.config)
         self._update_cache_status_label()
         self._refresh_item_completer()
+        if hasattr(self, "recipe_tree"):
+            self._populate_recipe_tree()
         self._sync_raid_control_overlay()
         self._log(f"Price mode set manually: {_game_mode_label(self.current_price_game_mode)}.")
 
@@ -2485,6 +2729,7 @@ class MainWindow(QMainWindow):
             if self._feature_enabled("hideout") and self.hideout_tracker is not None
             else []
         )
+        recipe_lines = self._tracked_recipe_requirement_lines(price)
         needs_history = _is_high_volatility(price)
         view = _build_price_view(
             price,
@@ -2494,6 +2739,7 @@ class MainWindow(QMainWindow):
             firearm_color,
             firearm_accent,
             hideout_lines,
+            recipe_lines=recipe_lines,
             volatility_notice=needs_history,
             toast_key=price_key,
         )
@@ -2532,6 +2778,7 @@ class MainWindow(QMainWindow):
             if self._feature_enabled("hideout") and self.hideout_tracker is not None
             else []
         )
+        recipe_lines = self._tracked_recipe_requirement_lines(price)
         enhanced = _build_price_view(
             price,
             display_language,
@@ -2540,6 +2787,7 @@ class MainWindow(QMainWindow):
             firearm_color,
             firearm_accent,
             hideout_lines,
+            recipe_lines=recipe_lines,
             history_summary=summary,
             toast_key=price_key,
         )
@@ -2561,6 +2809,19 @@ class MainWindow(QMainWindow):
                 seconds = 10
             self.price_overlay.show_price(enhanced, seconds, replace_key=price_key)
             self.price_overlay.show_price(detail, seconds, replace_key=detail.toast_key)
+
+    def _tracked_recipe_requirement_lines(self, price: object) -> list[str]:
+        if (
+            not self._feature_enabled("recipe_tracking")
+            or self.recipe_catalog is None
+            or not self.recipe_catalog.available
+        ):
+            return []
+        return self.recipe_catalog.tracked_requirement_lines(
+            str(getattr(price, "item_id", "")),
+            self._tracked_recipe_ids(),
+            str(getattr(price, "game_mode", self.current_price_game_mode)),
+        )
 
     def _schedule_selected_reminders(
         self,
@@ -3321,8 +3582,10 @@ class SettingsDialog(QDialog):
             check = QCheckBox(label)
             self.feature_checks[feature_id] = check
             layout.addWidget(check)
-        self.display_filter_restore_on_exit = QCheckBox("退出软件时恢复系统原始 Gamma")
-        self.display_filter_eye_care_enabled = QCheckBox("护眼模式：Tarkov 不活跃时自动关闭 Gamma")
+        self.display_filter_restore_on_exit = QCheckBox("退出软件时关闭画面增强并恢复原始画面")
+        self.display_filter_eye_care_enabled = QCheckBox(
+            "离开 Tarkov 和本助手后自动关闭画面增强"
+        )
         self.display_filter_eye_care_check_seconds = QSpinBox()
         self.display_filter_eye_care_check_seconds.setRange(1, 30)
         layout.addWidget(self.display_filter_restore_on_exit)
@@ -3674,6 +3937,7 @@ def _build_price_view(
     firearm_color: str = "#00D1D1",
     firearm_accent: str = "#00D1D1",
     hideout_lines: list[str] | None = None,
+    recipe_lines: list[str] | None = None,
     history_summary: object | None = None,
     volatility_notice: bool = False,
     toast_key: str = "",
@@ -3744,6 +4008,7 @@ def _build_price_view(
     detail = "\n".join(detail_lines)
 
     hideout_text = "；".join(hideout_lines or [])
+    recipe_text = "；".join(recipe_lines or [])
     display_detail = detail
     hideout_html = ""
     if hideout_text:
@@ -3751,6 +4016,14 @@ def _build_price_view(
         hideout_html = (
             f"<br><span style='color:#9EE6A8;'>"
             f"藏身处: {html.escape(hideout_text)}"
+            f"</span>"
+        )
+    recipe_html = ""
+    if recipe_text:
+        display_detail = f"{display_detail}\n关注配方: {recipe_text}"
+        recipe_html = (
+            f"<br><span style='color:#E8C47A;'>"
+            f"关注配方: {html.escape(recipe_text)}"
             f"</span>"
         )
     detail_html = "<br>".join(html.escape(line) for line in detail.splitlines())
@@ -3761,6 +4034,7 @@ def _build_price_view(
         f"<span style='color:{tier_color}; font-size:14px; font-weight:700;'>{html.escape(secondary_value_text)}</span><br>"
         f"<span>{detail_html}</span>"
         f"{hideout_html}"
+        f"{recipe_html}"
         f"</div>"
     )
     log_text = f"[{game_mode}] {title} | {value_text} | {secondary_value_text} | 商人 {vendor}"
@@ -3768,6 +4042,8 @@ def _build_price_view(
         log_text = f"{log_text} | 疑似高波动物品，正在联网查询详细价格"
     if hideout_text:
         log_text = f"{log_text} | 藏身处 {hideout_text}"
+    if recipe_text:
+        log_text = f"{log_text} | 关注配方 {recipe_text}"
     return PriceView(
         title=title,
         subtitle="",

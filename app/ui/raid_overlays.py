@@ -92,6 +92,7 @@ class RaidControlOverlay(QWidget):
     price_duration_changed = Signal(int)
     feedback_duration_changed = Signal(int)
     panel_opacity_changed = Signal(int)
+    gamma_enabled_changed = Signal(bool)
     gamma_values_changed = Signal(object)
     gamma_restore_requested = Signal()
 
@@ -178,10 +179,18 @@ class RaidControlOverlay(QWidget):
         layout.addWidget(timing_section)
 
         gamma_section, gamma_layout = self._section("实时画面")
+        self.gamma_toggle_button = QPushButton("画面增强：已关闭")
+        self.gamma_toggle_button.setCheckable(True)
+        self.gamma_toggle_button.clicked.connect(self._on_gamma_enabled_changed)
+        gamma_layout.addWidget(self.gamma_toggle_button, 0, 0, 1, 2)
+        self.gamma_status_label = QLabel("点击开启后，方案和滑条才会修改画面。")
+        self.gamma_status_label.setObjectName("raidPanelMeta")
+        self.gamma_status_label.setWordWrap(True)
+        gamma_layout.addWidget(self.gamma_status_label, 1, 0, 1, 2)
         self.gamma_preset_combo = QComboBox()
-        gamma_layout.addWidget(QLabel("Gamma 方案"), 0, 0)
-        gamma_layout.addWidget(self.gamma_preset_combo, 0, 1)
-        for row, (key, definition) in enumerate(GAMMA_CONTROLS.items(), start=1):
+        gamma_layout.addWidget(QLabel("Gamma 方案"), 2, 0)
+        gamma_layout.addWidget(self.gamma_preset_combo, 2, 1)
+        for row, (key, definition) in enumerate(GAMMA_CONTROLS.items(), start=3):
             label, minimum, maximum, _scale, _decimals = definition
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(minimum, maximum)
@@ -201,7 +210,7 @@ class RaidControlOverlay(QWidget):
         )
         gamma_layout.addWidget(
             self.gamma_restore_button,
-            len(GAMMA_CONTROLS) + 1,
+            len(GAMMA_CONTROLS) + 3,
             0,
             1,
             2,
@@ -247,6 +256,7 @@ class RaidControlOverlay(QWidget):
         config: dict[str, Any],
         presets: list[dict[str, Any]],
         status: str,
+        gamma_active: bool = False,
     ) -> None:
         self._loading = True
         try:
@@ -276,6 +286,16 @@ class RaidControlOverlay(QWidget):
             for slider in self._gamma_sliders.values():
                 slider.setEnabled(gamma_enabled)
             self.gamma_restore_button.setEnabled(gamma_enabled)
+            self.gamma_toggle_button.setEnabled(gamma_enabled)
+            with QSignalBlocker(self.gamma_toggle_button):
+                self.gamma_toggle_button.setChecked(gamma_enabled and gamma_active)
+            self._update_gamma_toggle_text()
+            if not gamma_enabled:
+                self.set_gamma_status("Gamma 功能未启用或没有可用方案。", error=True)
+            elif gamma_active:
+                self.set_gamma_status("画面增强已开启；方案和滑条会实时生效。")
+            else:
+                self.set_gamma_status("点击开启后，方案和滑条才会修改画面。")
             self._load_selected_gamma_preset()
             self._set_window_opacity(opacity)
         finally:
@@ -315,7 +335,7 @@ class RaidControlOverlay(QWidget):
 
     def _on_gamma_preset_changed(self) -> None:
         self._load_selected_gamma_preset()
-        if not self._loading:
+        if not self._loading and self.gamma_toggle_button.isChecked():
             self.gamma_values_changed.emit(self.gamma_values())
 
     def _load_selected_gamma_preset(self) -> None:
@@ -337,8 +357,29 @@ class RaidControlOverlay(QWidget):
     def _on_gamma_slider_changed(self) -> None:
         for key in self._gamma_sliders:
             self._update_gamma_label(key)
-        if not self._loading:
+        if not self._loading and self.gamma_toggle_button.isChecked():
             self.gamma_values_changed.emit(self.gamma_values())
+
+    def _on_gamma_enabled_changed(self, checked: bool) -> None:
+        self._update_gamma_toggle_text()
+        if not self._loading:
+            self.gamma_enabled_changed.emit(bool(checked))
+
+    def _update_gamma_toggle_text(self) -> None:
+        if self.gamma_toggle_button.isChecked():
+            self.gamma_toggle_button.setText("画面增强：已开启（滑条实时生效）")
+        else:
+            self.gamma_toggle_button.setText("画面增强：已关闭（点击开启）")
+
+    def set_gamma_active(self, active: bool) -> None:
+        with QSignalBlocker(self.gamma_toggle_button):
+            self.gamma_toggle_button.setChecked(bool(active))
+        self._update_gamma_toggle_text()
+
+    def set_gamma_status(self, message: str, *, error: bool = False) -> None:
+        self.gamma_status_label.setText(str(message))
+        color = "#FF8C8C" if error else "#8F9AA8"
+        self.gamma_status_label.setStyleSheet(f"color: {color};")
 
     def _update_gamma_label(self, key: str) -> None:
         _label, _minimum, _maximum, scale, decimals = GAMMA_CONTROLS[key]
@@ -396,12 +437,9 @@ class RaidLogOverlay(QWidget):
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus
-            | Qt.WindowType.WindowTransparentForInput
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.resize(620, 250)
 
         outer = QVBoxLayout(self)
@@ -411,21 +449,39 @@ class RaidLogOverlay(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(14, 10, 14, 11)
         layout.setSpacing(4)
+        header = _DragHandle()
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(8)
         title = QLabel("SYSTEM  /  RAID LOG")
         title.setObjectName("raidPanelEyebrow")
+        hint = QLabel("滚轮查看 · 拖动标题移动")
+        hint.setObjectName("raidPanelMeta")
+        close_button = QPushButton("×")
+        close_button.setObjectName("raidCloseButton")
+        close_button.setToolTip("关闭局内日志窗")
+        close_button.clicked.connect(self.hide)
+        header_layout.addWidget(title)
+        header_layout.addWidget(hint, 1)
+        header_layout.addWidget(close_button)
         self.text = QPlainTextEdit()
         self.text.setObjectName("raidLogText")
         self.text.setReadOnly(True)
         self.text.document().setMaximumBlockCount(max(20, int(max_lines)))
-        layout.addWidget(title)
+        layout.addWidget(header)
         layout.addWidget(self.text, 1)
         outer.addWidget(card)
         self.setStyleSheet(RAID_OVERLAY_STYLESHEET)
 
     def append_line(self, line: str) -> None:
-        self.text.appendPlainText(str(line))
         bar = self.text.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        previous_position = bar.value()
+        follow_tail = bar.value() >= bar.maximum() - 4
+        self.text.appendPlainText(str(line))
+        if follow_tail:
+            bar.setValue(bar.maximum())
+        else:
+            bar.setValue(previous_position)
 
     def set_max_lines(self, value: int) -> None:
         self.text.document().setMaximumBlockCount(max(20, int(value)))
@@ -448,6 +504,35 @@ class RaidLogOverlay(QWidget):
             return
         rect = screen.availableGeometry()
         self.move(rect.left() + 24, rect.bottom() - self.height() - 54)
+
+
+class _DragHandle(QFrame):
+    def __init__(self) -> None:
+        super().__init__()
+        self._drag_offset: QPoint | None = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = (
+                event.globalPosition().toPoint() - self.window().frameGeometry().topLeft()
+            )
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._drag_offset = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(event)
 
 
 def _float_value(value: object, fallback: float) -> float:

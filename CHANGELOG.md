@@ -6,16 +6,18 @@
 - Changed feature toggles to be hard module gates: disabled modules do not create their runtime managers, register hotkeys, start background refreshes, or apply display filters.
 - Changed Settings to open on the hotkey tab by default and moved low-frequency capture ROI/manual resolution controls into a collapsed advanced capture section.
 - Added a dark, translucent upper-right in-raid control panel (`F9`) for live price mode, display language, overlay timing, panel opacity, and Gamma adjustment.
-- Added a non-focus, mouse-through lower-left raid log (`F10`) with configurable opacity and retained-line count.
+- Added a lower-left raid log (`F10`) that shows without proactively taking focus, then supports click, wheel/scrollbar history navigation, and title-bar dragging.
+- Added an optional offline recipe-tracking module with a searchable product-first craft/barter tree, checkable concrete recipes, and tracked-material notices in price results and raid overlays.
+- Bundled versioned PvE/PvP craft and trader-barter snapshots generated from tarkov.dev's static JSON endpoints; runtime recipe lookup is local-only.
 - Added a shared UI theme, settings store, and log event bus as the first stage of splitting the desktop shell away from the monolithic main-window implementation.
 - Removed the redundant extra daemon thread previously created for every global-hotkey press; Qt-bound actions now cross into the UI through signals directly.
-- Added an initial Windows Gamma Ramp display-filter prototype with selectable presets, per-preset hotkeys, a restore hotkey, and restore-on-exit protection.
+- Added an explicit on/off flow for display enhancement and a Windows full-screen color-matrix fallback when the display driver rejects Gamma Ramp access.
 - Added Gamma tuning sliders, curve preview, named preset save/delete, and a mouse-interactive always-on-top tuning window for in-game live adjustment.
 - Added explicit Gamma preset creation from the current slider values in both the main panel and the in-game tuning window.
 - Added optional per-preset Gamma hotkeys so each saved display profile can be applied directly in raid without cycling through other presets.
 - Changed hotkey settings to capture the next key press directly, detect conflicts, and allow replacing an existing binding.
 - Changed Gamma live tuning to apply silently while dragging sliders so visible logs and feedback toasts only appear for explicit hotkey toggles/restores or important safety events.
-- Added Gamma eye-care mode: when Tarkov is no longer the foreground app, the app can automatically restore the original system Gamma and show a one-time reminder.
+- Added Gamma eye-care mode: when neither Tarkov nor the assistant UI is active, the app can automatically restore the original display state and show a one-time reminder.
 - Changed the visible log into a persistent main-window section shared by all feature panels, with automatic scrolling to the newest entry.
 - Hid foreground-window rejection messages from the visible log to avoid spam while users alt-tab or chat outside the game.
 - Added a performance settings tab with visible-log line limits, background-worker concurrency limits, worker-finished memory cleanup, periodic idle cleanup, and a default performance-mode skip for automatic price-cache refreshes.

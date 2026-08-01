@@ -64,17 +64,55 @@ class RaidOverlayTests(unittest.TestCase):
 
         self.assertEqual(modes, ["regular"])
 
-    def test_log_overlay_is_focus_safe_and_trims_history(self) -> None:
+    def test_gamma_changes_only_apply_after_explicit_enable(self) -> None:
+        overlay = RaidControlOverlay()
+        overlay.sync(
+            {"price_game_mode_default": "pve"},
+            [{"name": "Default", "gamma": 1.0}],
+            "ready",
+        )
+        enabled: list[bool] = []
+        values: list[object] = []
+        overlay.gamma_enabled_changed.connect(enabled.append)
+        overlay.gamma_values_changed.connect(values.append)
+
+        overlay._gamma_sliders["gamma"].setValue(90)
+        self.assertEqual(values, [])
+
+        overlay.gamma_toggle_button.click()
+        overlay._gamma_sliders["gamma"].setValue(80)
+
+        self.assertEqual(enabled, [True])
+        self.assertEqual(len(values), 1)
+        self.assertEqual(values[0]["gamma"], 0.8)
+
+    def test_log_overlay_accepts_interaction_and_trims_history(self) -> None:
         overlay = RaidLogOverlay(max_lines=20)
         for index in range(25):
             overlay.append_line(f"line {index}")
 
         self.assertLessEqual(overlay.text.document().blockCount(), 20)
         self.assertIn("line 24", overlay.text.toPlainText())
-        self.assertTrue(
+        self.assertFalse(
             bool(overlay.windowFlags() & Qt.WindowType.WindowDoesNotAcceptFocus)
         )
-        self.assertTrue(overlay.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
+        self.assertFalse(overlay.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents))
+
+    def test_log_overlay_does_not_jump_to_tail_while_reading_history(self) -> None:
+        overlay = RaidLogOverlay(max_lines=100)
+        overlay.resize(500, 180)
+        overlay.show()
+        self.app.processEvents()
+        for index in range(60):
+            overlay.append_line(f"line {index}")
+        bar = overlay.text.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        bar.setValue(0)
+
+        overlay.append_line("new tail")
+
+        self.assertEqual(bar.value(), 0)
+        overlay.hide()
 
     def test_settings_store_emits_only_real_changes(self) -> None:
         values: dict[str, object] = {"mode": "pve"}

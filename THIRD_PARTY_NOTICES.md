@@ -46,6 +46,16 @@ tarkov.dev GraphQL API available only as a user-approved fallback, and cached
 locally for lookup speed. Escape from Tarkov item names, images, and game
 terminology belong to their respective rights holders.
 
+Versioned craft and trader-barter snapshots in `data/recipes.json` are also
+generated from the public tarkov.dev JSON API (`/regular/crafts`,
+`/regular/barters`, `/pve/crafts`, and `/pve/barters`). The snapshot is bundled
+for offline lookup and is not presented as original project-owned game data.
+Upstream project and schema information:
+
+- https://json.tarkov.dev/endpoints
+- https://github.com/the-hideout/tarkov-api
+- https://github.com/the-hideout/tarkov-dev
+
 EFT Raid Assistant is an independent fan-made utility and is not affiliated
 with, endorsed by, or sponsored by Battlestate Games, Escape from Tarkov,
 RapidAI, Qt, or tarkov.dev.
