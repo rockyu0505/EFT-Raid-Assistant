@@ -172,6 +172,19 @@ QToolTip {
 """
 
 
+def _stylesheet_for_font_size(font_size: int) -> str:
+    tree_row_padding = max(3, round(font_size * 0.35))
+    return (
+        APP_STYLESHEET
+        + f"""
+QTreeView::item {{
+    padding-top: {tree_row_padding}px;
+    padding-bottom: {tree_row_padding}px;
+}}
+"""
+    )
+
+
 def apply_app_theme(application: object, font_size: object = 11) -> None:
     try:
         safe_font_size = max(9, min(18, int(font_size)))
@@ -190,4 +203,4 @@ def apply_app_theme(application: object, font_size: object = 11) -> None:
             set_font(font)
     set_stylesheet = getattr(application, "setStyleSheet", None)
     if callable(set_stylesheet):
-        set_stylesheet(APP_STYLESHEET)
+        set_stylesheet(_stylesheet_for_font_size(safe_font_size))

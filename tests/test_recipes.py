@@ -215,7 +215,8 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertIn("已关注总览 (1)", window.recipe_tabs.tabText(1))
         self.assertIn("共 1020 个配方", window.recipe_summary_label.text())
         self.assertEqual(window.recipe_color_label.text(), "#3366AA")
-        self.assertGreaterEqual(window.minimumWidth(), 1080)
+        self.assertGreaterEqual(window.minimumWidth(), 1160)
+        self.assertGreaterEqual(window.width(), 1520)
         self.assertEqual(window.recipe_result_tree.headerItem().text(1), "工具")
         self.assertEqual(window.recipe_result_tree.headerItem().text(3), "耗时 / 限购")
         self.assertEqual(window.recipe_result_tree.headerItem().text(4), "任务依赖")
@@ -324,6 +325,40 @@ class RecipeCatalogTests(unittest.TestCase):
 
         apply_app_theme(self.app, int(DEFAULT_CONFIG["ui_font_size"]))
         dialog.close()
+
+    def test_recipe_tree_font_and_spacing_scale_live(self) -> None:
+        apply_app_theme(self.app, 11)
+        config = deepcopy(DEFAULT_CONFIG)
+        config["enabled_features"] = ["recipe_tracking"]
+        config["feature_setup_complete"] = True
+        with patch("app.gui.load_config", return_value=config):
+            window = _RecipeSmokeWindow()
+
+        window.show()
+        self.app.processEvents()
+        apply_app_theme(self.app, 17)
+        window._sync_recipe_tree_fonts()
+        window._populate_recipe_tree()
+        self.app.processEvents()
+
+        for tree in (
+            window.recipe_category_tree,
+            window.recipe_result_tree,
+            window.tracked_recipe_tree,
+        ):
+            item = tree.topLevelItem(0)
+            self.assertEqual(tree.font().pointSize(), 17)
+            self.assertGreaterEqual(
+                tree.visualItemRect(item).height(),
+                round(tree.fontMetrics().height() * 1.4),
+            )
+        self.assertEqual(
+            window.recipe_result_tree.topLevelItem(0).font(0).pointSize(), 17
+        )
+
+        window.hide()
+        window.deleteLater()
+        apply_app_theme(self.app, int(DEFAULT_CONFIG["ui_font_size"]))
 
 
 if __name__ == "__main__":

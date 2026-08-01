@@ -2,6 +2,7 @@
 
 ## 0.6.0 - Unreleased
 
+- Fixed live font scaling in recipe trees, added proportional tree-row spacing, and enlarged the main-window defaults.
 - Renamed recipe notes to a compact task-dependency column and made every recipe tree column user-resizable.
 - Added a first-run feature setup dialog and Settings feature toggles so users can enable only the panels they need; changes take effect after restart.
 - Changed feature toggles to be hard module gates: disabled modules do not create their runtime managers, register hotkeys, start background refreshes, or apply display filters.

@@ -26,6 +26,7 @@ from PySide6.QtGui import (
     QBrush,
     QCloseEvent,
     QColor,
+    QFont,
     QIcon,
     QPainter,
     QPen,
@@ -283,8 +284,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("塔科夫局内助手")
-        self.resize(1440, 860)
-        self.setMinimumSize(1120, 700)
+        self.resize(1520, 920)
+        self.setMinimumSize(1160, 720)
 
         self.config = load_config()
         self.settings_store = SettingsStore(self.config, self)
@@ -846,8 +847,26 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.recipe_tabs, 1)
         self._update_recipe_color_preview()
+        self._sync_recipe_tree_fonts()
         self._populate_recipe_tree()
         return panel
+
+    def _sync_recipe_tree_fonts(self) -> None:
+        application = QApplication.instance()
+        if application is None:
+            return
+        font = QFont(application.font())
+        for attribute in (
+            "recipe_category_tree",
+            "recipe_result_tree",
+            "tracked_recipe_tree",
+        ):
+            tree = getattr(self, attribute, None)
+            if not isinstance(tree, QTreeWidget):
+                continue
+            tree.setFont(font)
+            tree.header().setFont(font)
+            tree.scheduleDelayedItemsLayout()
 
     @staticmethod
     def _configure_recipe_detail_tree(tree: QTreeWidget, first_header: str) -> None:
@@ -1054,7 +1073,7 @@ class MainWindow(QMainWindow):
                         "",
                     ]
                 )
-                product_font = product_item.font(0)
+                product_font = QFont(self.recipe_result_tree.font())
                 product_font.setBold(True)
                 product_item.setFont(0, product_font)
                 product_item.setToolTip(0, f"{len(product_records)} 个具体配方")
@@ -1177,7 +1196,7 @@ class MainWindow(QMainWindow):
                         "",
                     ]
                 )
-                product_font = product_item.font(0)
+                product_font = QFont(self.tracked_recipe_tree.font())
                 product_font.setBold(True)
                 product_item.setFont(0, product_font)
                 product_item.setToolTip(
@@ -2191,6 +2210,7 @@ class MainWindow(QMainWindow):
         font_size = _safe_int(self.config.get("ui_font_size")) or 11
         if font_size != previous_font_size:
             apply_app_theme(QApplication.instance(), font_size)
+            self._sync_recipe_tree_fonts()
         if hasattr(self, "price_mode_combo"):
             mode_index = self.price_mode_combo.findData(
                 str(self.config.get("price_game_mode_default", "pve"))
