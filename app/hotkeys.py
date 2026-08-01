@@ -15,11 +15,16 @@ class HotkeyManager:
         capture_hotkey: str,
         schedule_hotkey: str,
         on_capture: Callable[[], None],
-        on_schedule: Callable[[], None],
+        on_schedule: Callable[[], None] | None,
         item_lookup_hotkey: str = "",
         on_item_lookup: Callable[[], None] | None = None,
         hideout_scan_hotkey: str = "",
         on_hideout_scan: Callable[[], None] | None = None,
+        reminder_hold_hotkey: str = "",
+        on_reminder_hold: Callable[[], None] | None = None,
+        display_filter_restore_hotkey: str = "",
+        on_display_filter_restore: Callable[[], None] | None = None,
+        extra_hotkeys: list[tuple[str, Callable[[], None]]] | None = None,
     ) -> None:
         self.unregister()
         try:
@@ -27,14 +32,26 @@ class HotkeyManager:
         except ImportError as exc:
             raise RuntimeError("pynput is not installed; global hotkeys are disabled.") from exc
 
-        bindings = {
-            normalize_hotkey(capture_hotkey): _threaded(on_capture),
-            normalize_hotkey(schedule_hotkey): _threaded(on_schedule),
-        }
+        bindings = {}
+        if capture_hotkey.strip():
+            bindings[normalize_hotkey(capture_hotkey)] = _threaded(on_capture)
+        if schedule_hotkey.strip() and on_schedule is not None:
+            bindings[normalize_hotkey(schedule_hotkey)] = _threaded(on_schedule)
         if item_lookup_hotkey.strip() and on_item_lookup is not None:
             bindings[normalize_hotkey(item_lookup_hotkey)] = _threaded(on_item_lookup)
         if hideout_scan_hotkey.strip() and on_hideout_scan is not None:
             bindings[normalize_hotkey(hideout_scan_hotkey)] = _threaded(on_hideout_scan)
+        if reminder_hold_hotkey.strip() and on_reminder_hold is not None:
+            bindings[normalize_hotkey(reminder_hold_hotkey)] = _threaded(on_reminder_hold)
+        if display_filter_restore_hotkey.strip() and on_display_filter_restore is not None:
+            bindings[normalize_hotkey(display_filter_restore_hotkey)] = _threaded(
+                on_display_filter_restore
+            )
+        for hotkey, callback in extra_hotkeys or []:
+            if hotkey.strip():
+                bindings[normalize_hotkey(hotkey)] = _threaded(callback)
+        if not bindings:
+            return
         self._listener = keyboard.GlobalHotKeys(bindings)
         self._listener.start()
 

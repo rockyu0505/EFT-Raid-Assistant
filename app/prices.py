@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import statistics
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -16,11 +18,25 @@ from app.models import HistoricalPriceSummary, ItemPrice
 
 
 TARKOV_DEV_GRAPHQL = "https://api.tarkov.dev/graphql"
+TARKOV_DEV_JSON = "https://json.tarkov.dev"
 CACHE_DIR = APP_DIR / "cache"
 LEGACY_ITEM_CACHE_PATH = CACHE_DIR / "tarkov_items.json"
 DATA_DIR = APP_DIR / "data"
 CHINESE_ALIASES_PATH = DATA_DIR / "item_aliases_zh.json"
 GAME_MODES = ("regular", "pve")
+JSON_TRANSLATION_MODE = "regular"
+DEFAULT_MINIMUM_ITEM_COUNT = 1000
+TRADER_NAMES = {
+    "54cb50c76803fa8b248b4571": "Prapor",
+    "54cb57776803fa99248b456e": "Therapist",
+    "579dc571d53a0658a154fbec": "Fence",
+    "58330581ace78e27b8b10cee": "Skier",
+    "5935c25fb3acc3127c3d8cd9": "Peacekeeper",
+    "5a7c2eca46aef81a7ca2145d": "Mechanic",
+    "5ac3b934156ae10c4430e83c": "Ragman",
+    "5c0647fdd443bc2504c2d371": "Jaeger",
+    "6617beeaa9cfa777ca915b7c": "Ref",
+}
 _CJK_VARIANT_TRANSLATION = str.maketrans(
     {
         "\u8c93": "\u732b",
@@ -112,12 +128,16 @@ class TarkovPriceClient:
     def __init__(
         self,
         endpoint: str = TARKOV_DEV_GRAPHQL,
+        json_endpoint: str = TARKOV_DEV_JSON,
         cache_path: Path = LEGACY_ITEM_CACHE_PATH,
         aliases_path: Path = CHINESE_ALIASES_PATH,
+        minimum_item_count: int = DEFAULT_MINIMUM_ITEM_COUNT,
     ) -> None:
         self.endpoint = endpoint
+        self.json_endpoint = json_endpoint.rstrip("/")
         self.legacy_cache_path = cache_path
         self.aliases_path = aliases_path
+        self.minimum_item_count = max(1, int(minimum_item_count))
         self.current_game_mode = "regular"
         self._items_by_mode: dict[str, list[dict[str, Any]]] = {mode: [] for mode in GAME_MODES}
         self._fetched_at_by_mode: dict[str, float] = {mode: 0.0 for mode in GAME_MODES}
@@ -129,6 +149,7 @@ class TarkovPriceClient:
             mode: {} for mode in GAME_MODES
         }
         self._lookup_cache: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
+        self._json_etags: dict[str, str] = {}
         self._aliases: dict[str, str] = {}
         for mode in GAME_MODES:
             self._load_disk_cache(mode)
@@ -244,12 +265,16 @@ class TarkovPriceClient:
         game_mode: str | None = None,
         days: int = 2,
         sample_limit: int = 5,
+        source: str = "json",
     ) -> HistoricalPriceSummary:
         item_id = item_id.strip()
         if not item_id:
             raise PriceLookupError("物品 ID 为空，无法查询历史价格。")
         mode = _normalize_game_mode(game_mode or self.current_game_mode)
-        points = self._fetch_historical_prices(item_id, mode, days)
+        if _normalize_refresh_source(source) == "graphql":
+            points = self._fetch_historical_prices_graphql(item_id, mode, days)
+        else:
+            points = self._fetch_historical_prices_json(item_id, mode, days)
         usable = [point for point in points if _as_int(point.get("price")) is not None]
         recent = usable[-max(1, sample_limit):]
         prices = [_as_int(point.get("price")) for point in recent]
@@ -271,23 +296,182 @@ class TarkovPriceClient:
             days=days,
         )
 
-    def refresh_items(self, game_mode: str | None = None) -> int:
+    def refresh_items(self, game_mode: str | None = None, source: str = "json") -> int:
         mode = _normalize_game_mode(game_mode or self.current_game_mode)
-        items = self._fetch_items(mode, "en")
-        zh_items = self._fetch_items(mode, "zh")
-        items = _merge_localized_items(items, zh_items)
-        self._items_by_mode[mode] = items
-        self._fetched_at_by_mode[mode] = time.time()
-        self._build_search_index(mode)
-        self._lookup_cache.clear()
-        self._write_disk_cache(mode, items)
-        return len(items)
+        refresh_source = _normalize_refresh_source(source)
+        if refresh_source == "json":
+            return self._refresh_json_modes((mode,))[mode]
 
-    def refresh_all_modes(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
+        items = self._fetch_graphql_items(mode, "en")
+        zh_items = self._fetch_graphql_items(mode, "zh")
+        merged = _merge_localized_items(items, zh_items)
+        self._validate_refreshed_items(mode, merged, "GraphQL")
+        self._commit_refreshed_items({mode: merged}, self.endpoint)
+        return len(merged)
+
+    def refresh_all_modes(self, source: str = "json") -> dict[str, int]:
+        refresh_source = _normalize_refresh_source(source)
+        if refresh_source == "json":
+            return self._refresh_json_modes(GAME_MODES)
+
+        pending: dict[str, list[dict[str, Any]]] = {}
         for mode in GAME_MODES:
-            counts[mode] = self.refresh_items(mode)
-        return counts
+            items = self._fetch_graphql_items(mode, "en")
+            zh_items = self._fetch_graphql_items(mode, "zh")
+            pending[mode] = _merge_localized_items(items, zh_items)
+            self._validate_refreshed_items(mode, pending[mode], "GraphQL")
+        self._commit_refreshed_items(pending, self.endpoint)
+        return {mode: len(items) for mode, items in pending.items()}
+
+    def _refresh_json_modes(self, game_modes: tuple[str, ...]) -> dict[str, int]:
+        modes = tuple(dict.fromkeys(_normalize_game_mode(mode) for mode in game_modes))
+        translation_paths = (
+            f"{JSON_TRANSLATION_MODE}/items_en",
+            f"{JSON_TRANSLATION_MODE}/items_zh",
+        )
+        item_paths = tuple(f"{mode}/items" for mode in modes)
+        resource_paths = (*item_paths, *translation_paths)
+
+        if self._json_resources_unchanged(resource_paths, modes):
+            return {mode: len(self._items_by_mode.get(mode) or []) for mode in modes}
+
+        documents: dict[str, dict[str, Any]] = {}
+        pending_etags = dict(self._json_etags)
+        for resource_path in resource_paths:
+            document, etag = self._fetch_json_document(resource_path)
+            documents[resource_path] = document
+            if etag:
+                pending_etags[resource_path] = etag
+
+        english = _json_translation_map(documents[translation_paths[0]], "英文")
+        chinese = _json_translation_map(documents[translation_paths[1]], "中文")
+        pending_items: dict[str, list[dict[str, Any]]] = {}
+        for mode, resource_path in zip(modes, item_paths):
+            pending_items[mode] = _json_items(
+                documents[resource_path],
+                english,
+                chinese,
+            )
+            self._validate_refreshed_items(mode, pending_items[mode], "JSON")
+
+        previous_etags = self._json_etags
+        self._json_etags = pending_etags
+        try:
+            self._commit_refreshed_items(pending_items, self.json_endpoint)
+        except Exception:
+            self._json_etags = previous_etags
+            raise
+        return {mode: len(items) for mode, items in pending_items.items()}
+
+    def _json_resources_unchanged(
+        self,
+        resource_paths: tuple[str, ...],
+        game_modes: tuple[str, ...],
+    ) -> bool:
+        if any(not self._items_by_mode.get(mode) for mode in game_modes):
+            return False
+        if any(not self._json_etags.get(path) for path in resource_paths):
+            return False
+        return all(self._json_resource_unchanged(path) for path in resource_paths)
+
+    def _json_resource_unchanged(self, resource_path: str) -> bool:
+        etag = self._json_etags.get(resource_path)
+        if not etag:
+            return False
+        request = urllib.request.Request(
+            f"{self.json_endpoint}/{resource_path}",
+            headers={
+                "Accept-Encoding": "gzip",
+                "If-None-Match": etag,
+                "User-Agent": "EFT-Reminder-Price-Overlay/0.1",
+            },
+            method="HEAD",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=8) as response:
+                current_etag = response.headers.get("ETag")
+                return bool(current_etag and current_etag == etag)
+        except urllib.error.HTTPError as exc:
+            return exc.code == 304
+        except (OSError, urllib.error.URLError):
+            return False
+
+    def _fetch_json_document(self, resource_path: str) -> tuple[dict[str, Any], str | None]:
+        request = urllib.request.Request(
+            f"{self.json_endpoint}/{resource_path}",
+            headers={
+                "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "User-Agent": "EFT-Reminder-Price-Overlay/0.1",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read()
+                if str(response.headers.get("Content-Encoding") or "").casefold() == "gzip":
+                    raw = gzip.decompress(raw)
+                document = json.loads(raw.decode("utf-8"))
+                etag = response.headers.get("ETag")
+        except (OSError, urllib.error.URLError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise PriceLookupError(
+                f"JSON 价格 API 请求失败（{resource_path}）：{exc}"
+            ) from exc
+
+        if not isinstance(document, dict):
+            raise PriceLookupError(f"JSON 价格 API 响应格式无效（{resource_path}）。")
+        if document.get("error"):
+            raise PriceLookupError(
+                f"JSON 价格 API 返回错误（{resource_path}）：{document['error']}"
+            )
+        return document, etag
+
+    def _validate_refreshed_items(
+        self,
+        game_mode: str,
+        items: list[dict[str, Any]],
+        source_label: str,
+    ) -> None:
+        valid_ids = {
+            str(item.get("id"))
+            for item in items
+            if isinstance(item.get("id"), str) and str(item.get("id")).strip()
+        }
+        if len(items) < self.minimum_item_count or len(valid_ids) < self.minimum_item_count:
+            raise PriceLookupError(
+                f"{source_label} {_game_mode_label(game_mode)} 数据不完整："
+                f"只收到 {len(valid_ids)} 个有效物品，旧缓存已保留。"
+            )
+
+    def _commit_refreshed_items(
+        self,
+        items_by_mode: dict[str, list[dict[str, Any]]],
+        source: str,
+    ) -> None:
+        refreshed_at = time.time()
+        previous_items = {
+            mode: self._items_by_mode.get(mode, []) for mode in items_by_mode
+        }
+        previous_times = {
+            mode: self._fetched_at_by_mode.get(mode, 0.0) for mode in items_by_mode
+        }
+        try:
+            for mode, items in items_by_mode.items():
+                self._items_by_mode[mode] = items
+                self._fetched_at_by_mode[mode] = refreshed_at
+                self._build_search_index(mode)
+            self._lookup_cache.clear()
+            for mode, items in items_by_mode.items():
+                self._write_disk_cache(mode, items, source)
+        except Exception as exc:
+            for mode in items_by_mode:
+                self._items_by_mode[mode] = previous_items[mode]
+                self._fetched_at_by_mode[mode] = previous_times[mode]
+                self._build_search_index(mode)
+            self._lookup_cache.clear()
+            if isinstance(exc, PriceLookupError):
+                raise
+            raise PriceLookupError(f"价格缓存写入失败，旧缓存已保留：{exc}") from exc
 
     def cache_status(self) -> str:
         parts: list[str] = []
@@ -381,7 +565,11 @@ class TarkovPriceClient:
             f"{_game_mode_label(game_mode)} 物品价格缓存为空。请联网后使用 数据 > 刷新价格缓存。"
         )
 
-    def _fetch_items(self, game_mode: str, language: str = "en") -> list[dict[str, Any]]:
+    def _fetch_graphql_items(
+        self,
+        game_mode: str,
+        language: str = "en",
+    ) -> list[dict[str, Any]]:
         payload = json.dumps(
             {"query": ITEMS_QUERY, "variables": {"gameMode": game_mode, "lang": language}}
         ).encode("utf-8")
@@ -398,18 +586,42 @@ class TarkovPriceClient:
             with urllib.request.urlopen(request, timeout=12) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise PriceLookupError(f"价格 API 请求失败：{exc}") from exc
+            raise PriceLookupError(f"GraphQL 价格 API 请求失败：{exc}") from exc
 
         if data.get("errors"):
-            raise PriceLookupError(f"价格 API 返回错误：{data['errors']}")
+            raise PriceLookupError(f"GraphQL 价格 API 返回错误：{data['errors']}")
 
         items = data.get("data", {}).get("items")
         if not isinstance(items, list):
-            raise PriceLookupError("价格 API 响应中没有物品列表。")
+            raise PriceLookupError("GraphQL 价格 API 响应中没有物品列表。")
 
         return [item for item in items if isinstance(item, dict)]
 
-    def _fetch_historical_prices(
+    def _fetch_historical_prices_json(
+        self,
+        item_id: str,
+        game_mode: str,
+        days: int,
+    ) -> list[dict[str, Any]]:
+        safe_item_id = urllib.parse.quote(item_id, safe="")
+        document, _etag = self._fetch_json_document(
+            f"{game_mode}/prices/{safe_item_id}"
+        )
+        points = document.get("data")
+        if not isinstance(points, list):
+            raise PriceLookupError("JSON 历史价格 API 响应中没有价格点。")
+
+        cutoff_ms = (time.time() - max(1, int(days)) * 86400) * 1000
+        recent: list[dict[str, Any]] = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            timestamp = _as_float(point.get("timestamp"))
+            if timestamp is None or timestamp >= cutoff_ms:
+                recent.append(point)
+        return recent
+
+    def _fetch_historical_prices_graphql(
         self,
         item_id: str,
         game_mode: str,
@@ -434,14 +646,14 @@ class TarkovPriceClient:
             with urllib.request.urlopen(request, timeout=12) as response:
                 data = json.loads(response.read().decode("utf-8"))
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise PriceLookupError(f"历史价格 API 请求失败：{exc}") from exc
+            raise PriceLookupError(f"GraphQL 历史价格 API 请求失败：{exc}") from exc
 
         if data.get("errors"):
-            raise PriceLookupError(f"历史价格 API 返回错误：{data['errors']}")
+            raise PriceLookupError(f"GraphQL 历史价格 API 返回错误：{data['errors']}")
 
         points = data.get("data", {}).get("historicalItemPrices")
         if not isinstance(points, list):
-            raise PriceLookupError("历史价格 API 响应中没有价格点。")
+            raise PriceLookupError("GraphQL 历史价格 API 响应中没有价格点。")
         return [point for point in points if isinstance(point, dict)]
 
     def _load_disk_cache(self, game_mode: str) -> None:
@@ -458,23 +670,37 @@ class TarkovPriceClient:
         items = data.get("items")
         if not isinstance(items, list):
             return
+        json_etags = data.get("json_etags")
+        if isinstance(json_etags, dict):
+            for resource_path, etag in json_etags.items():
+                if isinstance(resource_path, str) and isinstance(etag, str) and etag:
+                    self._json_etags[resource_path] = etag
         self._items_by_mode[game_mode] = [item for item in items if isinstance(item, dict)]
         self._fetched_at_by_mode[game_mode] = float(data.get("fetched_at") or 0.0)
         self._build_search_index(game_mode)
         self._lookup_cache.clear()
 
-    def _write_disk_cache(self, game_mode: str, items: list[dict[str, Any]]) -> None:
+    def _write_disk_cache(
+        self,
+        game_mode: str,
+        items: list[dict[str, Any]],
+        source: str,
+    ) -> None:
         CACHE_DIR.mkdir(exist_ok=True)
         payload = {
             "fetched_at": self._fetched_at_by_mode[game_mode],
-            "source": self.endpoint,
+            "source": source,
             "game_mode": game_mode,
+            "json_etags": self._json_etags,
             "items": items,
         }
-        _cache_path_for_mode(game_mode).write_text(
+        cache_path = _cache_path_for_mode(game_mode)
+        temporary_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
+        temporary_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
+        temporary_path.replace(cache_path)
 
     def _find_best_match(
         self,
@@ -654,6 +880,97 @@ def _candidate_specificity_score(value: str) -> tuple[int, int, int]:
     caliber_count = len(_extract_calibers(normalized))
     token_count = len(_match_tokens(normalized))
     return model_count + caliber_count, token_count, len(compact)
+
+
+def _normalize_refresh_source(source: str) -> str:
+    value = str(source).strip().casefold()
+    if value in {"json", "static-json", "static_json"}:
+        return "json"
+    if value in {"graphql", "graph-ql", "graph_ql"}:
+        return "graphql"
+    raise PriceLookupError(f"未知价格数据源：{source}")
+
+
+def _json_translation_map(document: dict[str, Any], language_label: str) -> dict[str, str]:
+    values = document.get("data")
+    if not isinstance(values, dict):
+        raise PriceLookupError(f"JSON 价格 API 的{language_label}翻译文件格式无效。")
+    return {
+        key: value
+        for key, value in values.items()
+        if isinstance(key, str) and isinstance(value, str) and value.strip()
+    }
+
+
+def _json_items(
+    document: dict[str, Any],
+    english: dict[str, str],
+    chinese: dict[str, str],
+) -> list[dict[str, Any]]:
+    data = document.get("data")
+    raw_items = data.get("items") if isinstance(data, dict) else None
+    if isinstance(raw_items, dict):
+        values = raw_items.values()
+    elif isinstance(raw_items, list):
+        values = raw_items
+    else:
+        raise PriceLookupError("JSON 价格 API 响应中没有物品列表。")
+
+    items: list[dict[str, Any]] = []
+    for raw_item in values:
+        if not isinstance(raw_item, dict):
+            continue
+        item = dict(raw_item)
+        name_key = item.get("name")
+        short_name_key = item.get("shortName")
+        item["name"] = _translated_json_value(name_key, english)
+        item["shortName"] = _translated_json_value(short_name_key, english)
+        item["zhName"] = _translated_json_value(name_key, chinese, item["name"])
+        item["zhShortName"] = _translated_json_value(
+            short_name_key,
+            chinese,
+            item["shortName"],
+        )
+        item["sellFor"] = _json_sell_for(item.get("sellToTrader"))
+        items.append(item)
+    return items
+
+
+def _translated_json_value(
+    key: object,
+    translations: dict[str, str],
+    fallback: object = "",
+) -> str:
+    if isinstance(key, str):
+        translated = translations.get(key)
+        if isinstance(translated, str) and translated.strip():
+            return translated
+        if str(fallback or "").strip():
+            return str(fallback)
+        if key.strip():
+            return key
+    return str(fallback or "")
+
+
+def _json_sell_for(raw_offers: object) -> list[dict[str, Any]]:
+    if not isinstance(raw_offers, list):
+        return []
+    offers: list[dict[str, Any]] = []
+    for raw_offer in raw_offers:
+        if not isinstance(raw_offer, dict):
+            continue
+        trader_id = str(raw_offer.get("trader") or "")
+        trader_name = TRADER_NAMES.get(trader_id, "Trader")
+        offers.append(
+            {
+                "price": raw_offer.get("price"),
+                "priceRUB": raw_offer.get("priceRUB"),
+                "currency": raw_offer.get("currency"),
+                "source": trader_name,
+                "vendor": {"name": trader_name},
+            }
+        )
+    return offers
 
 
 def _merge_localized_items(

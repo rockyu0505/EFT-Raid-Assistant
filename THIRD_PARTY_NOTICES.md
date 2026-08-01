@@ -41,9 +41,10 @@ https://doc.qt.io/qtforpython-6/licenses.html
 
 ## Source Data
 
-Item and price data are fetched from the public tarkov.dev GraphQL API and
-cached locally for lookup speed. Escape from Tarkov item names, images, and
-game terminology belong to their respective rights holders.
+Item and price data are fetched from the public tarkov.dev JSON API, with the
+tarkov.dev GraphQL API available only as a user-approved fallback, and cached
+locally for lookup speed. Escape from Tarkov item names, images, and game
+terminology belong to their respective rights holders.
 
 EFT Raid Assistant is an independent fan-made utility and is not affiliated
 with, endorsed by, or sponsored by Battlestate Games, Escape from Tarkov,

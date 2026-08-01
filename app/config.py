@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -12,19 +13,34 @@ APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
 CONFIG_PATH = APP_DIR / "config.json"
 
 
+FEATURE_DEFINITIONS: dict[str, str] = {
+    "price_lookup": "局内查价",
+    "trader_reminders": "商人补货",
+    "hideout": "藏身处记录",
+    "display_filter": "Gamma 显示调校",
+}
+DEFAULT_ENABLED_FEATURES = ["price_lookup", "trader_reminders", "hideout"]
+
+
 REMOVED_CONFIG_KEYS = {
+    "display_filter_next_hotkey",
     "item_ocr_engine",
     "item_ocr_language",
+    "reminder_overlay_seconds",
+    "schedule_hotkey",
     "tesseract_cmd",
 }
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "enabled_features": DEFAULT_ENABLED_FEATURES.copy(),
+    "feature_setup_complete": False,
     "selected_traders": TRADERS.copy(),
     "capture_hotkey": "F8",
     "item_lookup_hotkey": "Q",
     "hideout_scan_hotkey": "F6",
-    "schedule_hotkey": "F10",
+    "reminder_hold_hotkey": "F7",
+    "display_filter_restore_hotkey": "Ctrl+F9",
     "capture_mode": "Auto",
     "manual_resolution_enabled": False,
     "manual_width": 2048,
@@ -71,23 +87,64 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "refresh_prices_on_startup": True,
     "lead_time_seconds": 10,
     "repeat_alert_seconds": 0,
+    "feedback_overlay_seconds": 6,
     "sound_enabled": True,
     "popup_enabled": True,
+    "performance_mode_enabled": True,
+    "performance_log_max_lines": 600,
+    "performance_gc_after_worker": True,
+    "performance_cleanup_interval_seconds": 60,
+    "performance_max_concurrent_workers": 2,
+    "performance_skip_auto_price_refresh": True,
+    "display_filter_restore_on_exit": True,
+    "display_filter_eye_care_enabled": True,
+    "display_filter_eye_care_check_seconds": 2,
+    "display_filter_active_preset": "",
+    "display_filter_presets": [
+        {
+            "name": "Indoor Lift",
+            "description": "暗处提亮，保留亮部余量",
+            "gamma": 0.78,
+            "black_lift": 0.08,
+            "gain": 0.96,
+            "contrast": 1.03,
+            "hotkey": "",
+        },
+        {
+            "name": "Night Soft",
+            "description": "夜图和室内更柔和的暗部抬升",
+            "gamma": 0.68,
+            "black_lift": 0.13,
+            "gain": 0.92,
+            "contrast": 0.98,
+            "hotkey": "",
+        },
+        {
+            "name": "Outdoor Guard",
+            "description": "轻度提暗，压住天空和雪地过曝",
+            "gamma": 0.88,
+            "black_lift": 0.04,
+            "gain": 0.90,
+            "contrast": 1.06,
+            "hotkey": "",
+        },
+    ],
 }
 
 
 def load_config() -> dict[str, Any]:
     """Load config.json, merging it onto defaults so new keys are harmless."""
     if not CONFIG_PATH.exists():
-        return DEFAULT_CONFIG.copy()
+        return copy.deepcopy(DEFAULT_CONFIG)
 
     try:
         data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return DEFAULT_CONFIG.copy()
+        return copy.deepcopy(DEFAULT_CONFIG)
 
-    merged = DEFAULT_CONFIG.copy()
+    merged = copy.deepcopy(DEFAULT_CONFIG)
     merged.update(data)
+    merged["enabled_features"] = _clean_enabled_features(merged.get("enabled_features"))
     for key in REMOVED_CONFIG_KEYS:
         merged.pop(key, None)
     return merged
@@ -96,7 +153,14 @@ def load_config() -> dict[str, Any]:
 def save_config(config: dict[str, Any]) -> None:
     """Persist user settings to config.json in the project directory."""
     cleaned = {key: value for key, value in config.items() if key not in REMOVED_CONFIG_KEYS}
+    cleaned["enabled_features"] = _clean_enabled_features(cleaned.get("enabled_features"))
     CONFIG_PATH.write_text(
         json.dumps(cleaned, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _clean_enabled_features(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return DEFAULT_ENABLED_FEATURES.copy()
+    return [str(item) for item in value if str(item) in FEATURE_DEFINITIONS]

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0 - Unreleased
+
+- Added a first-run feature setup dialog and Settings feature toggles so users can enable only the panels they need; changes take effect after restart.
+- Changed feature toggles to be hard module gates: disabled modules do not create their runtime managers, register hotkeys, start background refreshes, or apply display filters.
+- Changed Settings to open on the hotkey tab by default and moved low-frequency capture ROI/manual resolution controls into a collapsed advanced capture section.
+- Added an initial Windows Gamma Ramp display-filter prototype with selectable presets, per-preset hotkeys, a restore hotkey, and restore-on-exit protection.
+- Added Gamma tuning sliders, curve preview, named preset save/delete, and a mouse-interactive always-on-top tuning window for in-game live adjustment.
+- Added explicit Gamma preset creation from the current slider values in both the main panel and the in-game tuning window.
+- Added optional per-preset Gamma hotkeys so each saved display profile can be applied directly in raid without cycling through other presets.
+- Changed hotkey settings to capture the next key press directly, detect conflicts, and allow replacing an existing binding.
+- Changed Gamma live tuning to apply silently while dragging sliders so visible logs and feedback toasts only appear for explicit hotkey toggles/restores or important safety events.
+- Added Gamma eye-care mode: when Tarkov is no longer the foreground app, the app can automatically restore the original system Gamma and show a one-time reminder.
+- Changed the visible log into a persistent main-window section shared by all feature panels, with automatic scrolling to the newest entry.
+- Hid foreground-window rejection messages from the visible log to avoid spam while users alt-tab or chat outside the game.
+- Added a performance settings tab with visible-log line limits, background-worker concurrency limits, worker-finished memory cleanup, periodic idle cleanup, and a default performance-mode skip for automatic price-cache refreshes.
+- Changed trader restock reminders from modal message boxes to a left-side non-focus, mouse-through overlay so reminders do not interrupt gameplay.
+- Added a configurable reminder visibility hotkey, defaulting to `F7`, to hide or show persistent restock reminder overlays.
+- Changed trader countdown OCR so `F8` immediately schedules reminders for checked traders instead of requiring a separate `F10` hotkey.
+- Added left-side floating operation feedback for trader countdown OCR and hideout scans so hotkey actions report what was recorded.
+- Changed price-cache and historical-price refreshes to prefer tarkov.dev's static JSON API, preserve existing caches on failure, and ask before trying GraphQL as a fallback.
+
 ## 0.5.0 - 2026-06-27
 
 - Added an initial hideout upgrade tracking panel with full-screen hideout OCR capture.

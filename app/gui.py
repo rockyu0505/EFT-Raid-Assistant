@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import gc
 import html
 import os
 import re
@@ -11,7 +13,18 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QModelIndex, QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QCloseEvent, QColor, QIcon, QStandardItem, QStandardItemModel
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QIcon,
+    QPainter,
+    QPen,
+    QPixmap,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -26,12 +39,14 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPushButton,
+    QSlider,
     QStackedWidget,
     QSpinBox,
     QStyle,
@@ -62,9 +77,17 @@ from app.capture import (
     scale_metric,
 )
 from app.config import APP_DIR, load_config, save_config
+from app.config import CONFIG_PATH, DEFAULT_ENABLED_FEATURES, FEATURE_DEFINITIONS
+from app.display_filter import (
+    DisplayFilterError,
+    apply_preset,
+    build_gamma_ramp,
+    get_gamma_ramp,
+    set_gamma_ramp,
+)
 from app.hideout import HideoutDataError, HideoutTracker
 from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
-from app.hotkeys import HotkeyManager
+from app.hotkeys import HotkeyManager, normalize_hotkey
 from app.item_ocr import (
     detect_inventory_tab_crop,
     refine_tooltip_name_crop,
@@ -76,14 +99,131 @@ from app.prices import CHINESE_ALIASES_PATH, PriceLookupError, TarkovPriceClient
 from app.reminders import ReminderManager
 
 
+DISPLAY_FILTER_SLIDERS = {
+    "gamma": ("Gamma 曲线", 40, 160, 100, 2),
+    "black_lift": ("暗部抬升", 0, 35, 100, 2),
+    "gain": ("亮度/Gain", 50, 125, 100, 2),
+    "contrast": ("对比度", 65, 145, 100, 2),
+}
+
+
+HOTKEY_CONFIG_LABELS = [
+    ("capture_hotkey", "识别倒计时"),
+    ("item_lookup_hotkey", "物品查价"),
+    ("hideout_scan_hotkey", "识别藏身处"),
+    ("reminder_hold_hotkey", "隐藏/显示补货提示"),
+    ("display_filter_restore_hotkey", "恢复 Gamma"),
+]
+
+
+class HotkeyLineEdit(QLineEdit):
+    def __init__(self, label: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.label = label
+        self._capture_start_text = ""
+        self._conflict_checker: Callable[["HotkeyLineEdit", str], bool] | None = None
+        self.setPlaceholderText("点击后按一次快捷键；右键取消，Backspace/Delete 清空")
+        self.setToolTip("点击输入框后直接按下要绑定的按键或组合键，例如 F9、Alt+2、Ctrl+Alt+1；右键恢复本次设定前的按键。")
+
+    def set_conflict_checker(
+        self, checker: Callable[["HotkeyLineEdit", str], bool] | None
+    ) -> None:
+        self._conflict_checker = checker
+
+    def focusInEvent(self, event) -> None:  # type: ignore[override]
+        super().focusInEvent(event)
+        self._capture_start_text = self.text()
+        self.selectAll()
+
+    def mousePressEvent(self, event) -> None:  # type: ignore[override]
+        if event.button() == Qt.MouseButton.RightButton:
+            self.setText(self._capture_start_text)
+            self.clearFocus()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        key = int(event.key())
+        if key == int(Qt.Key.Key_Escape):
+            self.clearFocus()
+            event.accept()
+            return
+        if key in (int(Qt.Key.Key_Backspace), int(Qt.Key.Key_Delete)):
+            self.clear()
+            event.accept()
+            return
+
+        hotkey = _hotkey_text_from_event(event)
+        if hotkey is None:
+            event.accept()
+            return
+        if not hotkey:
+            QMessageBox.information(
+                self,
+                "不支持的快捷键",
+                "目前支持 F1-F12、字母、数字，以及 Ctrl/Shift/Alt/Win 组合。",
+            )
+            event.accept()
+            return
+        if self._conflict_checker is not None and not self._conflict_checker(self, hotkey):
+            event.accept()
+            return
+        self.setText(hotkey)
+        self.clearFocus()
+        event.accept()
+
+
+def _hotkey_text_from_event(event) -> str | None:
+    key = int(event.key())
+    if key in {
+        int(Qt.Key.Key_Control),
+        int(Qt.Key.Key_Shift),
+        int(Qt.Key.Key_Alt),
+        int(Qt.Key.Key_Meta),
+    }:
+        return None
+
+    parts: list[str] = []
+    modifiers = event.modifiers()
+    if modifiers & Qt.KeyboardModifier.ControlModifier:
+        parts.append("Ctrl")
+    if modifiers & Qt.KeyboardModifier.ShiftModifier:
+        parts.append("Shift")
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        parts.append("Alt")
+    if modifiers & Qt.KeyboardModifier.MetaModifier:
+        parts.append("Win")
+
+    if int(Qt.Key.Key_F1) <= key <= int(Qt.Key.Key_F12):
+        parts.append(f"F{key - int(Qt.Key.Key_F1) + 1}")
+    elif int(Qt.Key.Key_0) <= key <= int(Qt.Key.Key_9):
+        parts.append(chr(ord("0") + key - int(Qt.Key.Key_0)))
+    elif int(Qt.Key.Key_A) <= key <= int(Qt.Key.Key_Z):
+        parts.append(chr(ord("A") + key - int(Qt.Key.Key_A)))
+    else:
+        return ""
+    return "+".join(parts)
+
+
+@dataclass(frozen=True)
+class PriceCacheRefreshResult:
+    source: str
+    counts: dict[str, int] | None = None
+    error: str = ""
+
+
 class MainWindow(QMainWindow):
     capture_requested = Signal()
     item_lookup_requested = Signal()
     hideout_scan_requested = Signal()
-    schedule_requested = Signal()
+    reminder_hold_requested = Signal()
+    display_filter_restore_requested = Signal()
+    display_filter_preset_requested = Signal(str)
     price_result_ready = Signal(object, str)
     price_history_ready = Signal(object, object, str)
-    cache_refresh_ready = Signal(str)
+    cache_refresh_ready = Signal(object)
+    price_history_json_failed = Signal(object, str)
     hideout_scan_ready = Signal(object, str)
     hideout_cache_ready = Signal(str)
 
@@ -93,13 +233,35 @@ class MainWindow(QMainWindow):
         self.resize(980, 720)
 
         self.config = load_config()
+        self._first_run = not CONFIG_PATH.exists()
+        self._runtime_enabled_features: set[str] = set()
+        self._maybe_run_feature_setup()
+        self._runtime_enabled_features = self._configured_enabled_features()
         self.hotkeys = HotkeyManager()
-        self.reminders = ReminderManager()
-        self.price_client = TarkovPriceClient()
-        self.hideout_tracker = HideoutTracker()
+        self.reminders = ReminderManager() if self._feature_enabled("trader_reminders") else None
+        self.price_client = TarkovPriceClient() if self._feature_enabled("price_lookup") else None
+        self.hideout_tracker = HideoutTracker() if self._feature_enabled("hideout") else None
         self.current_price_game_mode = str(self.config.get("price_game_mode_default", "pve"))
-        self.price_client.set_game_mode(self.current_price_game_mode)
-        self.price_overlay = PriceOverlay()
+        if self.price_client is not None:
+            self.price_client.set_game_mode(self.current_price_game_mode)
+        self.price_overlay = PriceOverlay() if self._feature_enabled("price_lookup") else None
+        self.feedback_overlay = (
+            FeedbackOverlay()
+            if any(
+                self._feature_enabled(feature)
+                for feature in ("trader_reminders", "hideout", "display_filter")
+            )
+            else None
+        )
+        self.reminder_overlay = ReminderOverlay() if self._feature_enabled("trader_reminders") else None
+        self._display_filter_baseline = None
+        self._display_filter_index = -1
+        self._display_filter_controls_loading = False
+        self._display_filter_dialog: DisplayFilterControlDialog | None = None
+        self._display_filter_eye_timer = QTimer(self)
+        self._display_filter_eye_timer.timeout.connect(self._on_display_filter_eye_care_check)
+        self._resource_cleanup_timer = QTimer(self)
+        self._resource_cleanup_timer.timeout.connect(self._on_resource_cleanup_timer)
         self._run_log_path = APP_DIR / "debug" / "latest_run.log"
         self._reset_run_log()
         self._cached_item_region: Region | None = None
@@ -123,14 +285,18 @@ class MainWindow(QMainWindow):
         self.restock_items: dict[str, QTableWidgetItem] = {}
         self.status_items: dict[str, QTableWidgetItem] = {}
 
-        self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
+        if self.reminders is not None:
+            self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
         self.capture_requested.connect(self.capture_and_ocr)
         self.item_lookup_requested.connect(self.capture_item_price)
         self.hideout_scan_requested.connect(self.capture_hideout_progress)
-        self.schedule_requested.connect(self.schedule_selected)
+        self.reminder_hold_requested.connect(self.toggle_reminder_hold)
+        self.display_filter_restore_requested.connect(self.restore_display_filter)
+        self.display_filter_preset_requested.connect(self.apply_display_filter_preset_by_name)
         self.price_result_ready.connect(self._on_price_result_ready)
         self.price_history_ready.connect(self._on_price_history_ready)
         self.cache_refresh_ready.connect(self._on_cache_refresh_ready)
+        self.price_history_json_failed.connect(self._on_price_history_json_failed)
         self.hideout_scan_ready.connect(self._on_hideout_scan_ready)
         self.hideout_cache_ready.connect(self._on_hideout_cache_ready)
 
@@ -139,7 +305,8 @@ class MainWindow(QMainWindow):
         self._refresh_item_completer()
         self._register_hotkeys()
         self._update_cache_status_label()
-        if bool(self.config.get("refresh_prices_on_startup", True)):
+        self._apply_performance_settings()
+        if self._should_auto_refresh_price_cache():
             self.refresh_price_cache(background=True)
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -164,13 +331,66 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        if self._feature_enabled("display_filter") and bool(
+            self.config.get("display_filter_restore_on_exit", True)
+        ):
+            self.restore_display_filter(show_feedback=False)
         self._save_config()
         self.hotkeys.unregister(join_timeout=1.0)
-        self.reminders.shutdown()
-        self.price_overlay.hide()
+        if self.reminders is not None:
+            self.reminders.shutdown()
+        if self.price_overlay is not None:
+            self.price_overlay.hide()
+        if self.feedback_overlay is not None:
+            self.feedback_overlay.hide()
+        if self.reminder_overlay is not None:
+            self.reminder_overlay.hide()
         if self.tray_icon is not None:
             self.tray_icon.hide()
         self._join_workers(timeout=1.0)
+        self._cleanup_memory()
+
+    def _configured_enabled_features(self) -> set[str]:
+        value = self.config.get("enabled_features", DEFAULT_ENABLED_FEATURES)
+        if not isinstance(value, list):
+            return set(DEFAULT_ENABLED_FEATURES)
+        return {str(item) for item in value if str(item) in FEATURE_DEFINITIONS}
+
+    def _enabled_features(self) -> set[str]:
+        runtime = getattr(self, "_runtime_enabled_features", None)
+        if isinstance(runtime, set):
+            return runtime
+        return self._configured_enabled_features()
+
+    def _feature_enabled(self, feature_id: str) -> bool:
+        return feature_id in self._enabled_features()
+
+    def _maybe_run_feature_setup(self) -> None:
+        if not self._first_run or bool(self.config.get("feature_setup_complete", False)):
+            return
+        dialog = FeatureSetupDialog(self.config, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.config.update(dialog.values())
+        else:
+            self.config["enabled_features"] = ["price_lookup", "trader_reminders"]
+        self.config["feature_setup_complete"] = True
+        save_config(self.config)
+
+    def _build_panel_defs(self) -> list[tuple[str, Callable[[], QWidget]]]:
+        panels: list[tuple[str, Callable[[], QWidget]]] = []
+        if self._feature_enabled("price_lookup"):
+            panels.append(("局内查价", self._build_price_panel))
+        if self._feature_enabled("trader_reminders"):
+            panels.append(("商人补货", self._build_trader_panel))
+        if self._feature_enabled("price_lookup"):
+            panels.append(("数据", self._build_data_panel))
+        if self._feature_enabled("hideout"):
+            panels.append(("藏身处", self._build_hideout_panel))
+        if self._feature_enabled("display_filter"):
+            panels.append(("Gamma", self._build_display_filter_panel))
+        if not panels:
+            panels.append(("未启用", self._build_disabled_panel))
+        return panels
 
     def _build_ui(self) -> None:
         self.setWindowIcon(_load_app_icon(self))
@@ -181,17 +401,26 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(12)
 
+        self._panel_defs = self._build_panel_defs()
         sidebar = self._build_sidebar()
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
         self.panel_stack = QStackedWidget()
-        self.panel_stack.addWidget(self._build_price_panel())
-        self.panel_stack.addWidget(self._build_trader_panel())
-        self.panel_stack.addWidget(self._build_data_panel())
-        self.panel_stack.addWidget(self._build_hideout_panel())
+        for _title, builder in self._panel_defs:
+            self.panel_stack.addWidget(builder())
         self.panel_stack.setCurrentIndex(0)
         self._select_panel(0)
 
+        log_group = QGroupBox("运行日志")
+        log_layout = QVBoxLayout(log_group)
+        log_layout.addWidget(self._build_log_panel())
+        content_layout.addWidget(self.panel_stack, 1)
+        content_layout.addWidget(log_group)
+
         layout.addWidget(sidebar)
-        layout.addWidget(self.panel_stack, 1)
+        layout.addWidget(content, 1)
         self.setCentralWidget(root)
 
     def _build_tray_icon(self) -> None:
@@ -204,14 +433,15 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         show_action = QAction("显示主窗口", self)
         show_action.triggered.connect(self.show_from_tray)
-        price_action = QAction("立即查价", self)
-        price_action.triggered.connect(lambda: self.item_lookup_requested.emit())
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self.open_settings)
         exit_action = QAction("退出", self)
         exit_action.triggered.connect(self.request_exit)
         menu.addAction(show_action)
-        menu.addAction(price_action)
+        if self._feature_enabled("price_lookup"):
+            price_action = QAction("立即查价", self)
+            price_action.triggered.connect(lambda: self.item_lookup_requested.emit())
+            menu.addAction(price_action)
         menu.addAction(settings_action)
         menu.addSeparator()
         menu.addAction(exit_action)
@@ -285,19 +515,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        for index, title in enumerate(["局内查价", "商人补货", "数据"]):
+        for index, (title, _builder) in enumerate(self._panel_defs):
             button = QPushButton(title)
             button.setCheckable(True)
             button.setMinimumHeight(38)
             button.clicked.connect(lambda checked=False, page=index: self._select_panel(page))
             self.panel_buttons.append(button)
             layout.addWidget(button)
-        button = QPushButton("藏身处")
-        button.setCheckable(True)
-        button.setMinimumHeight(38)
-        button.clicked.connect(lambda checked=False, page=3: self._select_panel(page))
-        self.panel_buttons.append(button)
-        layout.addWidget(button)
         layout.addStretch(1)
 
         settings_button = QPushButton("设置")
@@ -317,7 +541,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.addWidget(self._build_status_bar())
         layout.addWidget(self._build_item_lookup_group())
-        layout.addWidget(self._build_log_panel(), 1)
+        layout.addStretch(1)
         return panel
 
     def _build_trader_panel(self) -> QWidget:
@@ -397,6 +621,591 @@ class MainWindow(QMainWindow):
         self._update_hideout_table()
         return panel
 
+    def _build_display_filter_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+
+        group = QGroupBox("Gamma 显示调校")
+        group_layout = QVBoxLayout(group)
+        self.display_filter_status_label = QLabel("尚未应用显示调校")
+        self.display_filter_status_label.setWordWrap(True)
+        group_layout.addWidget(self.display_filter_status_label)
+
+        top = QWidget()
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        controls = QWidget()
+        controls_layout = QFormLayout(controls)
+        self.display_filter_preset_combo = QComboBox()
+        for index, preset in enumerate(self._display_filter_presets()):
+            self.display_filter_preset_combo.addItem(str(preset.get("name", f"Preset {index + 1}")), index)
+        active = str(self.config.get("display_filter_active_preset", ""))
+        if active:
+            for index, preset in enumerate(self._display_filter_presets()):
+                if str(preset.get("name", "")) == active:
+                    self.display_filter_preset_combo.setCurrentIndex(index)
+                    break
+        self.display_filter_preset_combo.currentIndexChanged.connect(
+            self._on_display_filter_preset_changed
+        )
+
+        self.display_filter_sliders: dict[str, QSlider] = {}
+        self.display_filter_value_labels: dict[str, QLabel] = {}
+        self.display_filter_summary_label = QLabel("")
+        self.display_filter_summary_label.setWordWrap(True)
+        controls_layout.addRow("配色方案", self.display_filter_preset_combo)
+        for key, (label, minimum, maximum, _scale, _decimals) in DISPLAY_FILTER_SLIDERS.items():
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(minimum, maximum)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            slider.setTickInterval(max(1, (maximum - minimum) // 5))
+            value_label = QLabel("")
+            value_label.setMinimumWidth(56)
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(slider, 1)
+            row_layout.addWidget(value_label)
+            self.display_filter_sliders[key] = slider
+            self.display_filter_value_labels[key] = value_label
+            slider.valueChanged.connect(self._on_display_filter_slider_changed)
+            controls_layout.addRow(label, row)
+        controls_layout.addRow("参数", self.display_filter_summary_label)
+
+        self.display_filter_curve = GammaCurvePreview()
+        top_layout.addWidget(controls, 1)
+        top_layout.addWidget(self.display_filter_curve)
+        group_layout.addWidget(top)
+
+        self.display_filter_live_preview = QCheckBox("拖动滑条时实时应用到系统 Gamma")
+        self.display_filter_live_preview.setChecked(False)
+        group_layout.addWidget(self.display_filter_live_preview)
+
+        self.display_filter_preset_name = QLineEdit()
+        self.display_filter_preset_name.setPlaceholderText("输入名称后保存为自定义方案")
+        self.display_filter_preset_hotkey = HotkeyLineEdit("当前 Gamma 方案")
+        self.display_filter_preset_hotkey.set_conflict_checker(
+            self._check_display_filter_preset_hotkey
+        )
+        self.display_filter_preset_hotkey.setPlaceholderText("点击后按一次快捷键；留空则不绑定")
+        name_row = QWidget()
+        name_layout = QHBoxLayout(name_row)
+        name_layout.setContentsMargins(0, 0, 0, 0)
+        new_button = QPushButton("新建方案")
+        new_button.clicked.connect(self.create_display_filter_preset)
+        save_button = QPushButton("保存/覆盖方案")
+        save_button.clicked.connect(self.save_current_display_filter_preset)
+        delete_button = QPushButton("删除方案")
+        delete_button.clicked.connect(self.delete_selected_display_filter_preset)
+        name_layout.addWidget(self.display_filter_preset_name, 1)
+        name_layout.addWidget(new_button)
+        name_layout.addWidget(save_button)
+        name_layout.addWidget(delete_button)
+        group_layout.addWidget(name_row)
+        hotkey_row = QWidget()
+        hotkey_layout = QFormLayout(hotkey_row)
+        hotkey_layout.setContentsMargins(0, 0, 0, 0)
+        hotkey_layout.addRow("当前方案热键", self.display_filter_preset_hotkey)
+        group_layout.addWidget(hotkey_row)
+
+        apply_button = QPushButton("应用当前预设")
+        apply_button.clicked.connect(self.apply_selected_display_filter)
+        next_button = QPushButton("切换到下一个预设")
+        next_button.clicked.connect(lambda checked=False: self.cycle_display_filter_preset(notify=False))
+        restore_button = QPushButton("恢复系统原始 Gamma")
+        restore_button.clicked.connect(lambda checked=False: self.restore_display_filter(show_feedback=False))
+        floating_button = QPushButton("打开局内调节浮窗")
+        floating_button.clicked.connect(self.open_display_filter_control_window)
+        buttons = QWidget()
+        buttons_layout = QHBoxLayout(buttons)
+        buttons_layout.setContentsMargins(0, 0, 0, 0)
+        buttons_layout.addWidget(apply_button)
+        buttons_layout.addWidget(next_button)
+        buttons_layout.addWidget(restore_button)
+        buttons_layout.addWidget(floating_button)
+        group_layout.addWidget(buttons)
+
+        layout.addWidget(group)
+        layout.addStretch(1)
+        self._on_display_filter_preset_changed()
+        return panel
+
+    def _build_disabled_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        title = QLabel("当前没有启用任何功能")
+        title.setStyleSheet("font-size: 20px; font-weight: 700;")
+        detail = QLabel("可以打开设置，在“功能”页选择要启用的模块；保存后重启软件生效。")
+        detail.setWordWrap(True)
+        settings_button = QPushButton("打开设置")
+        settings_button.clicked.connect(self.open_settings)
+        layout.addWidget(title)
+        layout.addWidget(detail)
+        layout.addWidget(settings_button)
+        layout.addStretch(1)
+        return panel
+
+    def _display_filter_presets(self) -> list[dict[str, object]]:
+        presets = self.config.get("display_filter_presets", [])
+        if not isinstance(presets, list):
+            return []
+        return [preset for preset in presets if isinstance(preset, dict)]
+
+    def _selected_display_filter_preset(self) -> dict[str, object] | None:
+        presets = self._display_filter_presets()
+        if not presets:
+            return None
+        index = 0
+        if hasattr(self, "display_filter_preset_combo"):
+            index = max(0, self.display_filter_preset_combo.currentIndex())
+        else:
+            active = str(self.config.get("display_filter_active_preset", ""))
+            for preset_index, preset in enumerate(presets):
+                if str(preset.get("name", "")) == active:
+                    index = preset_index
+                    break
+        return presets[index % len(presets)]
+
+    def _display_filter_preset_from_controls(self) -> dict[str, object]:
+        preset = self._selected_display_filter_preset() or {}
+        result: dict[str, object] = {
+            "name": str(preset.get("name", "Custom")),
+            "description": str(preset.get("description", "自定义 Gamma 曲线")),
+            "hotkey": str(preset.get("hotkey", "")),
+        }
+        if hasattr(self, "display_filter_preset_hotkey"):
+            result["hotkey"] = self.display_filter_preset_hotkey.text().strip()
+        for key, (_label, _minimum, _maximum, scale, decimals) in DISPLAY_FILTER_SLIDERS.items():
+            slider = self.display_filter_sliders.get(key)
+            if slider is None:
+                result[key] = round(float(preset.get(key, 1.0)), decimals)
+            else:
+                result[key] = round(slider.value() / scale, decimals)
+        return result
+
+    def _load_display_filter_controls(self, preset: dict[str, object]) -> None:
+        self._display_filter_controls_loading = True
+        try:
+            for key, (_label, minimum, maximum, scale, _decimals) in DISPLAY_FILTER_SLIDERS.items():
+                slider = self.display_filter_sliders.get(key)
+                if slider is None:
+                    continue
+                value = int(round(_preset_float(preset, key, slider.value() / scale) * scale))
+                slider.setValue(min(max(value, minimum), maximum))
+            if hasattr(self, "display_filter_preset_name"):
+                self.display_filter_preset_name.setText(str(preset.get("name", "")))
+            if hasattr(self, "display_filter_preset_hotkey"):
+                self.display_filter_preset_hotkey.setText(str(preset.get("hotkey", "")))
+        finally:
+            self._display_filter_controls_loading = False
+        self._update_display_filter_summary()
+
+    def _on_display_filter_preset_changed(self) -> None:
+        preset = self._selected_display_filter_preset()
+        if preset is not None and hasattr(self, "display_filter_sliders"):
+            self._load_display_filter_controls(preset)
+            return
+        self._update_display_filter_summary()
+
+    def _on_display_filter_slider_changed(self) -> None:
+        if self._display_filter_controls_loading:
+            return
+        self._update_display_filter_summary()
+        if (
+            self._feature_enabled("display_filter")
+            and hasattr(self, "display_filter_live_preview")
+            and self.display_filter_live_preview.isChecked()
+        ):
+            self._apply_display_filter_preset(self._display_filter_preset_from_controls())
+
+    def _update_display_filter_summary(self) -> None:
+        if not hasattr(self, "display_filter_summary_label"):
+            return
+        if hasattr(self, "display_filter_sliders"):
+            preset = self._display_filter_preset_from_controls()
+        else:
+            preset = self._selected_display_filter_preset()
+        if preset is None:
+            self.display_filter_summary_label.setText("没有可用预设")
+            return
+        for key, value_label in getattr(self, "display_filter_value_labels", {}).items():
+            value_label.setText(_format_display_filter_value(key, _preset_float(preset, key, 1.0)))
+        if hasattr(self, "display_filter_curve"):
+            self.display_filter_curve.set_preset(preset)
+        summary = (
+            f"{preset.get('description', '')}\n"
+            f"gamma={preset.get('gamma', 1.0)}，"
+            f"black_lift={preset.get('black_lift', 0.0)}，"
+            f"gain={preset.get('gain', 1.0)}，"
+            f"contrast={preset.get('contrast', 1.0)}，"
+            f"hotkey={preset.get('hotkey', '') or '未绑定'}"
+        )
+        self.display_filter_summary_label.setText(summary)
+
+    def apply_selected_display_filter(self) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过应用预设。")
+            return
+        preset = self._selected_display_filter_preset()
+        if preset is None:
+            self._show_operation_feedback("Gamma 调校失败", "没有预设", "请先在配置中添加显示预设。", accent_color="#FF5A5F")
+            return
+        self._apply_display_filter_preset(self._display_filter_preset_from_controls())
+
+    def apply_current_display_filter_values(self) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过应用当前参数。")
+            return
+        self._apply_display_filter_preset(self._display_filter_preset_from_controls())
+
+    def _check_display_filter_preset_hotkey(
+        self, _field: HotkeyLineEdit, hotkey: str
+    ) -> bool:
+        try:
+            normalize_hotkey(hotkey)
+        except ValueError as exc:
+            QMessageBox.warning(self, "热键无效", str(exc))
+            return False
+        return True
+
+    def _resolve_display_filter_preset_hotkey_conflicts(
+        self, preset_name: str, hotkey: str
+    ) -> bool:
+        text = hotkey.strip()
+        if not text:
+            return True
+        try:
+            normalized = normalize_hotkey(text)
+        except ValueError as exc:
+            QMessageBox.warning(self, "热键无效", str(exc))
+            return False
+
+        conflict = self._find_hotkey_conflict(
+            normalized, exclude_preset_name=preset_name
+        )
+        if conflict is None:
+            return True
+
+        kind, label, target = conflict
+        answer = QMessageBox.question(
+            self,
+            "快捷键冲突",
+            f"{hotkey} 已被“{label}”使用。是否替代？选择“是”会清空原绑定。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        if kind == "config":
+            self.config[str(target)] = ""
+        elif kind == "preset":
+            target["hotkey"] = ""  # type: ignore[index]
+        return True
+
+    def _find_hotkey_conflict(
+        self, normalized: str, *, exclude_preset_name: str = ""
+    ) -> tuple[str, str, object] | None:
+        for config_key, label in HOTKEY_CONFIG_LABELS:
+            text = str(self.config.get(config_key, "")).strip()
+            if not text:
+                continue
+            try:
+                if normalize_hotkey(text) == normalized:
+                    return ("config", label, config_key)
+            except ValueError:
+                continue
+
+        for preset in self._display_filter_presets():
+            name = str(preset.get("name", "")).strip()
+            if name and name == exclude_preset_name:
+                continue
+            text = str(preset.get("hotkey", "")).strip()
+            if not text:
+                continue
+            try:
+                if normalize_hotkey(text) == normalized:
+                    return ("preset", f"Gamma 方案：{name}", preset)
+            except ValueError:
+                continue
+        return None
+
+    def create_display_filter_preset(self) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过新建方案。")
+            return
+        default_name = self._unique_display_filter_preset_name("自定义方案")
+        name, ok = QInputDialog.getText(
+            self,
+            "新建 Gamma 方案",
+            "方案名称：",
+            text=default_name,
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if self._display_filter_preset_name_exists(name):
+            QMessageBox.warning(
+                self,
+                "方案名称已存在",
+                "这个 Gamma 方案名称已经存在。请换一个名称，或使用“保存/覆盖方案”。",
+            )
+            return
+        preset = self._display_filter_preset_from_controls()
+        preset["name"] = name
+        preset["description"] = "自定义 Gamma 曲线"
+        preset["hotkey"] = ""
+        self._upsert_display_filter_preset(preset)
+        self._log_event(f"Gamma 方案已新建：{name}")
+
+    def save_current_display_filter_preset(self) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过保存方案。")
+            return
+        name = self.display_filter_preset_name.text().strip()
+        if not name:
+            name, ok = QInputDialog.getText(self, "保存 Gamma 方案", "方案名称：")
+            if not ok:
+                return
+            name = name.strip()
+        if not name:
+            return
+        preset = self._display_filter_preset_from_controls()
+        hotkey = str(preset.get("hotkey", "")).strip()
+        if not self._resolve_display_filter_preset_hotkey_conflicts(name, hotkey):
+            return
+        hotkey = ""
+        if hotkey:
+            try:
+                normalize_hotkey(hotkey)
+            except ValueError as exc:
+                self._show_operation_feedback(
+                    "Gamma 方案未保存",
+                    "热键无效",
+                    str(exc),
+                    accent_color="#FF5A5F",
+                )
+                return
+        preset["name"] = name
+        preset["description"] = "自定义 Gamma 曲线"
+        self._upsert_display_filter_preset(preset)
+        self._log_event(f"Gamma 方案已保存：{name}")
+
+    def _display_filter_preset_name_exists(self, name: str) -> bool:
+        normalized = name.strip()
+        return any(
+            str(preset.get("name", "")).strip() == normalized
+            for preset in self._display_filter_presets()
+        )
+
+    def _unique_display_filter_preset_name(self, base: str) -> str:
+        existing = {
+            str(preset.get("name", "")).strip()
+            for preset in self._display_filter_presets()
+        }
+        if base not in existing:
+            return base
+        index = 2
+        while f"{base} {index}" in existing:
+            index += 1
+        return f"{base} {index}"
+
+    def delete_selected_display_filter_preset(self) -> None:
+        preset = self._selected_display_filter_preset()
+        if preset is None:
+            return
+        name = str(preset.get("name", ""))
+        presets = [item for item in self._display_filter_presets() if str(item.get("name", "")) != name]
+        self.config["display_filter_presets"] = presets
+        self._reload_display_filter_presets(select_name="")
+        save_config(self.config)
+        self._register_hotkeys()
+        self._log_event(f"Gamma 方案已删除：{name}")
+
+    def _upsert_display_filter_preset(self, preset: dict[str, object]) -> None:
+        name = str(preset.get("name", "")).strip()
+        presets = []
+        replaced = False
+        for item in self._display_filter_presets():
+            if str(item.get("name", "")) == name:
+                presets.append(preset)
+                replaced = True
+            else:
+                presets.append(item)
+        if not replaced:
+            presets.append(preset)
+        self.config["display_filter_presets"] = presets
+        self.config["display_filter_active_preset"] = name
+        save_config(self.config)
+        self._reload_display_filter_presets(select_name=name)
+        if self._display_filter_dialog is not None:
+            self._display_filter_dialog.reload_presets(select_name=name)
+        self._register_hotkeys()
+
+    def _reload_display_filter_presets(self, *, select_name: str = "") -> None:
+        if not hasattr(self, "display_filter_preset_combo"):
+            return
+        self.display_filter_preset_combo.blockSignals(True)
+        self.display_filter_preset_combo.clear()
+        for index, preset in enumerate(self._display_filter_presets()):
+            self.display_filter_preset_combo.addItem(str(preset.get("name", f"Preset {index + 1}")), index)
+        selected = 0
+        if select_name:
+            for index, preset in enumerate(self._display_filter_presets()):
+                if str(preset.get("name", "")) == select_name:
+                    selected = index
+                    break
+        if self.display_filter_preset_combo.count() > 0:
+            self.display_filter_preset_combo.setCurrentIndex(selected)
+        self.display_filter_preset_combo.blockSignals(False)
+        self._on_display_filter_preset_changed()
+
+    def open_display_filter_control_window(self) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过打开调节浮窗。")
+            return
+        if self._display_filter_dialog is None:
+            self._display_filter_dialog = DisplayFilterControlDialog(self)
+        self._display_filter_dialog.reload_presets(
+            select_name=str(self.config.get("display_filter_active_preset", ""))
+        )
+        self._display_filter_dialog.show()
+        self._display_filter_dialog.raise_()
+        self._display_filter_dialog.activateWindow()
+
+    def cycle_display_filter_preset(self, *, notify: bool = True) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过预设切换。")
+            return
+        presets = self._display_filter_presets()
+        if not presets:
+            self._show_operation_feedback("Gamma 调校失败", "没有预设", "请先在配置中添加显示预设。", accent_color="#FF5A5F")
+            return
+        if hasattr(self, "display_filter_preset_combo"):
+            next_index = (self.display_filter_preset_combo.currentIndex() + 1) % len(presets)
+            self.display_filter_preset_combo.setCurrentIndex(next_index)
+            preset = presets[next_index]
+        else:
+            self._display_filter_index = (self._display_filter_index + 1) % len(presets)
+            preset = presets[self._display_filter_index]
+        self._apply_display_filter_preset(preset, notify=notify)
+
+    def apply_display_filter_preset_by_name(self, name: str) -> None:
+        if not self._feature_enabled("display_filter"):
+            return
+        for index, preset in enumerate(self._display_filter_presets()):
+            if str(preset.get("name", "")) == name:
+                if hasattr(self, "display_filter_preset_combo"):
+                    self.display_filter_preset_combo.setCurrentIndex(index)
+                self._apply_display_filter_preset(preset, notify=True)
+                return
+        self._log(f"Gamma 预设热键指向了不存在的方案：{name}")
+
+    def _apply_display_filter_preset(self, preset: dict[str, object], *, notify: bool = False) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过写入系统 Gamma。")
+            return
+        name = str(preset.get("name", "Unnamed"))
+        try:
+            if self._display_filter_baseline is None:
+                self._display_filter_baseline = get_gamma_ramp()
+            apply_preset(preset)
+        except DisplayFilterError as exc:
+            if hasattr(self, "display_filter_status_label"):
+                self.display_filter_status_label.setText(f"Gamma 调校失败：{exc}")
+            if notify:
+                self._log_event(f"Gamma 调校失败：{exc}")
+                self._show_operation_feedback("Gamma 调校失败", name, str(exc), accent_color="#FF5A5F")
+            return
+        self.config["display_filter_active_preset"] = name
+        if hasattr(self, "display_filter_status_label"):
+            self.display_filter_status_label.setText(f"已应用：{name}")
+        self._start_display_filter_eye_care_timer()
+        if notify:
+            self._log_event(f"已应用 Gamma 调校：{name}")
+            self._show_operation_feedback(
+                "已应用 Gamma 调校",
+                name,
+                str(preset.get("description", "")),
+                accent_color="#5DA8FF",
+            )
+
+    def restore_display_filter(self, *, show_feedback: bool = True) -> None:
+        if not self._feature_enabled("display_filter"):
+            self._log("Gamma 显示调校模块未启用，已跳过恢复 Gamma。")
+            return
+        if self._display_filter_baseline is None:
+            if show_feedback:
+                self._show_operation_feedback(
+                    "Gamma 未修改",
+                    "无需恢复",
+                    "本次会话还没有应用显示调校。",
+                    accent_color="#F2C14E",
+                )
+            return
+        try:
+            set_gamma_ramp(self._display_filter_baseline)
+        except DisplayFilterError as exc:
+            if show_feedback:
+                self._show_operation_feedback("Gamma 恢复失败", "系统原始 Gamma", str(exc), accent_color="#FF5A5F")
+                self._log_event(f"Gamma 恢复失败：{exc}")
+            return
+        self._display_filter_baseline = None
+        self._stop_display_filter_eye_care_timer()
+        self.config["display_filter_active_preset"] = ""
+        if hasattr(self, "display_filter_status_label"):
+            self.display_filter_status_label.setText("已恢复系统原始 Gamma")
+        if show_feedback:
+            self._log_event("已恢复系统原始 Gamma。")
+            self._show_operation_feedback(
+                "已恢复 Gamma",
+                "系统原始设置",
+                "显示调校已关闭。",
+                accent_color="#36D27F",
+            )
+
+    def _display_filter_eye_care_enabled(self) -> bool:
+        return self._feature_enabled("display_filter") and bool(
+            self.config.get("display_filter_eye_care_enabled", True)
+        )
+
+    def _start_display_filter_eye_care_timer(self) -> None:
+        if not self._display_filter_eye_care_enabled() or self._display_filter_baseline is None:
+            self._stop_display_filter_eye_care_timer()
+            return
+        try:
+            seconds = float(self.config.get("display_filter_eye_care_check_seconds", 2))
+        except (TypeError, ValueError):
+            seconds = 2.0
+        self._display_filter_eye_timer.start(max(1, int(seconds * 1000)))
+
+    def _stop_display_filter_eye_care_timer(self) -> None:
+        if self._display_filter_eye_timer.isActive():
+            self._display_filter_eye_timer.stop()
+
+    def _on_display_filter_eye_care_check(self) -> None:
+        if (
+            self._closing
+            or self._display_filter_baseline is None
+            or not self._display_filter_eye_care_enabled()
+        ):
+            self._stop_display_filter_eye_care_timer()
+            return
+        is_foreground, _title = is_tarkov_foreground()
+        if is_foreground:
+            return
+        self.restore_display_filter(show_feedback=False)
+        message = "护眼模式：检测到 Tarkov 不活跃，已恢复系统 Gamma。可按已绑定的 Gamma 方案热键重新应用。"
+        self._log_event(message)
+        self._show_operation_feedback(
+            "护眼模式已关闭 Gamma",
+            "Tarkov 不活跃",
+            "按已绑定的 Gamma 方案热键，或在 Gamma 面板重新应用。",
+            accent_color="#F2C14E",
+        )
+
     def _build_menu(self) -> None:
         settings_action = QAction("打开设置", self)
         settings_action.triggered.connect(self.open_settings)
@@ -412,10 +1221,11 @@ class MainWindow(QMainWindow):
         settings_menu = self.menuBar().addMenu("设置")
         settings_menu.addAction(settings_action)
 
-        data_menu = self.menuBar().addMenu("数据")
-        data_menu.addAction(refresh_action)
-        data_menu.addAction(reload_aliases_action)
-        data_menu.addAction(open_aliases_action)
+        if self._feature_enabled("price_lookup"):
+            data_menu = self.menuBar().addMenu("数据")
+            data_menu.addAction(refresh_action)
+            data_menu.addAction(reload_aliases_action)
+            data_menu.addAction(open_aliases_action)
 
         file_menu = self.menuBar().addMenu("文件")
         file_menu.addAction(quit_action)
@@ -551,13 +1361,36 @@ class MainWindow(QMainWindow):
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setMinimumHeight(160)
+        self._apply_log_limit()
         return self.log
+
+    def _apply_performance_settings(self) -> None:
+        self._apply_log_limit()
+        if bool(self.config.get("performance_mode_enabled", True)):
+            try:
+                seconds = int(self.config.get("performance_cleanup_interval_seconds", 60))
+            except (TypeError, ValueError):
+                seconds = 60
+            self._resource_cleanup_timer.start(max(15, seconds) * 1000)
+        elif self._resource_cleanup_timer.isActive():
+            self._resource_cleanup_timer.stop()
+
+    def _apply_log_limit(self) -> None:
+        if not hasattr(self, "log"):
+            return
+        try:
+            limit = int(self.config.get("performance_log_max_lines", 600))
+        except (TypeError, ValueError):
+            limit = 600
+        self.log.document().setMaximumBlockCount(max(100, limit))
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        previous_features = self._configured_enabled_features()
         self.config.update(dialog.values())
+        features_changed = previous_features != self._configured_enabled_features()
         if hasattr(self, "price_mode_combo"):
             mode_index = self.price_mode_combo.findData(
                 str(self.config.get("price_game_mode_default", "pve"))
@@ -565,28 +1398,39 @@ class MainWindow(QMainWindow):
             self.price_mode_combo.setCurrentIndex(max(0, mode_index))
         self._save_config()
         self._register_hotkeys()
+        self._start_display_filter_eye_care_timer()
+        self._apply_performance_settings()
         self._log("设置已更新。")
+        if features_changed:
+            self._log_event("功能开关已保存；主界面面板和模块热键会在重启后生效。")
         self._update_cache_status_label()
         self._refresh_item_completer()
-        if bool(self.config.get("refresh_prices_on_startup", True)):
+        if self._should_auto_refresh_price_cache():
             self.refresh_price_cache(background=True)
 
     def reload_chinese_aliases(self) -> None:
+        if self.price_client is None:
+            self._log("查价模块未启用，已跳过中文别名重载。")
+            return
         count = self.price_client.reload_aliases()
         self._update_cache_status_label()
         self._refresh_item_completer()
         self._log(f"中文别名已重新加载：{count} 条。")
 
     def open_chinese_aliases(self) -> None:
+        if not self._feature_enabled("price_lookup"):
+            self._log("查价模块未启用，已跳过打开中文别名文件。")
+            return
         CHINESE_ALIASES_PATH.parent.mkdir(exist_ok=True)
         if not CHINESE_ALIASES_PATH.exists():
             CHINESE_ALIASES_PATH.write_text("{}\n", encoding="utf-8")
         os.startfile(CHINESE_ALIASES_PATH)  # type: ignore[attr-defined]
 
     def _save_config(self) -> None:
-        self.config["selected_traders"] = [
-            trader for trader, check in self.watch_checks.items() if check.isChecked()
-        ]
+        if self.watch_checks:
+            self.config["selected_traders"] = [
+                trader for trader, check in self.watch_checks.items() if check.isChecked()
+            ]
         if hasattr(self, "price_mode_combo"):
             self.config["price_game_mode_default"] = self._selected_price_game_mode()
         save_config(self.config)
@@ -597,6 +1441,8 @@ class MainWindow(QMainWindow):
         return str(self.price_mode_combo.currentData() or "pve")
 
     def _on_price_mode_changed(self) -> None:
+        if self.price_client is None:
+            return
         mode = self._selected_price_game_mode()
         self.current_price_game_mode = self.price_client.set_game_mode(mode)
         self.config["price_game_mode_default"] = self.current_price_game_mode
@@ -605,62 +1451,176 @@ class MainWindow(QMainWindow):
         self._refresh_item_completer()
         self._log(f"Price mode set manually: {_game_mode_label(self.current_price_game_mode)}.")
 
+    def _should_auto_refresh_price_cache(self) -> bool:
+        if not self._feature_enabled("price_lookup") or self.price_client is None:
+            return False
+        if not bool(self.config.get("refresh_prices_on_startup", True)):
+            return False
+        if bool(self.config.get("performance_mode_enabled", True)) and bool(
+            self.config.get("performance_skip_auto_price_refresh", True)
+        ):
+            self._log("性能模式：已跳过自动刷新价格缓存，可在数据面板手动刷新。")
+            return False
+        return True
+
     def _register_hotkeys(self) -> None:
+        trader_enabled = self._feature_enabled("trader_reminders")
+        price_enabled = self._feature_enabled("price_lookup")
+        hideout_enabled = self._feature_enabled("hideout")
+        filter_enabled = self._feature_enabled("display_filter")
+        preset_hotkeys = self._display_filter_preset_hotkey_bindings() if filter_enabled else []
         try:
             self.hotkeys.register(
-                str(self.config.get("capture_hotkey", "F8")),
-                str(self.config.get("schedule_hotkey", "F10")),
-                lambda: self.capture_requested.emit(),
-                lambda: self.schedule_requested.emit(),
-                str(self.config.get("item_lookup_hotkey", "Q")),
-                lambda: self.item_lookup_requested.emit(),
-                str(self.config.get("hideout_scan_hotkey", "F6")),
-                lambda: self.hideout_scan_requested.emit(),
+                capture_hotkey=str(self.config.get("capture_hotkey", "F8"))
+                if trader_enabled
+                else "",
+                schedule_hotkey="",
+                on_capture=lambda: self.capture_requested.emit(),
+                on_schedule=None,
+                item_lookup_hotkey=str(self.config.get("item_lookup_hotkey", "Q"))
+                if price_enabled
+                else "",
+                on_item_lookup=lambda: self.item_lookup_requested.emit(),
+                hideout_scan_hotkey=str(self.config.get("hideout_scan_hotkey", "F6"))
+                if hideout_enabled
+                else "",
+                on_hideout_scan=lambda: self.hideout_scan_requested.emit(),
+                reminder_hold_hotkey=str(self.config.get("reminder_hold_hotkey", "F7"))
+                if trader_enabled
+                else "",
+                on_reminder_hold=lambda: self.reminder_hold_requested.emit(),
+                display_filter_restore_hotkey=str(
+                    self.config.get("display_filter_restore_hotkey", "Ctrl+F9")
+                )
+                if filter_enabled
+                else "",
+                on_display_filter_restore=lambda: self.display_filter_restore_requested.emit(),
+                extra_hotkeys=preset_hotkeys,
             )
         except Exception as exc:
             self._log(f"热键注册失败：{exc}")
             return
         self._log(
             "热键已注册："
-            f"倒计时={self.config.get('capture_hotkey', 'F8')}，"
-            f"物品查价={self.config.get('item_lookup_hotkey', 'Q')}，"
-            f"藏身处={self.config.get('hideout_scan_hotkey', 'F6')}，"
-            f"设置提醒={self.config.get('schedule_hotkey', 'F10')}"
+            f"倒计时={self.config.get('capture_hotkey', 'F8') if trader_enabled else '关闭'}，"
+            f"物品查价={self.config.get('item_lookup_hotkey', 'Q') if price_enabled else '关闭'}，"
+            f"藏身处={self.config.get('hideout_scan_hotkey', 'F6') if hideout_enabled else '关闭'}，"
+            f"隐藏/显示补货提示={self.config.get('reminder_hold_hotkey', 'F7') if trader_enabled else '关闭'}，"
+            f"Gamma预设={len(preset_hotkeys)} 个"
         )
 
-    def refresh_price_cache(self, background: bool = False) -> None:
-        if background:
-            self.cache_status_label.setText("价格: 正在刷新...")
-            self._start_worker("price-cache-refresh", self._refresh_price_cache_worker)
-            return
-        self._refresh_price_cache_worker()
+    def _display_filter_preset_hotkey_bindings(self) -> list[tuple[str, Callable[[], None]]]:
+        bindings: list[tuple[str, Callable[[], None]]] = []
+        seen_hotkeys: set[str] = set()
+        for value in [
+            self.config.get("capture_hotkey", "") if self._feature_enabled("trader_reminders") else "",
+            self.config.get("item_lookup_hotkey", "") if self._feature_enabled("price_lookup") else "",
+            self.config.get("hideout_scan_hotkey", "") if self._feature_enabled("hideout") else "",
+            self.config.get("reminder_hold_hotkey", "") if self._feature_enabled("trader_reminders") else "",
+            self.config.get("display_filter_restore_hotkey", ""),
+        ]:
+            text = str(value).strip()
+            if not text:
+                continue
+            try:
+                seen_hotkeys.add(normalize_hotkey(text))
+            except ValueError:
+                continue
+        for preset in self._display_filter_presets():
+            name = str(preset.get("name", "")).strip()
+            hotkey = str(preset.get("hotkey", "")).strip()
+            if not name or not hotkey:
+                continue
+            try:
+                key = normalize_hotkey(hotkey)
+            except ValueError as exc:
+                self._log(f"Gamma 预设热键无效，已跳过：{name} / {hotkey} / {exc}")
+                continue
+            if key in seen_hotkeys:
+                self._log(f"Gamma 预设热键重复，已跳过：{name} / {hotkey}")
+                continue
+            seen_hotkeys.add(key)
+            bindings.append(
+                (hotkey, lambda preset_name=name: self.display_filter_preset_requested.emit(preset_name))
+            )
+        return bindings
 
-    def _refresh_price_cache_worker(self) -> None:
-        if self._closing:
+    def refresh_price_cache(self, background: bool = False) -> None:
+        if not self._feature_enabled("price_lookup") or self.price_client is None:
+            self._log("价格模块未启用，已跳过价格缓存刷新。")
+            return
+        if background:
+            self.cache_status_label.setText("价格: 正在通过 JSON API 刷新...")
+            self._start_worker("price-cache-refresh", self._refresh_price_cache_worker, "json")
+            return
+        self._refresh_price_cache_worker("json")
+
+    def _refresh_price_cache_worker(self, source: str = "json") -> None:
+        if self._closing or self.price_client is None:
             return
         try:
-            counts = self.price_client.refresh_all_modes()
+            counts = self.price_client.refresh_all_modes(source=source)
         except PriceLookupError as exc:
-            status = f"价格缓存刷新失败：{exc}"
+            result = PriceCacheRefreshResult(source=source, error=str(exc))
         except Exception as exc:
-            status = f"价格缓存刷新异常：{exc}"
+            result = PriceCacheRefreshResult(source=source, error=f"价格缓存刷新异常：{exc}")
         else:
-            status = (
-                "价格缓存已就绪："
-                f"PvP {counts.get('regular', 0)} 个物品，"
-                f"PvE {counts.get('pve', 0)} 个物品"
-            )
+            result = PriceCacheRefreshResult(source=source, counts=counts)
         if not self._closing:
-            self.cache_refresh_ready.emit(status)
+            self.cache_refresh_ready.emit(result)
 
-    def _on_cache_refresh_ready(self, status: str) -> None:
-        if self._closing:
+    def _on_cache_refresh_ready(self, result: PriceCacheRefreshResult) -> None:
+        if self._closing or not self._feature_enabled("price_lookup"):
             return
+        source_label = "JSON API" if result.source == "json" else "GraphQL"
+        if result.error:
+            status = f"{source_label} 价格缓存刷新失败：{result.error}"
+            self._log(status)
+            self._update_cache_status_label()
+            if result.source == "json":
+                answer = QMessageBox.question(
+                    self,
+                    "JSON 价格 API 不可用",
+                    f"{result.error}\n\n现有本地缓存已经保留。是否尝试备用 GraphQL API？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self.cache_status_label.setText("价格: 正在尝试 GraphQL...")
+                    QTimer.singleShot(0, self._start_graphql_price_cache_fallback)
+                else:
+                    self._log("用户取消了 GraphQL 备用刷新，继续使用现有本地缓存。")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "GraphQL 价格 API 也不可用",
+                    f"{result.error}\n\n程序将继续使用现有本地缓存。",
+                )
+            return
+
+        counts = result.counts or {}
+        status = (
+            f"价格缓存已通过 {source_label} 就绪："
+            f"PvP {counts.get('regular', 0)} 个物品，"
+            f"PvE {counts.get('pve', 0)} 个物品"
+        )
         self._log(status)
         self._update_cache_status_label()
         self._refresh_item_completer()
 
+    def _start_graphql_price_cache_fallback(self) -> None:
+        if self._closing or self.price_client is None:
+            return
+        self._start_worker(
+            "price-cache-graphql-fallback",
+            self._refresh_price_cache_worker,
+            "graphql",
+        )
+
     def refresh_hideout_cache(self, background: bool = False) -> None:
+        if not self._feature_enabled("hideout") or self.hideout_tracker is None:
+            self._log("藏身处模块未启用，已跳过需求数据刷新。")
+            return
         if background:
             self.hideout_status_label.setText("藏身处: 正在刷新需求数据...")
             self._start_worker("hideout-cache-refresh", self._refresh_hideout_cache_worker)
@@ -668,7 +1628,7 @@ class MainWindow(QMainWindow):
         self._refresh_hideout_cache_worker()
 
     def _refresh_hideout_cache_worker(self) -> None:
-        if self._closing:
+        if self._closing or self.hideout_tracker is None:
             return
         try:
             count = self.hideout_tracker.refresh_requirements()
@@ -682,32 +1642,52 @@ class MainWindow(QMainWindow):
             self.hideout_cache_ready.emit(status)
 
     def _on_hideout_cache_ready(self, status: str) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("hideout"):
             return
         self.hideout_status_label.setText(status)
         self._log(status)
 
     def capture_hideout_progress(self) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("hideout") or self.hideout_tracker is None:
+            self._log("藏身处模块未启用，已跳过识别。")
             return
         self._save_config()
         if not self._ensure_tarkov_foreground("hideout scan"):
+            self._show_operation_feedback(
+                "藏身处识别未开始",
+                "未截图",
+                "当前前台窗口不是 Tarkov。",
+                accent_color="#F2C14E",
+            )
             return
         capture_mode = str(self.config.get("capture_mode", "Auto"))
         try:
             _, size, region_name = capture_hideout_screen(capture_mode)
         except Exception as exc:
             self._log(f"Hideout screenshot failed: {exc}")
-            QMessageBox.warning(self, "Hideout screenshot failed", str(exc))
+            self._show_operation_feedback(
+                "藏身处截图失败",
+                "未记录",
+                str(exc),
+                accent_color="#FF5A5F",
+            )
             return
 
-        self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
+        if hasattr(self, "detected_size_label"):
+            self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
         self.hideout_status_label.setText("藏身处: 已截图，正在 OCR...")
         self._log(f"Captured hideout screen: {size[0]}x{size[1]}, source: {region_name}.")
+        self._show_operation_feedback(
+            "藏身处识别中",
+            "正在 OCR...",
+            f"截图 {size[0]}x{size[1]} ({region_name})",
+            accent_color="#5DA8FF",
+            seconds=3,
+        )
         self._start_worker("hideout-scan", self._hideout_scan_worker, hideout_debug_path())
 
     def _hideout_scan_worker(self, screenshot_path: Path) -> None:
-        if self._closing:
+        if self._closing or self.hideout_tracker is None:
             return
         try:
             self.hideout_tracker.ensure_requirements()
@@ -724,18 +1704,30 @@ class MainWindow(QMainWindow):
             self.hideout_scan_ready.emit(record, "")
 
     def _on_hideout_scan_ready(self, record: object, error: str) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("hideout"):
             return
         if error:
             message = f"藏身处识别失败：{error}"
             self.hideout_status_label.setText(message)
             self._log_event(message)
             self._log(f"Hideout OCR text saved to: {hideout_ocr_text_path()}")
+            self._show_operation_feedback(
+                "藏身处识别失败",
+                "未记录",
+                error,
+                accent_color="#FF5A5F",
+            )
             return
         if not isinstance(record, dict):
             message = "藏身处识别失败：没有可用记录。"
             self.hideout_status_label.setText(message)
             self._log_event(message)
+            self._show_operation_feedback(
+                "藏身处识别失败",
+                "未记录",
+                "没有可用记录。",
+                accent_color="#FF5A5F",
+            )
             return
         self._update_hideout_table()
         station_name = str(record.get("station_name") or "")
@@ -751,9 +1743,15 @@ class MainWindow(QMainWindow):
         )
         self.hideout_status_label.setText(message)
         self._log_event(message)
+        self._show_operation_feedback(
+            "藏身处识别已记录",
+            f"{station_name} L{current_level}->L{target_level}",
+            f"识别 {recognized}/{expected} 项\n本次升级需求：{item_summary}",
+            accent_color="#36D27F",
+        )
 
     def _update_hideout_table(self) -> None:
-        if not hasattr(self, "hideout_table"):
+        if not hasattr(self, "hideout_table") or self.hideout_tracker is None:
             return
         records = self.hideout_tracker.records()
         self.hideout_table.setRowCount(len(records))
@@ -787,15 +1785,24 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "No hideout OCR text", "还没有藏身处 OCR 文本。")
 
     def _update_cache_status_label(self) -> None:
+        if not hasattr(self, "cache_status_label") or self.price_client is None:
+            return
         self.cache_status_label.setText(
             f"价格: {self.price_client.cache_status()} / 中文别名: {self.price_client.alias_status()}"
         )
 
     def capture_and_ocr(self) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("trader_reminders") or self.reminders is None:
+            self._log("商人补货模块未启用，已跳过倒计时识别。")
             return
         self._save_config()
         if not self._ensure_tarkov_foreground("倒计时识别"):
+            self._show_operation_feedback(
+                "商人倒计时识别未开始",
+                "未截图",
+                "当前前台窗口不是 Tarkov。",
+                accent_color="#F2C14E",
+            )
             return
         manual_size = self._manual_size()
 
@@ -807,22 +1814,45 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             self._log(f"截图失败：{exc}")
-            QMessageBox.warning(self, "截图失败", str(exc))
+            self._show_operation_feedback(
+                "商人倒计时截图失败",
+                "未设置提醒",
+                str(exc),
+                accent_color="#FF5A5F",
+            )
             return
 
-        self.detected_size_label.setText(f"截图: {size[0]}x{size[1]} ({region_name})")
+        if hasattr(self, "detected_size_label"):
+            self.detected_size_label.setText(f"截图: {size[0]}x{size[1]} ({region_name})")
         self._log(f"已截图：{size[0]}x{size[1]}，来源：{region_name}。")
+        self._show_operation_feedback(
+            "商人倒计时识别中",
+            "正在 OCR...",
+            f"截图 {size[0]}x{size[1]} ({region_name})",
+            accent_color="#5DA8FF",
+            seconds=3,
+        )
 
         _, crop_path = debug_paths()
         try:
             result = run_ocr(crop_path)
         except OcrUnavailableError as exc:
             self._log(str(exc))
-            QMessageBox.warning(self, "OCR 不可用", str(exc))
+            self._show_operation_feedback(
+                "商人倒计时 OCR 不可用",
+                "未设置提醒",
+                str(exc),
+                accent_color="#FF5A5F",
+            )
             return
         except Exception as exc:
             self._log(f"OCR 失败：{exc}")
-            QMessageBox.warning(self, "OCR 失败", str(exc))
+            self._show_operation_feedback(
+                "商人倒计时 OCR 失败",
+                "未设置提醒",
+                str(exc),
+                accent_color="#FF5A5F",
+            )
             return
 
         self._log(f"OCR 预处理：{result.variant_name}")
@@ -840,9 +1870,12 @@ class MainWindow(QMainWindow):
                 f"注意：只识别到 {len(result.timers)} 个倒计时，商人数量为 {len(TRADERS)}。"
                 "请使用手动修正输入框。"
             )
+        scheduled, invalid = self._schedule_selected_reminders()
+        self._show_trader_capture_feedback(result.timers, scheduled, invalid)
 
     def capture_item_price(self) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("price_lookup") or self.price_client is None:
+            self._log("查价模块未启用，已跳过物品查价。")
             return
         self._save_config()
         if not self._ensure_tarkov_foreground("item lookup"):
@@ -895,7 +1928,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Item screenshot failed", str(exc))
             return
 
-        self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
+        if hasattr(self, "detected_size_label"):
+            self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
         self._log(f"Captured item region: {size[0]}x{size[1]}, source: {region_name}.")
         if save_full_screenshot:
             self._log("Capture region calibrated; subsequent item lookups use ROI-only crops.")
@@ -918,7 +1952,8 @@ class MainWindow(QMainWindow):
                 return
             if not detected:
                 self.item_price_label.setText("Price: inventory tab not detected")
-                self.price_overlay.clear_prices()
+                if self.price_overlay is not None:
+                    self.price_overlay.clear_prices()
                 self._log_event("已拒绝查价：没有检测到装备/背包页面。")
                 self._log(f"Inventory tab not detected. Keywords: {', '.join(found) or 'none'}")
                 return
@@ -978,6 +2013,9 @@ class MainWindow(QMainWindow):
         self._lookup_item_candidates(result.candidates)
 
     def capture_item_price_after_delay(self) -> None:
+        if not self._feature_enabled("price_lookup") or self.price_client is None:
+            self._log("查价模块未启用，已跳过延迟查价。")
+            return
         seconds = int(self.config.get("button_capture_delay_seconds", 0))
         if seconds <= 0:
             self._log("即将截图。hover 模式建议在游戏中等名称框出现后按热键触发。")
@@ -988,7 +2026,8 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(seconds * 1000, self.capture_item_price)
 
     def lookup_manual_item_name(self) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("price_lookup") or self.price_client is None:
+            self._log("查价模块未启用，已跳过手动查价。")
             return
         name = self.item_name_field.text().strip()
         lookup_name = self.item_completion_lookup.get(name, name)
@@ -1010,6 +2049,10 @@ class MainWindow(QMainWindow):
 
     def _refresh_item_completer(self) -> None:
         if not hasattr(self, "item_completion_model"):
+            return
+        if self.price_client is None:
+            self.item_completion_lookup = {}
+            self.item_completion_model.clear()
             return
         entries = self.price_client.completion_entries(self._selected_price_game_mode())
         self.item_completion_lookup = {}
@@ -1054,6 +2097,9 @@ class MainWindow(QMainWindow):
         self._on_item_completion_activated(value)
 
     def _lookup_item_candidates(self, names: list[str]) -> None:
+        if not self._feature_enabled("price_lookup") or self.price_client is None:
+            self._log("查价模块未启用，已跳过候选查价。")
+            return
         candidates: list[str] = []
         seen: set[str] = set()
         for name in names:
@@ -1075,7 +2121,7 @@ class MainWindow(QMainWindow):
         self._start_worker("price-lookup", self._lookup_price_candidates_worker, candidates, mode)
 
     def _lookup_price_worker(self, name: str, game_mode: str) -> None:
-        if self._closing:
+        if self._closing or self.price_client is None:
             return
         try:
             price = self.price_client.lookup(name, game_mode)
@@ -1090,7 +2136,7 @@ class MainWindow(QMainWindow):
                 self.price_result_ready.emit(price, "")
 
     def _lookup_price_candidates_worker(self, names: list[str], game_mode: str) -> None:
-        if self._closing:
+        if self._closing or self.price_client is None:
             return
         try:
             price = self.price_client.lookup_candidates(names, game_mode)
@@ -1105,19 +2151,52 @@ class MainWindow(QMainWindow):
         if not self._closing:
             self.price_result_ready.emit(price, "")
 
-    def _price_history_worker(self, price: object) -> None:
-        if self._closing:
+    def _price_history_worker(self, price: object, source: str = "json") -> None:
+        if self._closing or self.price_client is None:
             return
         item_id = str(getattr(price, "item_id", "") or "")
         game_mode = str(getattr(price, "game_mode", self.current_price_game_mode) or self.current_price_game_mode)
         try:
-            summary = self.price_client.historical_price_summary(item_id, game_mode, days=2, sample_limit=5)
+            summary = self.price_client.historical_price_summary(
+                item_id,
+                game_mode,
+                days=2,
+                sample_limit=5,
+                source=source,
+            )
         except Exception as exc:
             if not self._closing:
-                self.price_history_ready.emit(price, None, str(exc))
+                if source == "json":
+                    self.price_history_json_failed.emit(price, str(exc))
+                else:
+                    self.price_history_ready.emit(price, None, str(exc))
             return
         if not self._closing:
             self.price_history_ready.emit(price, summary, "")
+
+    def _on_price_history_json_failed(self, price: object, error: str) -> None:
+        if self._closing or not self._feature_enabled("price_lookup"):
+            return
+        if _price_overlay_key(price) != self._active_price_key:
+            return
+        self._log(f"JSON historical price lookup failed: {error}")
+        answer = QMessageBox.question(
+            self,
+            "JSON 历史价格 API 不可用",
+            f"{error}\n\n是否尝试备用 GraphQL API 获取本次历史价格？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            QTimer.singleShot(
+                0,
+                lambda current_price=price: self._start_worker(
+                    "price-history-graphql-fallback",
+                    self._price_history_worker,
+                    current_price,
+                    "graphql",
+                ),
+            )
 
     def _detect_inventory_from_capture(
         self,
@@ -1158,6 +2237,14 @@ class MainWindow(QMainWindow):
     ) -> None:
         if self._closing:
             return
+        if bool(self.config.get("performance_mode_enabled", True)):
+            max_workers = self._max_concurrent_workers()
+            active_workers = self._active_worker_count()
+            if active_workers >= max_workers:
+                self._log_event(
+                    f"性能模式：已有 {active_workers} 个后台任务运行，已暂缓 {name}。"
+                )
+                return
 
         def run() -> None:
             try:
@@ -1166,11 +2253,37 @@ class MainWindow(QMainWindow):
                 current = threading.current_thread()
                 with self._workers_lock:
                     self._workers.discard(current)
+                if bool(self.config.get("performance_gc_after_worker", True)):
+                    self._cleanup_memory()
 
         thread = threading.Thread(target=run, name=name, daemon=True)
         with self._workers_lock:
             self._workers.add(thread)
         thread.start()
+
+    def _active_worker_count(self) -> int:
+        with self._workers_lock:
+            workers = [worker for worker in self._workers if worker.is_alive()]
+            self._workers = set(workers)
+            return len(workers)
+
+    def _max_concurrent_workers(self) -> int:
+        try:
+            value = int(self.config.get("performance_max_concurrent_workers", 2))
+        except (TypeError, ValueError):
+            value = 2
+        return max(1, value)
+
+    def _on_resource_cleanup_timer(self) -> None:
+        if self._closing or self._active_worker_count() > 0:
+            return
+        self._cleanup_memory()
+
+    def _cleanup_memory(self) -> None:
+        if not bool(self.config.get("performance_mode_enabled", True)):
+            return
+        self._inventory_check_cache = None
+        gc.collect()
 
     def _join_workers(self, timeout: float = 1.0) -> None:
         deadline = time.monotonic() + max(0.0, timeout)
@@ -1189,12 +2302,13 @@ class MainWindow(QMainWindow):
             workers[0].join(timeout=min(0.2, remaining))
 
     def _on_price_result_ready(self, price: object, error: str) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("price_lookup"):
             return
         if error:
             self.item_price_label.setText(f"价格: {error}")
             self._log_event(error)
-            self.price_overlay.clear_prices()
+            if self.price_overlay is not None:
+                self.price_overlay.clear_prices()
             return
 
         price_key = _price_overlay_key(price)
@@ -1205,7 +2319,11 @@ class MainWindow(QMainWindow):
         basis = str(self.config.get("price_value_basis", "slot"))
         firearm_color = str(self.config.get("firearm_value_color", "#00D1D1"))
         firearm_accent = str(self.config.get("firearm_value_accent", firearm_color))
-        hideout_lines = self.hideout_tracker.item_demand_lines(str(getattr(price, "item_id", "")))
+        hideout_lines = (
+            self.hideout_tracker.item_demand_lines(str(getattr(price, "item_id", "")))
+            if self._feature_enabled("hideout") and self.hideout_tracker is not None
+            else []
+        )
         needs_history = _is_high_volatility(price)
         view = _build_price_view(
             price,
@@ -1221,19 +2339,19 @@ class MainWindow(QMainWindow):
         self.item_price_label.setText(view.label_html)
         self.item_price_label.setTextFormat(Qt.TextFormat.RichText)
         self._log_event(view.log_text)
-        if bool(self.config.get("price_overlay_enabled", True)):
+        if self.price_overlay is not None and bool(self.config.get("price_overlay_enabled", True)):
             try:
                 seconds = int(self.config.get("price_overlay_seconds", 10))
             except (TypeError, ValueError):
                 seconds = 10
             self.price_overlay.show_price(view, seconds)
-        else:
+        elif self.price_overlay is not None:
             self.price_overlay.clear_prices()
         if needs_history:
             self._start_worker("price-history", self._price_history_worker, price)
 
     def _on_price_history_ready(self, price: object, summary: object, error: str) -> None:
-        if self._closing:
+        if self._closing or not self._feature_enabled("price_lookup"):
             return
         price_key = _price_overlay_key(price)
         if price_key != self._active_price_key:
@@ -1248,7 +2366,11 @@ class MainWindow(QMainWindow):
         basis = str(self.config.get("price_value_basis", "slot"))
         firearm_color = str(self.config.get("firearm_value_color", "#00D1D1"))
         firearm_accent = str(self.config.get("firearm_value_accent", firearm_color))
-        hideout_lines = self.hideout_tracker.item_demand_lines(str(getattr(price, "item_id", "")))
+        hideout_lines = (
+            self.hideout_tracker.item_demand_lines(str(getattr(price, "item_id", "")))
+            if self._feature_enabled("hideout") and self.hideout_tracker is not None
+            else []
+        )
         enhanced = _build_price_view(
             price,
             display_language,
@@ -1271,7 +2393,7 @@ class MainWindow(QMainWindow):
         self.item_price_label.setText(enhanced.label_html)
         self.item_price_label.setTextFormat(Qt.TextFormat.RichText)
         self._log_event(detail.log_text)
-        if bool(self.config.get("price_overlay_enabled", True)):
+        if self.price_overlay is not None and bool(self.config.get("price_overlay_enabled", True)):
             try:
                 seconds = int(self.config.get("price_overlay_seconds", 10))
             except (TypeError, ValueError):
@@ -1279,9 +2401,15 @@ class MainWindow(QMainWindow):
             self.price_overlay.show_price(enhanced, seconds, replace_key=price_key)
             self.price_overlay.show_price(detail, seconds, replace_key=detail.toast_key)
 
-    def schedule_selected(self) -> None:
+    def _schedule_selected_reminders(
+        self,
+    ) -> tuple[list[tuple[str, TraderReminder]], list[tuple[str, str]]]:
+        if not self._feature_enabled("trader_reminders") or self.reminders is None:
+            self._log("商人补货模块未启用，已跳过提醒设置。")
+            return [], []
         self._save_config()
-        scheduled = 0
+        scheduled: list[tuple[str, TraderReminder]] = []
+        invalid: list[tuple[str, str]] = []
         for trader in TRADERS:
             if not self.watch_checks[trader].isChecked():
                 continue
@@ -1290,6 +2418,7 @@ class MainWindow(QMainWindow):
             seconds = timer_to_seconds(value)
             if seconds is None:
                 self.status_items[trader].setText("倒计时无效")
+                invalid.append((trader, value))
                 self._log(f"已跳过 {trader}：倒计时无效 '{value}'。")
                 continue
 
@@ -1305,13 +2434,113 @@ class MainWindow(QMainWindow):
                 f"已设置 {trader}：补货 {reminder.restock_at.strftime('%H:%M:%S')}，"
                 f"提醒 {reminder.notify_at.strftime('%H:%M:%S')}。"
             )
-            scheduled += 1
+            scheduled.append((trader, reminder))
 
-        if scheduled == 0:
+        if not scheduled:
             self._log("没有设置任何提醒。请选择商人并输入有效的 HH:MM:SS 倒计时。")
+        return scheduled, invalid
+
+    def schedule_selected(self) -> None:
+        if not self._feature_enabled("trader_reminders") or self.reminders is None:
+            self._log("商人补货模块未启用，已跳过提醒设置。")
+            return
+        scheduled, invalid = self._schedule_selected_reminders()
+        self._show_trader_schedule_feedback(scheduled, invalid, manual=True)
+
+    def _show_trader_capture_feedback(
+        self,
+        timers: list[str],
+        scheduled: list[tuple[str, TraderReminder]],
+        invalid: list[tuple[str, str]],
+    ) -> None:
+        if scheduled:
+            self._show_trader_schedule_feedback(scheduled, invalid, manual=False)
+            return
+        detail_lines = [f"已识别 {len(timers)} 个倒计时，但没有设置提醒。"]
+        if invalid:
+            detail_lines.append("无效倒计时：" + "；".join(f"{trader} {value or '-'}" for trader, value in invalid))
+        else:
+            detail_lines.append("请勾选要提醒的商人，或手动修正倒计时后再设置。")
+        self._show_operation_feedback(
+            "商人倒计时已识别",
+            "未设置提醒",
+            "\n".join(detail_lines),
+            accent_color="#F2C14E",
+        )
+
+    def _show_trader_schedule_feedback(
+        self,
+        scheduled: list[tuple[str, TraderReminder]],
+        invalid: list[tuple[str, str]],
+        *,
+        manual: bool,
+    ) -> None:
+        if scheduled:
+            detail_lines = [
+                f"{trader} {reminder.restock_at:%H:%M:%S}"
+                for trader, reminder in scheduled
+            ]
+            if invalid:
+                detail_lines.append(
+                    "未设置："
+                    + "；".join(f"{trader} {value or '-'}" for trader, value in invalid)
+                )
+            self._show_operation_feedback(
+                "已记录并设置提醒",
+                f"{len(scheduled)} 个商人",
+                "\n".join(detail_lines),
+                accent_color="#36D27F",
+            )
+            return
+        title = "未设置提醒" if manual else "商人倒计时已识别"
+        detail = "没有勾选商人，或勾选商人的倒计时无效。"
+        if invalid:
+            detail = "无效倒计时：" + "；".join(
+                f"{trader} {value or '-'}" for trader, value in invalid
+            )
+        self._show_operation_feedback(
+            title,
+            "0 个商人",
+            detail,
+            accent_color="#F2C14E",
+        )
+
+    def _show_operation_feedback(
+        self,
+        title: str,
+        value_text: str,
+        detail: str,
+        *,
+        accent_color: str = "#5DA8FF",
+        seconds: int | None = None,
+    ) -> None:
+        if self.feedback_overlay is None:
+            self._log(f"{title}: {value_text} / {detail}")
+            return
+        if seconds is None:
+            seconds = self._feedback_overlay_seconds()
+        self.feedback_overlay.show_feedback(
+            ReminderView(
+                title=title,
+                value_text=value_text,
+                detail=detail,
+                accent_color=accent_color,
+            ),
+            seconds=seconds,
+        )
+
+    def _feedback_overlay_seconds(self) -> int:
+        try:
+            return int(self.config.get("feedback_overlay_seconds", 6))
+        except (TypeError, ValueError):
+            return 6
 
     def clear_reminders(self) -> None:
+        if self.reminders is None or self.reminder_overlay is None:
+            self._log("商人补货模块未启用，已跳过清空提醒。")
+            return
         self.reminders.clear()
+        self.reminder_overlay.clear_reminders()
         for trader in TRADERS:
             self.status_items[trader].setText("未启用")
             self.restock_items[trader].setText("")
@@ -1332,16 +2561,34 @@ class MainWindow(QMainWindow):
         os.startfile(crop_path)  # type: ignore[attr-defined]
 
     def _on_reminder_triggered(self, trader: str, reminder: TraderReminder) -> None:
+        if not self._feature_enabled("trader_reminders") or self.reminder_overlay is None:
+            return
         self.status_items[trader].setText("已触发")
         self._log(f"{trader} 的提醒已触发。")
         if bool(self.config.get("sound_enabled", True)):
             QApplication.beep()
         if bool(self.config.get("popup_enabled", True)):
-            QMessageBox.information(
-                self,
-                "商人补货提醒",
-                f"{trader} 即将补货。\n补货时间：{reminder.restock_at:%H:%M:%S}",
+            view = ReminderView(
+                title=f"{trader} 即将补货",
+                value_text=f"补货时间 {reminder.restock_at:%H:%M:%S}",
+                detail=(
+                    f"提醒时间 {reminder.notify_at:%H:%M:%S}"
+                    f" · 隐藏/显示: {self.config.get('reminder_hold_hotkey', 'F7')}"
+                ),
             )
+            self.reminder_overlay.show_reminder(view)
+
+    def toggle_reminder_hold(self) -> None:
+        if self.reminder_overlay is None:
+            self._log("商人补货模块未启用，已跳过补货提示显示切换。")
+            return
+        state = self.reminder_overlay.toggle_visibility()
+        if state is None:
+            self._log("当前没有可隐藏/显示的补货提示。")
+        elif state:
+            self._log("补货提示已显示。")
+        else:
+            self._log("补货提示已隐藏；再次按热键显示。")
 
     def _manual_size(self) -> tuple[int, int] | None:
         if not bool(self.config.get("manual_resolution_enabled", False)):
@@ -1354,9 +2601,10 @@ class MainWindow(QMainWindow):
         is_foreground, title = is_tarkov_foreground()
         if is_foreground:
             return True
-        message = f"已拒绝查价：当前前台窗口不是 Tarkov，而是「{title}」。"
-        self._log_event(message)
-        self.item_price_label.setText("价格: 当前前台窗口不是 Tarkov，未截图")
+        message = f"已拒绝{action_name}：当前前台窗口不是 Tarkov，而是「{title}」。"
+        self._log(message, visible=False)
+        if hasattr(self, "item_price_label"):
+            self.item_price_label.setText("价格: 当前前台窗口不是 Tarkov，未截图")
         return False
 
     def _reset_run_log(self) -> None:
@@ -1380,6 +2628,7 @@ class MainWindow(QMainWindow):
             pass
         if visible and hasattr(self, "log"):
             self.log.append(line)
+            self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def _log_event(self, message: str) -> None:
         self._log(message, visible=True)
@@ -1426,6 +2675,280 @@ def _safe_int(value: object) -> int | None:
         return None
 
 
+def _preset_float(preset: dict[str, object], key: str, fallback: float) -> float:
+    try:
+        return float(preset.get(key, fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _format_display_filter_value(key: str, value: float) -> str:
+    if key == "black_lift":
+        return f"{value * 100:.0f}%"
+    return f"{value:.2f}"
+
+
+class GammaCurvePreview(QLabel):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(220, 150)
+        self.setStyleSheet("background: #050505; border: 1px solid rgba(255, 255, 255, 60);")
+        self.set_preset({})
+
+    def set_preset(self, preset: dict[str, object]) -> None:
+        width = max(1, self.width())
+        height = max(1, self.height())
+        pixmap = QPixmap(width, height)
+        pixmap.fill(QColor("#050505"))
+        painter = QPainter(pixmap)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QPen(QColor(50, 50, 50), 1))
+            for fraction in (0.25, 0.5, 0.75):
+                x = int(fraction * (width - 1))
+                y = int(fraction * (height - 1))
+                painter.drawLine(x, 0, x, height)
+                painter.drawLine(0, y, width, y)
+            ramp = build_gamma_ramp(preset)[0]
+            painter.setPen(QPen(QColor("#F2F2F2"), 2))
+            last_x = 0
+            last_y = height - 1 - int((ramp[0] / 65535) * (height - 1))
+            for index, value in enumerate(ramp[1:], start=1):
+                x = int((index / 255) * (width - 1))
+                y = height - 1 - int((value / 65535) * (height - 1))
+                painter.drawLine(last_x, last_y, x, y)
+                last_x, last_y = x, y
+        finally:
+            painter.end()
+        self.setPixmap(pixmap)
+
+
+class DisplayFilterControlDialog(QDialog):
+    def __init__(self, main_window: MainWindow) -> None:
+        super().__init__(main_window)
+        self.main_window = main_window
+        self._loading = False
+        self.sliders: dict[str, QSlider] = {}
+        self.value_labels: dict[str, QLabel] = {}
+        self.setWindowTitle("Gamma 局内调节")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.resize(520, 360)
+
+        layout = QVBoxLayout(self)
+        self.combo = QComboBox()
+        self.combo.currentIndexChanged.connect(self._on_preset_changed)
+        layout.addWidget(self.combo)
+
+        editor = QWidget()
+        editor_layout = QHBoxLayout(editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        form = QFormLayout()
+        for key, (label, minimum, maximum, _scale, _decimals) in DISPLAY_FILTER_SLIDERS.items():
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setRange(minimum, maximum)
+            slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+            slider.setTickInterval(max(1, (maximum - minimum) // 5))
+            value_label = QLabel("")
+            value_label.setMinimumWidth(56)
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.addWidget(slider, 1)
+            row_layout.addWidget(value_label)
+            self.sliders[key] = slider
+            self.value_labels[key] = value_label
+            slider.valueChanged.connect(self._on_slider_changed)
+            form.addRow(label, row)
+        self.curve = GammaCurvePreview()
+        editor_layout.addLayout(form, 1)
+        editor_layout.addWidget(self.curve)
+        layout.addWidget(editor)
+
+        self.live_preview = QCheckBox("实时应用")
+        self.live_preview.setChecked(True)
+        layout.addWidget(self.live_preview)
+
+        buttons = QWidget()
+        button_layout = QHBoxLayout(buttons)
+        button_layout.setContentsMargins(0, 0, 0, 0)
+        apply_button = QPushButton("应用")
+        apply_button.clicked.connect(self.apply_current)
+        new_button = QPushButton("新建方案")
+        new_button.clicked.connect(self.create_new)
+        save_button = QPushButton("保存为方案")
+        save_button.clicked.connect(self.save_current)
+        restore_button = QPushButton("恢复")
+        restore_button.clicked.connect(
+            lambda checked=False: self.main_window.restore_display_filter(show_feedback=False)
+        )
+        close_button = QPushButton("隐藏")
+        close_button.clicked.connect(self.hide)
+        button_layout.addWidget(apply_button)
+        button_layout.addWidget(new_button)
+        button_layout.addWidget(save_button)
+        button_layout.addWidget(restore_button)
+        button_layout.addWidget(close_button)
+        layout.addWidget(buttons)
+        self.reload_presets()
+
+    def reload_presets(self, *, select_name: str = "") -> None:
+        self.combo.blockSignals(True)
+        self.combo.clear()
+        presets = self.main_window._display_filter_presets()
+        for index, preset in enumerate(presets):
+            self.combo.addItem(str(preset.get("name", f"Preset {index + 1}")), index)
+        selected = 0
+        if select_name:
+            for index, preset in enumerate(presets):
+                if str(preset.get("name", "")) == select_name:
+                    selected = index
+                    break
+        if self.combo.count() > 0:
+            self.combo.setCurrentIndex(selected)
+        self.combo.blockSignals(False)
+        self._on_preset_changed()
+
+    def _selected_preset(self) -> dict[str, object] | None:
+        presets = self.main_window._display_filter_presets()
+        if not presets:
+            return None
+        return presets[max(0, self.combo.currentIndex()) % len(presets)]
+
+    def _preset_from_controls(self) -> dict[str, object]:
+        preset = self._selected_preset() or {}
+        result: dict[str, object] = {
+            "name": str(preset.get("name", "Custom")),
+            "description": str(preset.get("description", "自定义 Gamma 曲线")),
+            "hotkey": str(preset.get("hotkey", "")),
+        }
+        for key, (_label, _minimum, _maximum, scale, decimals) in DISPLAY_FILTER_SLIDERS.items():
+            result[key] = round(self.sliders[key].value() / scale, decimals)
+        return result
+
+    def _load_controls(self, preset: dict[str, object]) -> None:
+        self._loading = True
+        try:
+            for key, (_label, minimum, maximum, scale, _decimals) in DISPLAY_FILTER_SLIDERS.items():
+                value = int(round(_preset_float(preset, key, self.sliders[key].value() / scale) * scale))
+                self.sliders[key].setValue(min(max(value, minimum), maximum))
+        finally:
+            self._loading = False
+        self._update_preview()
+
+    def _on_preset_changed(self) -> None:
+        preset = self._selected_preset()
+        if preset is not None:
+            self._load_controls(preset)
+
+    def _on_slider_changed(self) -> None:
+        if self._loading:
+            return
+        self._update_preview()
+        if self.live_preview.isChecked():
+            self.apply_current()
+
+    def _update_preview(self) -> None:
+        preset = self._preset_from_controls()
+        for key, label in self.value_labels.items():
+            label.setText(_format_display_filter_value(key, _preset_float(preset, key, 1.0)))
+        self.curve.set_preset(preset)
+
+    def apply_current(self) -> None:
+        self.main_window._apply_display_filter_preset(self._preset_from_controls(), notify=False)
+
+    def create_new(self) -> None:
+        default_name = self.main_window._unique_display_filter_preset_name("自定义方案")
+        name, ok = QInputDialog.getText(
+            self,
+            "新建 Gamma 方案",
+            "方案名称：",
+            text=default_name,
+        )
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        if self.main_window._display_filter_preset_name_exists(name):
+            QMessageBox.warning(
+                self,
+                "方案名称已存在",
+                "这个 Gamma 方案名称已经存在。请换一个名称，或使用“保存为方案”。",
+            )
+            return
+        preset = self._preset_from_controls()
+        preset["name"] = name
+        preset["description"] = "自定义 Gamma 曲线"
+        preset["hotkey"] = ""
+        self.main_window._upsert_display_filter_preset(preset)
+        self.reload_presets(select_name=name)
+        self.main_window._log_event(f"Gamma 方案已新建：{name}")
+
+    def save_current(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "保存 Gamma 方案",
+            "方案名称：",
+            text=str((self._selected_preset() or {}).get("name", "")),
+        )
+        if not ok or not name.strip():
+            return
+        preset = self._preset_from_controls()
+        preset["name"] = name.strip()
+        preset["description"] = "自定义 Gamma 曲线"
+        self.main_window._upsert_display_filter_preset(preset)
+        self.reload_presets(select_name=name.strip())
+
+
+class FeatureSetupDialog(QDialog):
+    def __init__(self, config: dict[str, object], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("首次启动设置")
+        self.resize(460, 320)
+        self._config = copy.deepcopy(config)
+        self.feature_checks: dict[str, QCheckBox] = {}
+
+        layout = QVBoxLayout(self)
+        title = QLabel("选择要启用的功能")
+        title.setStyleSheet("font-size: 18px; font-weight: 700;")
+        detail = QLabel("软件会根据选择隐藏对应的主界面面板和热键；之后也可以在设置里修改，重启后生效。")
+        detail.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(detail)
+
+        initial = {"price_lookup", "trader_reminders"}
+        if bool(config.get("feature_setup_complete", False)):
+            raw_enabled = config.get("enabled_features", DEFAULT_ENABLED_FEATURES)
+            if isinstance(raw_enabled, list):
+                initial = {str(item) for item in raw_enabled}
+        for feature_id, label in FEATURE_DEFINITIONS.items():
+            check = QCheckBox(label)
+            check.setChecked(feature_id in initial)
+            self.feature_checks[feature_id] = check
+            layout.addWidget(check)
+        layout.addStretch(1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict[str, object]:
+        enabled = [
+            feature_id for feature_id, check in self.feature_checks.items() if check.isChecked()
+        ]
+        return {
+            "enabled_features": enabled,
+            "feature_setup_complete": True,
+        }
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config: dict[str, object], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1439,16 +2962,21 @@ class SettingsDialog(QDialog):
         self.hover_size_fields: list[QSpinBox] = []
         self.hover_search_margin_fields: list[QSpinBox] = []
         self.hover_name_padding_fields: list[QSpinBox] = []
+        self.feature_checks: dict[str, QCheckBox] = {}
+        self.hotkey_fields: dict[str, HotkeyLineEdit] = {}
         self._build_ui()
         self._load()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
-        tabs.addTab(self._build_capture_tab(), "截图")
         tabs.addTab(self._build_hotkeys_tab(), "热键")
-        tabs.addTab(self._build_prices_tab(), "价格")
+        tabs.addTab(self._build_features_tab(), "功能")
         tabs.addTab(self._build_reminders_tab(), "提醒")
+        tabs.addTab(self._build_prices_tab(), "价格")
+        tabs.addTab(self._build_performance_tab(), "性能")
+        tabs.addTab(self._build_capture_tab(), "截图")
+        tabs.setCurrentIndex(0)
         layout.addWidget(tabs)
 
         buttons = QDialogButtonBox(
@@ -1460,7 +2988,8 @@ class SettingsDialog(QDialog):
 
     def _build_capture_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
+        basic = QFormLayout()
 
         self.capture_mode = QComboBox()
         for label, value in [
@@ -1502,33 +3031,137 @@ class SettingsDialog(QDialog):
             200,
         )
 
-        layout.addRow("截图模式", self.capture_mode)
-        layout.addRow(self.manual_resolution)
-        layout.addRow("分辨率预设", self.resolution_preset)
-        layout.addRow("宽度", self.manual_width)
-        layout.addRow("高度", self.manual_height)
-        layout.addRow("物品识别方式", self.item_capture_mode)
-        layout.addRow("悬停等待毫秒", self.hover_wait_ms)
-        layout.addRow("悬停搜索边距", hover_search_margins)
-        layout.addRow("名称框留白", hover_name_padding)
-        layout.addRow("悬停提示偏移", hover_offset)
-        layout.addRow("悬停提示尺寸", hover_size)
-        layout.addRow("装备页签 ROI", inventory_tab_roi)
-        layout.addRow("倒计时 ROI", timer_roi)
-        layout.addRow("物品名 ROI", item_roi)
+        basic.addRow("截图模式", self.capture_mode)
+        basic.addRow("物品识别方式", self.item_capture_mode)
+        layout.addLayout(basic)
+
+        advanced = QGroupBox("高级截图设置")
+        advanced.setCheckable(True)
+        advanced.setChecked(False)
+        advanced_layout = QVBoxLayout(advanced)
+        advanced_body = QWidget()
+        advanced_form = QFormLayout(advanced_body)
+        advanced_form.addRow(self.manual_resolution)
+        advanced_form.addRow("分辨率预设", self.resolution_preset)
+        advanced_form.addRow("宽度", self.manual_width)
+        advanced_form.addRow("高度", self.manual_height)
+        advanced_form.addRow("悬停等待毫秒", self.hover_wait_ms)
+        advanced_form.addRow("悬停搜索边距", hover_search_margins)
+        advanced_form.addRow("名称框留白", hover_name_padding)
+        advanced_form.addRow("悬停提示偏移", hover_offset)
+        advanced_form.addRow("悬停提示尺寸", hover_size)
+        advanced_form.addRow("装备页签 ROI", inventory_tab_roi)
+        advanced_form.addRow("倒计时 ROI", timer_roi)
+        advanced_form.addRow("物品名 ROI", item_roi)
+        advanced_layout.addWidget(advanced_body)
+        advanced_body.setVisible(False)
+        advanced.toggled.connect(advanced_body.setVisible)
+        layout.addWidget(advanced)
+        layout.addStretch(1)
         return tab
+
+    def _make_hotkey_field(self, label: str) -> HotkeyLineEdit:
+        field = HotkeyLineEdit(label)
+        field.set_conflict_checker(self._check_hotkey_conflict)
+        self.hotkey_fields[label] = field
+        return field
+
+    def _check_hotkey_conflict(self, field: HotkeyLineEdit, hotkey: str) -> bool:
+        try:
+            normalized = normalize_hotkey(hotkey)
+        except ValueError as exc:
+            QMessageBox.warning(self, "热键无效", str(exc))
+            return False
+
+        conflict = self._find_settings_hotkey_conflict(normalized, source_field=field)
+        if conflict is None:
+            return True
+
+        kind, label, target = conflict
+        answer = QMessageBox.question(
+            self,
+            "快捷键冲突",
+            f"{hotkey} 已被“{label}”使用。是否替代？选择“是”会清空原绑定。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+
+        if kind == "field":
+            target.clear()  # type: ignore[attr-defined]
+        elif kind == "preset":
+            target["hotkey"] = ""  # type: ignore[index]
+        return True
+
+    def _find_settings_hotkey_conflict(
+        self, normalized: str, *, source_field: HotkeyLineEdit
+    ) -> tuple[str, str, object] | None:
+        for label, field in self.hotkey_fields.items():
+            if field is source_field:
+                continue
+            text = field.text().strip()
+            if not text:
+                continue
+            try:
+                if normalize_hotkey(text) == normalized:
+                    return ("field", label, field)
+            except ValueError:
+                continue
+
+        presets = self._config.get("display_filter_presets", [])
+        if isinstance(presets, list):
+            for preset in presets:
+                if not isinstance(preset, dict):
+                    continue
+                text = str(preset.get("hotkey", "")).strip()
+                if not text:
+                    continue
+                try:
+                    if normalize_hotkey(text) == normalized:
+                        name = str(preset.get("name", "")).strip() or "未命名"
+                        return ("preset", f"Gamma 方案：{name}", preset)
+                except ValueError:
+                    continue
+        return None
 
     def _build_hotkeys_tab(self) -> QWidget:
         tab = QWidget()
         layout = QFormLayout(tab)
-        self.capture_hotkey = QLineEdit()
-        self.item_lookup_hotkey = QLineEdit()
-        self.hideout_scan_hotkey = QLineEdit()
-        self.schedule_hotkey = QLineEdit()
+        self.capture_hotkey = self._make_hotkey_field("识别倒计时")
+        self.item_lookup_hotkey = self._make_hotkey_field("物品查价")
+        self.hideout_scan_hotkey = self._make_hotkey_field("识别藏身处")
+        self.reminder_hold_hotkey = self._make_hotkey_field("隐藏/显示补货提示")
+        self.display_filter_restore_hotkey = self._make_hotkey_field("恢复 Gamma")
         layout.addRow("识别倒计时", self.capture_hotkey)
         layout.addRow("物品查价", self.item_lookup_hotkey)
         layout.addRow("识别藏身处", self.hideout_scan_hotkey)
-        layout.addRow("设置提醒", self.schedule_hotkey)
+        layout.addRow("隐藏/显示补货提示", self.reminder_hold_hotkey)
+        layout.addRow("恢复 Gamma", self.display_filter_restore_hotkey)
+        return tab
+
+    def _build_features_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        intro = QLabel("选择要在主界面启用的功能；保存后重启软件生效。")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        for feature_id, label in FEATURE_DEFINITIONS.items():
+            check = QCheckBox(label)
+            self.feature_checks[feature_id] = check
+            layout.addWidget(check)
+        self.display_filter_restore_on_exit = QCheckBox("退出软件时恢复系统原始 Gamma")
+        self.display_filter_eye_care_enabled = QCheckBox("护眼模式：Tarkov 不活跃时自动关闭 Gamma")
+        self.display_filter_eye_care_check_seconds = QSpinBox()
+        self.display_filter_eye_care_check_seconds.setRange(1, 30)
+        layout.addWidget(self.display_filter_restore_on_exit)
+        layout.addWidget(self.display_filter_eye_care_enabled)
+        eye_row = QWidget()
+        eye_layout = QFormLayout(eye_row)
+        eye_layout.setContentsMargins(0, 0, 0, 0)
+        eye_layout.addRow("护眼检测间隔秒数", self.display_filter_eye_care_check_seconds)
+        layout.addWidget(eye_row)
+        layout.addStretch(1)
         return tab
 
     def _build_prices_tab(self) -> QWidget:
@@ -1564,12 +3197,35 @@ class SettingsDialog(QDialog):
         self.lead_seconds.setRange(0, 3600)
         self.repeat_seconds = QSpinBox()
         self.repeat_seconds.setRange(0, 3600)
+        self.feedback_overlay_seconds = QSpinBox()
+        self.feedback_overlay_seconds.setRange(1, 120)
         self.sound_enabled = QCheckBox("声音")
-        self.popup_enabled = QCheckBox("弹窗")
+        self.popup_enabled = QCheckBox("悬浮提示")
         layout.addRow("提前提醒秒数", self.lead_seconds)
         layout.addRow("重复提醒间隔", self.repeat_seconds)
+        layout.addRow("操作反馈显示秒数", self.feedback_overlay_seconds)
         layout.addRow(self.sound_enabled)
         layout.addRow(self.popup_enabled)
+        return tab
+
+    def _build_performance_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QFormLayout(tab)
+        self.performance_mode_enabled = QCheckBox("性能模式：限制后台任务并主动释放临时内存")
+        self.performance_gc_after_worker = QCheckBox("后台任务结束后主动释放临时对象")
+        self.performance_skip_auto_price_refresh = QCheckBox("性能模式下跳过自动刷新价格缓存")
+        self.performance_log_max_lines = QSpinBox()
+        self.performance_log_max_lines.setRange(100, 5000)
+        self.performance_cleanup_interval_seconds = QSpinBox()
+        self.performance_cleanup_interval_seconds.setRange(15, 600)
+        self.performance_max_concurrent_workers = QSpinBox()
+        self.performance_max_concurrent_workers.setRange(1, 4)
+        layout.addRow(self.performance_mode_enabled)
+        layout.addRow(self.performance_gc_after_worker)
+        layout.addRow(self.performance_skip_auto_price_refresh)
+        layout.addRow("可见日志最多行数", self.performance_log_max_lines)
+        layout.addRow("空闲清理间隔秒数", self.performance_cleanup_interval_seconds)
+        layout.addRow("后台任务并发上限", self.performance_max_concurrent_workers)
         return tab
 
     def _build_roi_fields(self, fields: list[QSpinBox]) -> QWidget:
@@ -1641,7 +3297,25 @@ class SettingsDialog(QDialog):
         self.capture_hotkey.setText(str(self._config.get("capture_hotkey", "F8")))
         self.item_lookup_hotkey.setText(str(self._config.get("item_lookup_hotkey", "Q")))
         self.hideout_scan_hotkey.setText(str(self._config.get("hideout_scan_hotkey", "F6")))
-        self.schedule_hotkey.setText(str(self._config.get("schedule_hotkey", "F10")))
+        self.reminder_hold_hotkey.setText(str(self._config.get("reminder_hold_hotkey", "F7")))
+        self.display_filter_restore_hotkey.setText(
+            str(self._config.get("display_filter_restore_hotkey", "Ctrl+F9"))
+        )
+        enabled_features = self._config.get("enabled_features", DEFAULT_ENABLED_FEATURES)
+        if not isinstance(enabled_features, list):
+            enabled_features = DEFAULT_ENABLED_FEATURES
+        enabled_set = {str(item) for item in enabled_features}
+        for feature_id, check in self.feature_checks.items():
+            check.setChecked(feature_id in enabled_set)
+        self.display_filter_restore_on_exit.setChecked(
+            bool(self._config.get("display_filter_restore_on_exit", True))
+        )
+        self.display_filter_eye_care_enabled.setChecked(
+            bool(self._config.get("display_filter_eye_care_enabled", True))
+        )
+        self.display_filter_eye_care_check_seconds.setValue(
+            int(self._config.get("display_filter_eye_care_check_seconds", 2))
+        )
 
         self.price_overlay_enabled.setChecked(bool(self._config.get("price_overlay_enabled", True)))
         self.close_to_tray.setChecked(bool(self._config.get("close_to_tray", True)))
@@ -1664,15 +3338,45 @@ class SettingsDialog(QDialog):
 
         self.lead_seconds.setValue(int(self._config.get("lead_time_seconds", 10)))
         self.repeat_seconds.setValue(int(self._config.get("repeat_alert_seconds", 0)))
+        self.feedback_overlay_seconds.setValue(int(self._config.get("feedback_overlay_seconds", 6)))
         self.sound_enabled.setChecked(bool(self._config.get("sound_enabled", True)))
         self.popup_enabled.setChecked(bool(self._config.get("popup_enabled", True)))
+        self.performance_mode_enabled.setChecked(
+            bool(self._config.get("performance_mode_enabled", True))
+        )
+        self.performance_gc_after_worker.setChecked(
+            bool(self._config.get("performance_gc_after_worker", True))
+        )
+        self.performance_skip_auto_price_refresh.setChecked(
+            bool(self._config.get("performance_skip_auto_price_refresh", True))
+        )
+        self.performance_log_max_lines.setValue(
+            int(self._config.get("performance_log_max_lines", 600))
+        )
+        self.performance_cleanup_interval_seconds.setValue(
+            int(self._config.get("performance_cleanup_interval_seconds", 60))
+        )
+        self.performance_max_concurrent_workers.setValue(
+            int(self._config.get("performance_max_concurrent_workers", 2))
+        )
 
     def values(self) -> dict[str, object]:
         return {
-            "capture_hotkey": self.capture_hotkey.text().strip() or "F8",
-            "item_lookup_hotkey": self.item_lookup_hotkey.text().strip() or "Q",
-            "hideout_scan_hotkey": self.hideout_scan_hotkey.text().strip() or "F6",
-            "schedule_hotkey": self.schedule_hotkey.text().strip() or "F10",
+            "capture_hotkey": self.capture_hotkey.text().strip(),
+            "item_lookup_hotkey": self.item_lookup_hotkey.text().strip(),
+            "hideout_scan_hotkey": self.hideout_scan_hotkey.text().strip(),
+            "reminder_hold_hotkey": self.reminder_hold_hotkey.text().strip(),
+            "display_filter_restore_hotkey": self.display_filter_restore_hotkey.text().strip(),
+            "display_filter_presets": self._config.get("display_filter_presets", []),
+            "enabled_features": [
+                feature_id for feature_id, check in self.feature_checks.items() if check.isChecked()
+            ],
+            "feature_setup_complete": True,
+            "display_filter_restore_on_exit": self.display_filter_restore_on_exit.isChecked(),
+            "display_filter_eye_care_enabled": self.display_filter_eye_care_enabled.isChecked(),
+            "display_filter_eye_care_check_seconds": (
+                self.display_filter_eye_care_check_seconds.value()
+            ),
             "capture_mode": self.capture_mode.currentData() or "Auto",
             "item_capture_mode": self.item_capture_mode.currentData() or "Hover tooltip",
             "manual_resolution_enabled": self.manual_resolution.isChecked(),
@@ -1696,8 +3400,19 @@ class SettingsDialog(QDialog):
             "price_game_mode_default": self.price_game_mode_default.currentData() or "pve",
             "lead_time_seconds": self.lead_seconds.value(),
             "repeat_alert_seconds": self.repeat_seconds.value(),
+            "feedback_overlay_seconds": self.feedback_overlay_seconds.value(),
             "sound_enabled": self.sound_enabled.isChecked(),
             "popup_enabled": self.popup_enabled.isChecked(),
+            "performance_mode_enabled": self.performance_mode_enabled.isChecked(),
+            "performance_gc_after_worker": self.performance_gc_after_worker.isChecked(),
+            "performance_skip_auto_price_refresh": (
+                self.performance_skip_auto_price_refresh.isChecked()
+            ),
+            "performance_log_max_lines": self.performance_log_max_lines.value(),
+            "performance_cleanup_interval_seconds": (
+                self.performance_cleanup_interval_seconds.value()
+            ),
+            "performance_max_concurrent_workers": self.performance_max_concurrent_workers.value(),
         }
 
     def _apply_resolution_preset(self, value: str) -> None:
@@ -1741,6 +3456,14 @@ class PriceView:
     label_html: str
     log_text: str
     toast_key: str = ""
+
+
+@dataclass(frozen=True)
+class ReminderView:
+    title: str
+    value_text: str
+    detail: str
+    accent_color: str = "#F2C14E"
 
 
 def _build_price_view(
@@ -2183,6 +3906,226 @@ class PriceToast(QWidget):
         self._animation = animation
         animation.setDuration(max(80, duration_ms))
         animation.setStartValue(1.0)
+        animation.setEndValue(0.0)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.finished.connect(self.close)
+        animation.start()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        callback = self.closed_callback
+        self.closed_callback = None
+        if callable(callback):
+            callback()
+        super().closeEvent(event)
+
+
+class FeedbackOverlay(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._toasts: list[ReminderToast] = []
+
+    def show_feedback(self, view: ReminderView, seconds: int = 6) -> None:
+        toast = ReminderToast(view)
+        toast.closed_callback = lambda item=toast: self._forget_toast(item)
+        self._toasts.insert(0, toast)
+        while len(self._toasts) > 3:
+            old_toast = self._toasts.pop()
+            old_toast.close()
+        self._position_toasts()
+        toast.show_for(seconds)
+
+    def clear_feedback(self) -> None:
+        toasts = list(self._toasts)
+        self._toasts.clear()
+        for toast in toasts:
+            toast.close()
+
+    def hide(self) -> None:
+        self.clear_feedback()
+        super().hide()
+
+    def _forget_toast(self, toast: "ReminderToast") -> None:
+        if toast in self._toasts:
+            self._toasts.remove(toast)
+
+    def _position_toasts(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        rect = screen.availableGeometry()
+        left = rect.left() + 32
+        top = rect.top() + 80
+        for toast in self._toasts:
+            toast.adjustSize()
+            toast.move(left, top)
+            top += toast.height() + 12
+
+
+class ReminderOverlay(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._toasts: list[ReminderToast] = []
+        self._hidden = False
+
+    def show_reminder(self, view: ReminderView) -> None:
+        toast = ReminderToast(view)
+        toast.closed_callback = lambda item=toast: self._forget_toast(item)
+        self._toasts.insert(0, toast)
+        while len(self._toasts) > 5:
+            old_toast = self._toasts.pop()
+            old_toast.close()
+        self._position_toasts()
+        if self._hidden:
+            toast.hide()
+        else:
+            toast.show_persistent()
+
+    def toggle_visibility(self) -> bool | None:
+        if not self._toasts:
+            return None
+        self._hidden = not self._hidden
+        if self._hidden:
+            for toast in list(self._toasts):
+                toast.hide()
+        else:
+            for toast in list(self._toasts):
+                toast.show_persistent()
+            self._position_toasts()
+        return not self._hidden
+
+    def clear_reminders(self) -> None:
+        self._hidden = False
+        toasts = list(self._toasts)
+        self._toasts.clear()
+        for toast in toasts:
+            toast.close()
+
+    def hide(self) -> None:
+        self.clear_reminders()
+        super().hide()
+
+    def _forget_toast(self, toast: "ReminderToast") -> None:
+        if toast in self._toasts:
+            self._toasts.remove(toast)
+
+    def _position_toasts(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            return
+        rect = screen.availableGeometry()
+        left = rect.left() + 32
+        top = rect.top() + 220
+        for toast in self._toasts:
+            toast.adjustSize()
+            toast.move(left, top)
+            top += toast.height() + 12
+
+
+class ReminderToast(QWidget):
+    def __init__(self, view: ReminderView) -> None:
+        super().__init__()
+        self.closed_callback: object | None = None
+        self._closing = False
+        self._animation: QPropertyAnimation | None = None
+        self._timer_generation = 0
+        self.setWindowTitle("商人补货提醒")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(1.0)
+        self.setGraphicsEffect(self._opacity)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("reminderToastCard")
+        card.setMinimumWidth(480)
+        card.setMaximumWidth(640)
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(0, 0, 0, 0)
+        card_layout.setSpacing(0)
+
+        accent = QWidget()
+        accent.setFixedWidth(7)
+        accent.setStyleSheet(
+            f"background: {view.accent_color};"
+            "border-top-left-radius: 8px;"
+            "border-bottom-left-radius: 8px;"
+        )
+        card_layout.addWidget(accent)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(15, 12, 16, 13)
+        content_layout.setSpacing(5)
+
+        self._title_label = QLabel(view.title)
+        self._title_label.setWordWrap(True)
+        self._title_label.setStyleSheet("font-size: 18px; font-weight: 800; color: #FBFAF4;")
+        self._value_label = QLabel(view.value_text)
+        self._value_label.setStyleSheet(
+            f"font-size: 24px; font-weight: 900; color: {view.accent_color};"
+        )
+        self._detail_label = QLabel(view.detail)
+        self._detail_label.setWordWrap(True)
+        self._detail_label.setStyleSheet("font-size: 13px; color: rgba(245, 242, 232, 0.72);")
+
+        content_layout.addWidget(self._title_label)
+        content_layout.addWidget(self._value_label)
+        content_layout.addWidget(self._detail_label)
+        card_layout.addWidget(content, 1)
+        outer.addWidget(card)
+
+        self.setStyleSheet(
+            "QWidget#reminderToastCard {"
+            "background: rgba(18, 20, 24, 234);"
+            "border: 1px solid rgba(242, 193, 78, 90);"
+            "border-radius: 8px;"
+            "}"
+        )
+
+    def show_for(self, seconds: int) -> None:
+        self._closing = False
+        self._timer_generation += 1
+        generation = self._timer_generation
+        if self._animation is not None:
+            self._animation.stop()
+        self._opacity.setOpacity(1.0)
+        self.show()
+        self.raise_()
+        duration_ms = max(1, int(seconds)) * 1000
+        QTimer.singleShot(duration_ms, lambda: self._fade_out_if_current(generation))
+
+    def show_persistent(self) -> None:
+        self._closing = False
+        self._timer_generation += 1
+        if self._animation is not None:
+            self._animation.stop()
+        self._opacity.setOpacity(0.62)
+        self.show()
+        self.raise_()
+
+    def _fade_out_if_current(self, generation: int) -> None:
+        if generation == self._timer_generation:
+            self.fade_out()
+
+    def fade_out(self, duration_ms: int = 450) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        animation = QPropertyAnimation(self._opacity, b"opacity", self)
+        self._animation = animation
+        animation.setDuration(max(80, duration_ms))
+        animation.setStartValue(float(self._opacity.opacity()))
         animation.setEndValue(0.0)
         animation.setEasingCurve(QEasingCurve.Type.OutCubic)
         animation.finished.connect(self.close)
