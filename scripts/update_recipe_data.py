@@ -26,30 +26,6 @@ TRADER_NAMES = {
     "6617beeaa9cfa777ca915b7c": "Ref",
 }
 
-CATEGORY_NAMES = {
-    "gun": "武器",
-    "ammo": "弹药",
-    "ammoBox": "弹药",
-    "armor": "护甲",
-    "armorPlate": "护甲",
-    "helmet": "头盔",
-    "rig": "胸挂",
-    "backpack": "背包",
-    "container": "容器",
-    "keys": "钥匙",
-    "meds": "医疗",
-    "injectors": "医疗",
-    "provisions": "食物与饮品",
-    "grenade": "投掷物",
-    "mods": "武器配件",
-    "suppressor": "武器配件",
-    "wearable": "装备",
-    "barter": "物资",
-    "preset": "武器与装备预设",
-}
-CATEGORY_PRIORITY = tuple(CATEGORY_NAMES)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Build the compact, versioned EFT craft/barter bundle."
@@ -60,6 +36,11 @@ def main() -> int:
     station_names = _load_station_names()
     modes: dict[str, list[dict[str, Any]]] = {}
     source_etags: dict[str, str] = {}
+    item_document, item_etag = _fetch_json("regular/items")
+    item_zh_document, item_zh_etag = _fetch_json("regular/items_zh")
+    source_etags["regular/items"] = item_etag
+    source_etags["regular/items_zh"] = item_zh_etag
+    handbook_categories = _handbook_categories(item_document, item_zh_document)
     for mode in GAME_MODES:
         item_map = _load_item_map(mode)
         crafts, craft_etag = _fetch_json(f"{mode}/crafts")
@@ -71,26 +52,32 @@ def main() -> int:
         _validate_source_count(mode, "crafts", craft_rows)
         _validate_source_count(mode, "barters", barter_rows)
         records = [
-            *(_craft_record(record, item_map, station_names) for record in craft_rows),
-            *(_barter_record(record, item_map) for record in barter_rows),
+            *(
+                _craft_record(record, item_map, station_names, handbook_categories)
+                for record in craft_rows
+            ),
+            *(
+                _barter_record(record, item_map, handbook_categories)
+                for record in barter_rows
+            ),
         ]
         _validate_records(mode, records)
         modes[mode] = sorted(
             records,
             key=lambda record: (
                 str(record.get("kind")),
-                str(record.get("category")),
                 str(record.get("source")),
                 str(record.get("product", {}).get("name")),
             ),
         )
 
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(UTC).isoformat(),
         "source": "tarkov.dev JSON API",
         "source_url": JSON_API,
         "source_etags": source_etags,
+        "handbook_categories": handbook_categories,
         "modes": modes,
     }
     output = args.output.resolve()
@@ -194,21 +181,56 @@ def _load_station_names() -> dict[str, str]:
     }
 
 
+def _handbook_categories(
+    item_document: dict[str, Any], translations_document: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    data = item_document.get("data")
+    raw_categories = data.get("handbookCategories") if isinstance(data, dict) else None
+    translations = translations_document.get("data")
+    if not isinstance(raw_categories, dict) or not isinstance(translations, dict):
+        raise RuntimeError("The items endpoint did not include handbook categories/translations.")
+    categories: dict[str, dict[str, Any]] = {}
+    for category_id, value in raw_categories.items():
+        if not isinstance(value, dict):
+            continue
+        identifier = str(value.get("id") or category_id)
+        source_name = str(value.get("name") or "")
+        normalized_name = str(value.get("normalizedName") or "")
+        categories[identifier] = {
+            "name": str(
+                translations.get(source_name)
+                or normalized_name.replace("-", " ").title()
+                or identifier
+            ),
+            "normalized_name": normalized_name,
+            "parent": str(value.get("parent") or ""),
+        }
+    if len(categories) < 50:
+        raise RuntimeError(
+            f"Refusing to build a recipe bundle with only {len(categories)} handbook categories."
+        )
+    return categories
+
+
 def _craft_record(
     record: dict[str, Any],
     items: dict[str, dict[str, Any]],
     stations: dict[str, str],
+    handbook_categories: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     station_id = str(record.get("station") or "")
     return {
         "id": str(record.get("id") or ""),
         "kind": "craft",
-        "category": _item_category(record.get("productItem"), items),
         "source": stations.get(station_id, station_id or "未知工作站"),
         "level": _int_value(record.get("level")),
         "duration": _int_value(record.get("duration")),
         "task_unlock": bool(record.get("taskUnlock")),
-        "product": _contained_item(record.get("productItem"), items),
+        "product": _contained_item(
+            record.get("productItem"),
+            items,
+            handbook_categories=handbook_categories,
+        ),
         "requirements": [
             _contained_item(item, items)
             for item in record.get("requiredItems", [])
@@ -218,18 +240,23 @@ def _craft_record(
 
 
 def _barter_record(
-    record: dict[str, Any], items: dict[str, dict[str, Any]]
+    record: dict[str, Any],
+    items: dict[str, dict[str, Any]],
+    handbook_categories: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     trader_id = str(record.get("trader") or "")
     return {
         "id": str(record.get("id") or ""),
         "kind": "barter",
-        "category": _item_category(record.get("offeredItem"), items),
         "source": TRADER_NAMES.get(trader_id, trader_id or "未知商人"),
         "level": _int_value(record.get("minTraderLevel")),
         "buy_limit": _number(record.get("buyLimit")),
         "task_unlock": bool(record.get("taskUnlock")),
-        "product": _contained_item(record.get("offeredItem"), items),
+        "product": _contained_item(
+            record.get("offeredItem"),
+            items,
+            handbook_categories=handbook_categories,
+        ),
         "requirements": [
             _contained_item(item, items)
             for item in record.get("requiredItems", [])
@@ -238,7 +265,12 @@ def _barter_record(
     }
 
 
-def _contained_item(value: object, items: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _contained_item(
+    value: object,
+    items: dict[str, dict[str, Any]],
+    *,
+    handbook_categories: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     contained = value if isinstance(value, dict) else {}
     item_id = str(contained.get("item") or "")
     item = items.get(item_id, {})
@@ -259,18 +291,31 @@ def _contained_item(value: object, items: dict[str, dict[str, Any]]) -> dict[str
             result["min_level"] = min_level
         if bool(attributes.get("functional")):
             result["functional"] = True
+    if handbook_categories is not None:
+        result["category_path"] = _handbook_category_path(item, handbook_categories)
     return result
 
 
-def _item_category(value: object, items: dict[str, dict[str, Any]]) -> str:
-    contained = value if isinstance(value, dict) else {}
-    item = items.get(str(contained.get("item") or ""), {})
-    raw_types = item.get("types")
-    types = {str(value) for value in raw_types} if isinstance(raw_types, list) else set()
-    for category in CATEGORY_PRIORITY:
-        if category in types:
-            return CATEGORY_NAMES[category]
-    return "特殊物品"
+def _handbook_category_path(
+    item: dict[str, Any], categories: dict[str, dict[str, Any]]
+) -> list[str]:
+    raw_ids = item.get("handbookCategories")
+    category_ids = [str(value) for value in raw_ids] if isinstance(raw_ids, list) else []
+    if not category_ids:
+        return []
+
+    def path_to_root(category_id: str) -> list[str]:
+        path: list[str] = []
+        seen: set[str] = set()
+        current = category_id
+        while current and current not in seen and current in categories:
+            seen.add(current)
+            path.append(current)
+            current = str(categories[current].get("parent") or "")
+        path.reverse()
+        return path
+
+    return max((path_to_root(category_id) for category_id in category_ids), key=len, default=[])
 
 
 def _number(value: object) -> int | float | None:

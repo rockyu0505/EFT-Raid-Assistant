@@ -37,10 +37,12 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QCompleter,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QFormLayout,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -54,9 +56,11 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QStackedWidget,
     QSpinBox,
+    QSplitter,
     QStyle,
     QSystemTrayIcon,
     QTabWidget,
@@ -111,10 +115,10 @@ from app.reminders import ReminderManager
 from app.recipes import (
     RecipeCatalog,
     RecipeDataError,
-    recipe_requirements_text,
+    RecipeNotice,
+    recipe_requirement_rows,
     recipe_search_text,
     recipe_source_text,
-    recipe_title,
 )
 from app.ui.raid_overlays import RaidControlOverlay, RaidLogOverlay
 from app.ui.state import LogBus, SettingsStore
@@ -125,6 +129,27 @@ DISPLAY_FILTER_SLIDERS = {
     "black_lift": ("暗部抬升", 0, 35, 100, 2),
     "gain": ("亮度/Gain", 50, 125, 100, 2),
     "contrast": ("对比度", 65, 145, 100, 2),
+}
+
+HANDBOOK_ROOT_ORDER = {
+    name: index
+    for index, name in enumerate(
+        (
+            "barter-items",
+            "gear",
+            "weapon-parts-mods",
+            "weapons",
+            "ammo",
+            "provisions",
+            "medication",
+            "keys",
+            "info-items",
+            "special-equipment",
+            "task-items",
+            "maps",
+            "money",
+        )
+    )
 }
 
 
@@ -255,7 +280,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("塔科夫局内助手")
-        self.resize(980, 720)
+        self.resize(1280, 820)
+        self.setMinimumSize(1080, 700)
 
         self.config = load_config()
         self.settings_store = SettingsStore(self.config, self)
@@ -726,8 +752,8 @@ class MainWindow(QMainWindow):
         header = QGroupBox("关注制作 / 商人兑换")
         header_layout = QVBoxLayout(header)
         intro = QLabel(
-            "勾选感兴趣的具体配方。之后查到其所需物品时，局内价格浮窗会追加对应配方。"
-            "PvE / PvP 商人兑换分别保存，请先切换到对应价格模式。"
+            "按游戏手册的产物分类浏览，展开产物后勾选具体制作或兑换。"
+            "查到关注配方的材料时，价格浮窗会追加用途卡片。"
         )
         intro.setWordWrap(True)
         header_layout.addWidget(intro)
@@ -735,14 +761,11 @@ class MainWindow(QMainWindow):
         search_row = QHBoxLayout()
         self.recipe_search_field = QLineEdit()
         self.recipe_search_field.setPlaceholderText("搜索产物、来源或所需物品")
-        self.recipe_search_field.textChanged.connect(self._populate_recipe_tree)
-        collapse_button = QPushButton("全部折叠")
-        collapse_button.clicked.connect(lambda: self.recipe_tree.collapseAll())
-        clear_button = QPushButton("清除全部关注")
-        clear_button.clicked.connect(self._clear_tracked_recipes)
+        self.recipe_search_field.textChanged.connect(self._populate_recipe_results)
+        collapse_button = QPushButton("折叠配方")
+        collapse_button.clicked.connect(lambda: self.recipe_result_tree.collapseAll())
         search_row.addWidget(self.recipe_search_field, 1)
         search_row.addWidget(collapse_button)
-        search_row.addWidget(clear_button)
         header_layout.addLayout(search_row)
 
         self.recipe_summary_label = QLabel("")
@@ -750,15 +773,96 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.recipe_summary_label)
         layout.addWidget(header)
 
-        self.recipe_tree = QTreeWidget()
-        self.recipe_tree.setHeaderLabels(["产物 / 分类", "来源", "所需物品"])
-        self.recipe_tree.setAlternatingRowColors(True)
-        self.recipe_tree.setUniformRowHeights(True)
-        self.recipe_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.recipe_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.recipe_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.recipe_tree.itemChanged.connect(self._on_recipe_item_changed)
-        layout.addWidget(self.recipe_tree, 1)
+        self.recipe_tabs = QTabWidget()
+
+        browser = QWidget()
+        browser_layout = QVBoxLayout(browser)
+        browser_layout.setContentsMargins(0, 8, 0, 0)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.recipe_category_tree = QTreeWidget()
+        self.recipe_category_tree.setHeaderLabels(["游戏手册产物分类"])
+        self.recipe_category_tree.setMinimumWidth(260)
+        self.recipe_category_tree.setMaximumWidth(390)
+        self.recipe_category_tree.setUniformRowHeights(True)
+        self.recipe_category_tree.itemSelectionChanged.connect(
+            self._populate_recipe_results
+        )
+        splitter.addWidget(self.recipe_category_tree)
+
+        self.recipe_result_tree = QTreeWidget()
+        self.recipe_result_tree.setHeaderLabels(
+            ["产物 / 配方 / 所需物品", "来源 / 条件", "数量"]
+        )
+        self.recipe_result_tree.setAlternatingRowColors(True)
+        self.recipe_result_tree.setUniformRowHeights(True)
+        self.recipe_result_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.recipe_result_tree.header().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.recipe_result_tree.header().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.recipe_result_tree.itemChanged.connect(self._on_recipe_item_changed)
+        splitter.addWidget(self.recipe_result_tree)
+        splitter.setSizes([310, 850])
+        browser_layout.addWidget(splitter, 1)
+        self.recipe_tabs.addTab(browser, "按产物浏览")
+
+        tracked_page = QWidget()
+        tracked_layout = QVBoxLayout(tracked_page)
+        tracked_layout.setContentsMargins(0, 8, 0, 0)
+        color_group = QGroupBox("查价浮窗中的关注配方区域")
+        color_layout = QHBoxLayout(color_group)
+        self.recipe_color_swatch = QLabel()
+        self.recipe_color_swatch.setFixedSize(52, 24)
+        self.recipe_color_label = QLabel()
+        color_button = QPushButton("选择边框颜色")
+        color_button.clicked.connect(self._choose_recipe_overlay_color)
+        reset_color_button = QPushButton("恢复默认")
+        reset_color_button.clicked.connect(self._reset_recipe_overlay_color)
+        color_layout.addWidget(QLabel("边框与标题强调色"))
+        color_layout.addWidget(self.recipe_color_swatch)
+        color_layout.addWidget(self.recipe_color_label)
+        color_layout.addStretch(1)
+        color_layout.addWidget(color_button)
+        color_layout.addWidget(reset_color_button)
+        tracked_layout.addWidget(color_group)
+
+        self.tracked_recipe_tree = QTreeWidget()
+        self.tracked_recipe_tree.setHeaderLabels(
+            ["已关注产物 / 配方 / 所需物品", "模式与来源", "数量"]
+        )
+        self.tracked_recipe_tree.setAlternatingRowColors(True)
+        self.tracked_recipe_tree.setUniformRowHeights(True)
+        self.tracked_recipe_tree.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.tracked_recipe_tree.header().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.tracked_recipe_tree.header().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.tracked_recipe_tree.header().setSectionResizeMode(
+            2, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.tracked_recipe_tree.itemChanged.connect(self._on_recipe_item_changed)
+        tracked_layout.addWidget(self.tracked_recipe_tree, 1)
+        tracked_actions = QHBoxLayout()
+        delete_selected_button = QPushButton("删除选中的关注配方")
+        delete_selected_button.clicked.connect(self._delete_selected_tracked_recipes)
+        clear_button = QPushButton("清除全部关注")
+        clear_button.clicked.connect(self._clear_tracked_recipes)
+        tracked_actions.addStretch(1)
+        tracked_actions.addWidget(delete_selected_button)
+        tracked_actions.addWidget(clear_button)
+        tracked_layout.addLayout(tracked_actions)
+        self.recipe_tabs.addTab(tracked_page, "已关注总览")
+
+        layout.addWidget(self.recipe_tabs, 1)
+        self._update_recipe_color_preview()
         self._populate_recipe_tree()
         return panel
 
@@ -769,86 +873,282 @@ class MainWindow(QMainWindow):
         return {str(item) for item in value if str(item)}
 
     def _populate_recipe_tree(self, _search_text: str = "") -> None:
-        if not hasattr(self, "recipe_tree"):
+        if not hasattr(self, "recipe_category_tree"):
+            return
+        self._populate_recipe_category_tree()
+        self._populate_recipe_results()
+        self._populate_tracked_recipe_overview()
+
+    def _populate_recipe_category_tree(self) -> None:
+        if not hasattr(self, "recipe_category_tree"):
             return
         self._recipe_tree_loading = True
-        self.recipe_tree.blockSignals(True)
+        self.recipe_category_tree.blockSignals(True)
         try:
-            self.recipe_tree.clear()
+            self.recipe_category_tree.clear()
             if self.recipe_catalog is None or not self.recipe_catalog.available:
                 message = self._recipe_data_error or "本版本没有可用的本地配方数据。"
-                placeholder = QTreeWidgetItem([message, "", ""])
-                self.recipe_tree.addTopLevelItem(placeholder)
+                self.recipe_category_tree.addTopLevelItem(QTreeWidgetItem([message]))
                 self.recipe_summary_label.setText(message)
                 return
 
             mode = self.current_price_game_mode
-            query = (
-                self.recipe_search_field.text().strip().casefold()
-                if hasattr(self, "recipe_search_field")
-                else ""
-            )
-            all_records = self.recipe_catalog.records(mode)
-            mode_ids = {str(record.get("id") or "") for record in all_records}
-            records = all_records
-            if query:
-                records = [record for record in records if query in recipe_search_text(record)]
-            tracked = self._tracked_recipe_ids()
-            tracked_in_mode = tracked & mode_ids
-            roots: dict[str, QTreeWidgetItem] = {}
-            categories: dict[tuple[str, str], QTreeWidgetItem] = {}
-            sources: dict[tuple[str, str, str], QTreeWidgetItem] = {}
+            records = self.recipe_catalog.records(mode)
+            category_products: dict[str, set[str]] = {}
             for record in records:
-                kind = str(record.get("kind") or "barter")
-                root_label = "藏身处制作" if kind == "craft" else "商人兑换"
-                root = roots.get(kind)
-                if root is None:
-                    root = QTreeWidgetItem([root_label, "", ""])
-                    root.setExpanded(True)
-                    roots[kind] = root
-                    self.recipe_tree.addTopLevelItem(root)
-                category_name = str(record.get("category") or "其他")
-                category_key = (kind, category_name)
-                category = categories.get(category_key)
-                if category is None:
-                    category = QTreeWidgetItem([category_name, "", ""])
-                    categories[category_key] = category
-                    root.addChild(category)
-                source_name = str(record.get("source") or "未知来源")
-                level = int(record.get("level") or 0)
-                source_label = f"{source_name} Lv{level}"
-                source_key = (kind, category_name, source_label)
-                source = sources.get(source_key)
-                if source is None:
-                    source = QTreeWidgetItem([source_label, "", ""])
-                    sources[source_key] = source
-                    category.addChild(source)
-                leaf = QTreeWidgetItem(
+                product = record.get("product")
+                product_id = (
+                    str(product.get("id") or record.get("id") or "")
+                    if isinstance(product, dict)
+                    else str(record.get("id") or "")
+                )
+                path = self.recipe_catalog.category_path(record)
+                if not path:
+                    category_products.setdefault("__uncategorized__", set()).add(
+                        product_id
+                    )
+                for category in path:
+                    category_id = category["id"]
+                    category_products.setdefault(category_id, set()).add(product_id)
+            counts = {
+                category_id: len(product_ids)
+                for category_id, product_ids in category_products.items()
+            }
+            all_product_count = len(
+                {
+                    str((record.get("product") or {}).get("id") or record.get("id") or "")
+                    for record in records
+                    if isinstance(record.get("product"), dict)
+                }
+            )
+
+            all_item = QTreeWidgetItem(
+                [f"全部产物 ({all_product_count}) · 配方 {len(records)}"]
+            )
+            all_item.setData(0, Qt.ItemDataRole.UserRole, "__all__")
+            self.recipe_category_tree.addTopLevelItem(all_item)
+            item_by_id: dict[str, QTreeWidgetItem] = {}
+
+            def add_category(category_id: str) -> QTreeWidgetItem:
+                existing = item_by_id.get(category_id)
+                if existing is not None:
+                    return existing
+                definition = self.recipe_catalog.handbook_categories.get(category_id, {})
+                item = QTreeWidgetItem(
+                    [f"{definition.get('name') or category_id} ({counts[category_id]})"]
+                )
+                item.setData(0, Qt.ItemDataRole.UserRole, category_id)
+                item_by_id[category_id] = item
+                parent_id = str(definition.get("parent") or "")
+                if parent_id and parent_id in counts:
+                    add_category(parent_id).addChild(item)
+                else:
+                    self.recipe_category_tree.addTopLevelItem(item)
+                return item
+
+            def category_sort_key(category_id: str) -> tuple[object, ...]:
+                path: list[tuple[str, str]] = []
+                current = category_id
+                seen: set[str] = set()
+                while current and current not in seen:
+                    seen.add(current)
+                    definition = self.recipe_catalog.handbook_categories.get(current, {})
+                    path.append(
+                        (
+                            str(definition.get("normalized_name") or ""),
+                            str(definition.get("name") or current).casefold(),
+                        )
+                    )
+                    current = str(definition.get("parent") or "")
+                path.reverse()
+                root_normalized = path[0][0] if path else ""
+                return (
+                    HANDBOOK_ROOT_ORDER.get(root_normalized, 999),
+                    tuple(name for _normalized, name in path),
+                )
+
+            for category_id in sorted(counts, key=category_sort_key):
+                if category_id != "__uncategorized__":
+                    add_category(category_id)
+            if counts.get("__uncategorized__"):
+                uncategorized = QTreeWidgetItem(
+                    [f"未分类 ({counts['__uncategorized__']})"]
+                )
+                uncategorized.setData(
+                    0, Qt.ItemDataRole.UserRole, "__uncategorized__"
+                )
+                self.recipe_category_tree.addTopLevelItem(uncategorized)
+            self.recipe_category_tree.expandToDepth(0)
+            self.recipe_category_tree.setCurrentItem(all_item)
+        finally:
+            self.recipe_category_tree.blockSignals(False)
+            self._recipe_tree_loading = False
+
+    def _populate_recipe_results(self, _search_text: str = "") -> None:
+        if self._recipe_tree_loading or not hasattr(self, "recipe_result_tree"):
+            return
+        self._recipe_tree_loading = True
+        self.recipe_result_tree.blockSignals(True)
+        try:
+            self.recipe_result_tree.clear()
+            if self.recipe_catalog is None or not self.recipe_catalog.available:
+                return
+            mode = self.current_price_game_mode
+            records = self.recipe_catalog.records(mode)
+            query = self.recipe_search_field.text().strip().casefold()
+            selected = self.recipe_category_tree.currentItem()
+            category_id = (
+                str(selected.data(0, Qt.ItemDataRole.UserRole) or "__all__")
+                if selected is not None
+                else "__all__"
+            )
+            if category_id != "__all__":
+                if category_id == "__uncategorized__":
+                    records = [
+                        record
+                        for record in records
+                        if not self.recipe_catalog.category_path(record)
+                    ]
+                else:
+                    records = [
+                        record
+                        for record in records
+                        if category_id
+                        in {
+                            category["id"]
+                            for category in self.recipe_catalog.category_path(record)
+                        }
+                    ]
+            if query:
+                records = [
+                    record for record in records if query in recipe_search_text(record)
+                ]
+
+            tracked = self._tracked_recipe_ids()
+            products: dict[str, list[dict[str, object]]] = {}
+            for record in records:
+                product = record.get("product")
+                product_id = (
+                    str(product.get("id") or record.get("id") or "")
+                    if isinstance(product, dict)
+                    else str(record.get("id") or "")
+                )
+                products.setdefault(product_id, []).append(record)
+
+            for product_records in sorted(
+                products.values(),
+                key=lambda values: _recipe_product_name(values[0]).casefold(),
+            ):
+                product_item = QTreeWidgetItem(
                     [
-                        recipe_title(record),
-                        recipe_source_text(record),
-                        recipe_requirements_text(record),
+                        _recipe_product_name(product_records[0]),
+                        f"{len(product_records)} 个具体配方",
+                        "",
                     ]
                 )
-                leaf.setFlags(leaf.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                recipe_id = str(record.get("id") or "")
-                leaf.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
-                leaf.setCheckState(
-                    0,
-                    Qt.CheckState.Checked
-                    if recipe_id in tracked_in_mode
-                    else Qt.CheckState.Unchecked,
-                )
-                source.addChild(leaf)
-            self.recipe_tree.expandToDepth(1 if not query else 3)
+                self.recipe_result_tree.addTopLevelItem(product_item)
+                for record in product_records:
+                    recipe_id = str(record.get("id") or "")
+                    recipe_item = self._build_recipe_tree_item(
+                        record,
+                        checked=recipe_id in tracked,
+                    )
+                    product_item.addChild(recipe_item)
+                    if query:
+                        recipe_item.setExpanded(True)
+                if query:
+                    product_item.setExpanded(True)
+
             total = self.recipe_catalog.record_count(mode)
-            visible = len(records)
+            mode_ids = {
+                str(record.get("id") or "")
+                for record in self.recipe_catalog.records(mode)
+            }
             self.recipe_summary_label.setText(
-                f"{_game_mode_label(mode)}：共 {total} 个配方 · 当前显示 {visible} 个 · "
-                f"本模式已关注 {len(tracked_in_mode)} 个 · 全部模式 {len(tracked)} 个"
+                f"{_game_mode_label(mode)}：共 {total} 个配方 · 当前显示 "
+                f"{len(products)} 种产物 / {len(records)} 个配方 · "
+                f"本模式已关注 {len(tracked & mode_ids)} 个 · 全部模式 {len(tracked)} 个"
             )
         finally:
-            self.recipe_tree.blockSignals(False)
+            self.recipe_result_tree.blockSignals(False)
+            self._recipe_tree_loading = False
+
+    def _build_recipe_tree_item(
+        self,
+        record: dict[str, object],
+        *,
+        checked: bool,
+        mode_text: str = "",
+    ) -> QTreeWidgetItem:
+        kind_text = "藏身处制作" if record.get("kind") == "craft" else "商人兑换"
+        source_text = recipe_source_text(record)
+        if mode_text:
+            source_text = f"{mode_text} · {source_text}"
+        recipe_item = QTreeWidgetItem(
+            [kind_text, source_text, _recipe_product_count_text(record)]
+        )
+        recipe_item.setFlags(recipe_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        recipe_id = str(record.get("id") or "")
+        recipe_item.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
+        recipe_item.setCheckState(
+            0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        )
+        for name, conditions, count_text in recipe_requirement_rows(record):
+            requirement_item = QTreeWidgetItem([f"↳ {name}", conditions, count_text])
+            requirement_item.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
+            requirement_item.setForeground(0, QBrush(QColor("#AAB3BE")))
+            recipe_item.addChild(requirement_item)
+        return recipe_item
+
+    def _populate_tracked_recipe_overview(self) -> None:
+        if not hasattr(self, "tracked_recipe_tree"):
+            return
+        self._recipe_tree_loading = True
+        self.tracked_recipe_tree.blockSignals(True)
+        try:
+            self.tracked_recipe_tree.clear()
+            if self.recipe_catalog is None:
+                return
+            tracked = self._tracked_recipe_ids()
+            entries = self.recipe_catalog.tracked_records(tracked)
+            products: dict[str, list[tuple[dict[str, object], tuple[str, ...]]]] = {}
+            for record, modes in entries:
+                product = record.get("product")
+                product_id = (
+                    str(product.get("id") or record.get("id") or "")
+                    if isinstance(product, dict)
+                    else str(record.get("id") or "")
+                )
+                products.setdefault(product_id, []).append((record, modes))
+            for product_entries in sorted(
+                products.values(),
+                key=lambda values: _recipe_product_name(values[0][0]).casefold(),
+            ):
+                product_item = QTreeWidgetItem(
+                    [
+                        _recipe_product_name(product_entries[0][0]),
+                        f"{len(product_entries)} 个已关注配方",
+                        "",
+                    ]
+                )
+                self.tracked_recipe_tree.addTopLevelItem(product_item)
+                for record, modes in product_entries:
+                    mode_text = "/".join(_game_mode_label(mode) for mode in modes)
+                    recipe_item = self._build_recipe_tree_item(
+                        record,
+                        checked=True,
+                        mode_text=mode_text,
+                    )
+                    product_item.addChild(recipe_item)
+            if entries:
+                self.tracked_recipe_tree.expandToDepth(1)
+            else:
+                self.tracked_recipe_tree.addTopLevelItem(
+                    QTreeWidgetItem(["还没有关注任何配方。", "", ""])
+                )
+            self.recipe_tabs.setTabText(1, f"已关注总览 ({len(entries)})")
+        finally:
+            self.tracked_recipe_tree.blockSignals(False)
             self._recipe_tree_loading = False
 
     def _on_recipe_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
@@ -865,6 +1165,11 @@ class MainWindow(QMainWindow):
         self.settings_store.set("tracked_recipe_ids", sorted(tracked))
         self._config_save_timer.start(250)
         self._update_recipe_summary_only()
+        QTimer.singleShot(0, self._refresh_recipe_views)
+
+    def _refresh_recipe_views(self) -> None:
+        self._populate_recipe_results()
+        self._populate_tracked_recipe_overview()
 
     def _update_recipe_summary_only(self) -> None:
         if not hasattr(self, "recipe_summary_label") or self.recipe_catalog is None:
@@ -879,6 +1184,28 @@ class MainWindow(QMainWindow):
             f"{_game_mode_label(self.current_price_game_mode)}：共 {total} 个配方 · "
             f"本模式已关注 {len(tracked & mode_ids)} 个 · 全部模式 {len(tracked)} 个"
         )
+
+    def _delete_selected_tracked_recipes(self) -> None:
+        selected_ids: set[str] = set()
+
+        def collect_recipe_ids(item: QTreeWidgetItem) -> None:
+            recipe_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+            if recipe_id:
+                selected_ids.add(recipe_id)
+            for child_index in range(item.childCount()):
+                collect_recipe_ids(item.child(child_index))
+
+        for item in self.tracked_recipe_tree.selectedItems():
+            collect_recipe_ids(item)
+        if not selected_ids:
+            return
+        tracked = self._tracked_recipe_ids() - selected_ids
+        self.settings_store.set("tracked_recipe_ids", sorted(tracked))
+        self._config_save_timer.start(250)
+        self._populate_recipe_results()
+        self._populate_tracked_recipe_overview()
+        self._update_recipe_summary_only()
+        self._log_event(f"已删除 {len(selected_ids)} 个关注配方。")
 
     def _clear_tracked_recipes(self) -> None:
         if not self._tracked_recipe_ids():
@@ -896,6 +1223,39 @@ class MainWindow(QMainWindow):
         self._config_save_timer.start(250)
         self._populate_recipe_tree()
         self._log_event("已清除全部关注配方。")
+
+    def _recipe_overlay_color(self) -> str:
+        color = QColor(
+            str(self.config.get("recipe_overlay_accent_color", "#E8C47A"))
+        )
+        return color.name().upper() if color.isValid() else "#E8C47A"
+
+    def _choose_recipe_overlay_color(self) -> None:
+        color = QColorDialog.getColor(
+            QColor(self._recipe_overlay_color()),
+            self,
+            "选择关注配方提示边框颜色",
+        )
+        if not color.isValid():
+            return
+        self.settings_store.set("recipe_overlay_accent_color", color.name().upper())
+        self._config_save_timer.start(250)
+        self._update_recipe_color_preview()
+
+    def _reset_recipe_overlay_color(self) -> None:
+        self.settings_store.set("recipe_overlay_accent_color", "#E8C47A")
+        self._config_save_timer.start(250)
+        self._update_recipe_color_preview()
+
+    def _update_recipe_color_preview(self) -> None:
+        if not hasattr(self, "recipe_color_swatch"):
+            return
+        color = self._recipe_overlay_color()
+        self.recipe_color_swatch.setStyleSheet(
+            f"background:{color}; border:1px solid rgba(255,255,255,90); "
+            "border-radius:4px;"
+        )
+        self.recipe_color_label.setText(color)
 
     def _build_display_filter_panel(self) -> QWidget:
         panel = QWidget()
@@ -1742,7 +2102,7 @@ class MainWindow(QMainWindow):
                 self.price_mode_combo.setCurrentIndex(max(0, index))
         self._update_cache_status_label()
         self._refresh_item_completer()
-        if hasattr(self, "recipe_tree"):
+        if hasattr(self, "recipe_category_tree"):
             self._populate_recipe_tree()
         self.raid_control_overlay.status_label.setText(self._raid_status_text())
         if changed:
@@ -1835,7 +2195,7 @@ class MainWindow(QMainWindow):
         save_config(self.config)
         self._update_cache_status_label()
         self._refresh_item_completer()
-        if hasattr(self, "recipe_tree"):
+        if hasattr(self, "recipe_category_tree"):
             self._populate_recipe_tree()
         self._sync_raid_control_overlay()
         self._log(f"Price mode set manually: {_game_mode_label(self.current_price_game_mode)}.")
@@ -2729,7 +3089,7 @@ class MainWindow(QMainWindow):
             if self._feature_enabled("hideout") and self.hideout_tracker is not None
             else []
         )
-        recipe_lines = self._tracked_recipe_requirement_lines(price)
+        recipe_notices = self._tracked_recipe_requirement_notices(price)
         needs_history = _is_high_volatility(price)
         view = _build_price_view(
             price,
@@ -2739,7 +3099,8 @@ class MainWindow(QMainWindow):
             firearm_color,
             firearm_accent,
             hideout_lines,
-            recipe_lines=recipe_lines,
+            recipe_notices=recipe_notices,
+            recipe_accent_color=self._recipe_overlay_color(),
             volatility_notice=needs_history,
             toast_key=price_key,
         )
@@ -2778,7 +3139,7 @@ class MainWindow(QMainWindow):
             if self._feature_enabled("hideout") and self.hideout_tracker is not None
             else []
         )
-        recipe_lines = self._tracked_recipe_requirement_lines(price)
+        recipe_notices = self._tracked_recipe_requirement_notices(price)
         enhanced = _build_price_view(
             price,
             display_language,
@@ -2787,7 +3148,8 @@ class MainWindow(QMainWindow):
             firearm_color,
             firearm_accent,
             hideout_lines,
-            recipe_lines=recipe_lines,
+            recipe_notices=recipe_notices,
+            recipe_accent_color=self._recipe_overlay_color(),
             history_summary=summary,
             toast_key=price_key,
         )
@@ -2810,14 +3172,14 @@ class MainWindow(QMainWindow):
             self.price_overlay.show_price(enhanced, seconds, replace_key=price_key)
             self.price_overlay.show_price(detail, seconds, replace_key=detail.toast_key)
 
-    def _tracked_recipe_requirement_lines(self, price: object) -> list[str]:
+    def _tracked_recipe_requirement_notices(self, price: object) -> list[RecipeNotice]:
         if (
             not self._feature_enabled("recipe_tracking")
             or self.recipe_catalog is None
             or not self.recipe_catalog.available
         ):
             return []
-        return self.recipe_catalog.tracked_requirement_lines(
+        return self.recipe_catalog.tracked_requirement_notices(
             str(getattr(price, "item_id", "")),
             self._tracked_recipe_ids(),
             str(getattr(price, "game_mode", self.current_price_game_mode)),
@@ -3656,7 +4018,9 @@ class SettingsDialog(QDialog):
         layout.addRow("右上控制窗透明度", self.raid_panel_opacity)
         layout.addRow("左下日志窗透明度", self.raid_log_opacity)
         layout.addRow("局内日志保留行数", self.raid_log_max_lines)
-        note = QLabel("控制窗会接收键盘和鼠标；日志窗不抢焦点并允许鼠标穿透。")
+        note = QLabel(
+            "控制窗会接收键盘和鼠标；日志窗显示时不主动抢焦点，点击后可滚动和拖动。"
+        )
         note.setWordWrap(True)
         layout.addRow(note)
         return tab
@@ -3919,6 +4283,8 @@ class PriceView:
     label_html: str
     log_text: str
     toast_key: str = ""
+    recipe_notices: tuple[RecipeNotice, ...] = ()
+    recipe_accent_color: str = "#E8C47A"
 
 
 @dataclass(frozen=True)
@@ -3929,6 +4295,24 @@ class ReminderView:
     accent_color: str = "#F2C14E"
 
 
+def _recipe_product_name(record: dict[str, object]) -> str:
+    product = record.get("product")
+    if not isinstance(product, dict):
+        return "未知产物"
+    return str(product.get("name") or product.get("short_name") or "未知产物")
+
+
+def _recipe_product_count_text(record: dict[str, object]) -> str:
+    product = record.get("product")
+    value = product.get("count") if isinstance(product, dict) else None
+    try:
+        count = float(value)
+    except (TypeError, ValueError):
+        return "产出 ×?"
+    count_text = f"{int(count):,}" if count.is_integer() else f"{count:,.2f}".rstrip("0").rstrip(".")
+    return f"产出 ×{count_text}"
+
+
 def _build_price_view(
     price: object,
     display_language: str,
@@ -3937,7 +4321,8 @@ def _build_price_view(
     firearm_color: str = "#00D1D1",
     firearm_accent: str = "#00D1D1",
     hideout_lines: list[str] | None = None,
-    recipe_lines: list[str] | None = None,
+    recipe_notices: list[RecipeNotice] | None = None,
+    recipe_accent_color: str = "#E8C47A",
     history_summary: object | None = None,
     volatility_notice: bool = False,
     toast_key: str = "",
@@ -4008,7 +4393,6 @@ def _build_price_view(
     detail = "\n".join(detail_lines)
 
     hideout_text = "；".join(hideout_lines or [])
-    recipe_text = "；".join(recipe_lines or [])
     display_detail = detail
     hideout_html = ""
     if hideout_text:
@@ -4018,13 +4402,21 @@ def _build_price_view(
             f"藏身处: {html.escape(hideout_text)}"
             f"</span>"
         )
+    safe_recipe_color = _safe_color(recipe_accent_color, "#E8C47A")
+    notices = tuple(recipe_notices or [])
     recipe_html = ""
-    if recipe_text:
-        display_detail = f"{display_detail}\n关注配方: {recipe_text}"
+    if notices:
+        notice_rows = "<br>".join(
+            f"<b>{html.escape(notice.product_text)}</b> · "
+            f"{html.escape(notice.source_text)} · "
+            f"{html.escape(notice.requirement_text)}"
+            for notice in notices
+        )
         recipe_html = (
-            f"<br><span style='color:#E8C47A;'>"
-            f"关注配方: {html.escape(recipe_text)}"
-            f"</span>"
+            f"<div style='margin-top:8px; padding:7px 9px; "
+            f"border:1px solid {safe_recipe_color}; border-radius:6px;'>"
+            f"<span style='color:{safe_recipe_color}; font-weight:800;'>"
+            f"关注配方用途</span><br>{notice_rows}</div>"
         )
     detail_html = "<br>".join(html.escape(line) for line in detail.splitlines())
     label_html = (
@@ -4042,8 +4434,11 @@ def _build_price_view(
         log_text = f"{log_text} | 疑似高波动物品，正在联网查询详细价格"
     if hideout_text:
         log_text = f"{log_text} | 藏身处 {hideout_text}"
-    if recipe_text:
-        log_text = f"{log_text} | 关注配方 {recipe_text}"
+    if notices:
+        log_text = (
+            f"{log_text} | 关注配方 "
+            + "；".join(notice.compact_text for notice in notices)
+        )
     return PriceView(
         title=title,
         subtitle="",
@@ -4056,6 +4451,8 @@ def _build_price_view(
         label_html=label_html,
         log_text=log_text,
         toast_key=toast_key,
+        recipe_notices=notices,
+        recipe_accent_color=safe_recipe_color,
     )
 
 def _display_item_name(price: object, display_language: str) -> str:
@@ -4293,8 +4690,8 @@ class PriceToast(QWidget):
 
         card = QWidget()
         card.setObjectName("priceToastCard")
-        card.setMinimumWidth(430)
-        card.setMaximumWidth(540)
+        card.setMinimumWidth(460)
+        card.setMaximumWidth(640)
         card_layout = QHBoxLayout(card)
         card_layout.setContentsMargins(0, 0, 0, 0)
         card_layout.setSpacing(0)
@@ -4321,10 +4718,36 @@ class PriceToast(QWidget):
         self._detail_label = QLabel()
         self._detail_label.setWordWrap(True)
 
+        self._recipe_box = QFrame()
+        self._recipe_box.setObjectName("recipeNoticeBox")
+        recipe_layout = QVBoxLayout(self._recipe_box)
+        recipe_layout.setContentsMargins(10, 8, 10, 9)
+        recipe_layout.setSpacing(5)
+        self._recipe_title_label = QLabel("关注配方用途")
+        self._recipe_content_label = QLabel()
+        self._recipe_content_label.setWordWrap(True)
+        self._recipe_content_label.setTextFormat(Qt.TextFormat.RichText)
+        self._recipe_scroll = QScrollArea()
+        self._recipe_scroll.setWidgetResizable(True)
+        self._recipe_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._recipe_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self._recipe_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._recipe_scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+        )
+        self._recipe_scroll.viewport().setAutoFillBackground(False)
+        self._recipe_scroll.setWidget(self._recipe_content_label)
+        recipe_layout.addWidget(self._recipe_title_label)
+        recipe_layout.addWidget(self._recipe_scroll)
+
         content_layout.addWidget(self._title_label)
         content_layout.addWidget(self._value_label)
         content_layout.addWidget(self._secondary_value_label)
         content_layout.addWidget(self._detail_label)
+        content_layout.addWidget(self._recipe_box)
         card_layout.addWidget(content, 1)
         outer.addWidget(card)
 
@@ -4356,6 +4779,35 @@ class PriceToast(QWidget):
         )
         self._detail_label.setText(view.detail)
         self._detail_label.setStyleSheet("font-size: 12px; color: rgba(245, 242, 232, 0.68);")
+        if view.recipe_notices:
+            color = _safe_color(view.recipe_accent_color, "#E8C47A")
+            self._recipe_box.setStyleSheet(
+                "QFrame#recipeNoticeBox {"
+                "background: rgba(8, 10, 13, 150);"
+                f"border: 1px solid {color};"
+                "border-radius: 6px;"
+                "}"
+            )
+            self._recipe_title_label.setStyleSheet(
+                f"font-size: 12px; font-weight: 800; color: {color};"
+            )
+            rows = "<br><br>".join(
+                f"<b>{html.escape(notice.product_text)}</b><br>"
+                f"<span style='color:#BFC3C8;'>"
+                f"{html.escape(notice.source_text)} · "
+                f"{html.escape(notice.requirement_text)}</span>"
+                for notice in view.recipe_notices
+            )
+            self._recipe_content_label.setText(rows)
+            self._recipe_content_label.setStyleSheet(
+                "font-size: 12px; color: rgba(245, 242, 232, 0.90);"
+            )
+            estimated_height = max(44, len(view.recipe_notices) * 44)
+            self._recipe_scroll.setFixedHeight(min(260, estimated_height))
+            self._recipe_box.show()
+        else:
+            self._recipe_content_label.clear()
+            self._recipe_box.hide()
         self.adjustSize()
 
     def show_for(self, seconds: int) -> None:

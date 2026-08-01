@@ -7,7 +7,9 @@
 - Changed Settings to open on the hotkey tab by default and moved low-frequency capture ROI/manual resolution controls into a collapsed advanced capture section.
 - Added a dark, translucent upper-right in-raid control panel (`F9`) for live price mode, display language, overlay timing, panel opacity, and Gamma adjustment.
 - Added a lower-left raid log (`F10`) that shows without proactively taking focus, then supports click, wheel/scrollbar history navigation, and title-bar dragging.
-- Added an optional offline recipe-tracking module with a searchable product-first craft/barter tree, checkable concrete recipes, and tracked-material notices in price results and raid overlays.
+- Added an optional offline recipe-tracking module using tarkov.dev's game-handbook category hierarchy, with a category browser and product → concrete recipe → per-material rows.
+- Added a tracked-recipe overview for unified untracking, multi-selection deletion, clearing, and recipe-notice accent-color customization.
+- Changed tracked-material price notices into a separately bordered nested section below the normal price content, listing every related product plus trader/station level and current-item quantity.
 - Bundled versioned PvE/PvP craft and trader-barter snapshots generated from tarkov.dev's static JSON endpoints; runtime recipe lookup is local-only.
 - Added a shared UI theme, settings store, and log event bus as the first stage of splitting the desktop shell away from the monolithic main-window implementation.
 - Removed the redundant extra daemon thread previously created for every global-hotkey press; Qt-bound actions now cross into the UI through signals directly.

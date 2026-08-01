@@ -14,8 +14,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from app.config import DEFAULT_CONFIG
-from app.gui import MainWindow, _build_price_view
-from app.recipes import RecipeCatalog, recipe_search_text
+from app.gui import MainWindow, PriceToast, _build_price_view
+from app.recipes import RecipeCatalog, RecipeNotice, recipe_search_text
 
 
 class _RecipeSmokeWindow(MainWindow):
@@ -31,6 +31,9 @@ class _RecipeSmokeWindow(MainWindow):
     def _apply_performance_settings(self) -> None:
         pass
 
+    def _save_config(self) -> None:
+        pass
+
 
 class RecipeCatalogTests(unittest.TestCase):
     @classmethod
@@ -44,10 +47,14 @@ class RecipeCatalogTests(unittest.TestCase):
         recipe = {
             "id": "craft-1",
             "kind": "craft",
-            "category": "弹药",
             "source": "工作台",
             "level": 2,
-            "product": {"id": "product", "name": "测试弹药", "count": 60},
+            "product": {
+                "id": "product",
+                "name": "测试弹药",
+                "count": 60,
+                "category_path": ["ammo", "rounds"],
+            },
             "requirements": [
                 {
                     "id": "powder",
@@ -62,9 +69,13 @@ class RecipeCatalogTests(unittest.TestCase):
         self.path.write_text(
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "generated_at": "2026-08-01T00:00:00Z",
                     "source": "test",
+                    "handbook_categories": {
+                        "ammo": {"name": "弹药", "parent": ""},
+                        "rounds": {"name": "子弹", "parent": "ammo"},
+                    },
                     "modes": {"regular": [recipe], "pve": []},
                 },
                 ensure_ascii=False,
@@ -81,7 +92,7 @@ class RecipeCatalogTests(unittest.TestCase):
 
         self.assertEqual(len(lines), 1)
         self.assertIn("测试弹药 ×60", lines[0])
-        self.assertIn("需此物品 ×2", lines[0])
+        self.assertIn("需当前物品 ×2", lines[0])
         self.assertIn("物品等级≥15", lines[0])
         self.assertIn("需可用状态", lines[0])
 
@@ -92,6 +103,9 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertIn("测试弹药", search_text)
         self.assertIn("工作台", search_text)
         self.assertIn("火药", search_text)
+
+        path = RecipeCatalog(self.path).category_path(record)
+        self.assertEqual([category["name"] for category in path], ["弹药", "子弹"])
 
     def test_recipe_notice_is_in_price_card_and_log(self) -> None:
         price = SimpleNamespace(
@@ -113,26 +127,74 @@ class RecipeCatalogTests(unittest.TestCase):
             "en",
             [],
             "slot",
-            recipe_lines=["测试弹药 ×60 · 制作 · 工作台 Lv2 · 需此物品 ×2"],
+            recipe_notices=[
+                RecipeNotice(
+                    recipe_id="craft-1",
+                    product_text="测试弹药 ×60",
+                    source_text="制作 · 工作台 Lv2",
+                    requirement_text="需当前物品 ×2",
+                )
+            ],
+            recipe_accent_color="#33AA77",
         )
 
-        self.assertIn("关注配方", view.detail)
+        self.assertEqual(len(view.recipe_notices), 1)
         self.assertIn("测试弹药", view.label_html)
+        self.assertIn("#33AA77", view.label_html)
         self.assertIn("关注配方", view.log_text)
+
+        toast = PriceToast(view)
+        self.assertFalse(toast._recipe_box.isHidden())
+        self.assertIn("测试弹药", toast._recipe_content_label.text())
+        self.assertIn("#33AA77", toast._recipe_box.styleSheet())
+        toast.close()
 
     def test_main_window_builds_bundled_recipe_tree(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)
         config["enabled_features"] = ["recipe_tracking"]
         config["feature_setup_complete"] = True
+        catalog = RecipeCatalog()
+        tracked_id = str(catalog.records("pve")[0]["id"])
+        config["tracked_recipe_ids"] = [tracked_id]
+        config["recipe_overlay_accent_color"] = "#3366AA"
         with patch("app.gui.load_config", return_value=config):
             window = _RecipeSmokeWindow()
 
         self.assertIsNotNone(window.recipe_catalog)
         self.assertEqual(window.recipe_catalog.record_count("pve"), 1020)
-        self.assertGreater(window.recipe_tree.topLevelItemCount(), 0)
+        self.assertGreater(window.recipe_category_tree.topLevelItemCount(), 0)
+        self.assertGreater(window.recipe_result_tree.topLevelItemCount(), 0)
+        self.assertGreater(window.tracked_recipe_tree.topLevelItemCount(), 0)
+        self.assertIn(
+            "交换用物品", window.recipe_category_tree.topLevelItem(1).text(0)
+        )
+        self.assertIn("已关注总览 (1)", window.recipe_tabs.tabText(1))
         self.assertIn("共 1020 个配方", window.recipe_summary_label.text())
+        self.assertEqual(window.recipe_color_label.text(), "#3366AA")
+        self.assertGreaterEqual(window.minimumWidth(), 1080)
+
+        requirement_rows = [
+            recipe_item.childCount()
+            for product_index in range(window.recipe_result_tree.topLevelItemCount())
+            for product_item in [window.recipe_result_tree.topLevelItem(product_index)]
+            for recipe_index in range(product_item.childCount())
+            for recipe_item in [product_item.child(recipe_index)]
+        ]
+        self.assertTrue(any(count > 0 for count in requirement_rows))
+
+        tracked_product = window.tracked_recipe_tree.topLevelItem(0)
+        tracked_product.child(0).setSelected(True)
+        window._delete_selected_tracked_recipes()
+        self.assertEqual(config["tracked_recipe_ids"], [])
         window.hide()
         window.deleteLater()
+
+    def test_bundled_snapshot_uses_game_handbook_paths(self) -> None:
+        catalog = RecipeCatalog()
+        records = catalog.records("regular")
+
+        self.assertGreaterEqual(len(catalog.handbook_categories), 80)
+        self.assertEqual(sum(bool(catalog.category_path(record)) for record in records), 1019)
 
 
 if __name__ == "__main__":

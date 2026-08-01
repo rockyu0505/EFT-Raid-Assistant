@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -15,11 +16,24 @@ class RecipeDataError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class RecipeNotice:
+    recipe_id: str
+    product_text: str
+    source_text: str
+    requirement_text: str
+
+    @property
+    def compact_text(self) -> str:
+        return f"{self.product_text} · {self.source_text} · {self.requirement_text}"
+
+
 class RecipeCatalog:
     def __init__(self, data_path: Path = RECIPE_DATA_PATH) -> None:
         self.data_path = data_path
         self.generated_at = ""
         self.source = ""
+        self.handbook_categories: dict[str, dict[str, Any]] = {}
         self._records: dict[str, list[dict[str, Any]]] = {
             mode: [] for mode in GAME_MODES
         }
@@ -46,6 +60,23 @@ class RecipeCatalog:
         *,
         max_lines: int = 4,
     ) -> list[str]:
+        notices = self.tracked_requirement_notices(
+            item_id,
+            tracked_recipe_ids,
+            game_mode,
+        )
+        lines = [notice.compact_text for notice in notices[:max_lines]]
+        remaining = len(notices) - len(lines)
+        if remaining > 0:
+            lines.append(f"另有 {remaining} 个已关注配方也需要此物品")
+        return lines
+
+    def tracked_requirement_notices(
+        self,
+        item_id: str,
+        tracked_recipe_ids: Iterable[str],
+        game_mode: str,
+    ) -> list[RecipeNotice]:
         tracked = {str(value) for value in tracked_recipe_ids if str(value)}
         if not item_id or not tracked:
             return []
@@ -54,11 +85,47 @@ class RecipeCatalog:
             for record in self._requirements.get(_mode(game_mode), {}).get(item_id, [])
             if str(record.get("id")) in tracked
         ]
-        lines = [requirement_line(record, item_id) for record in matches[:max_lines]]
-        remaining = len(matches) - len(lines)
-        if remaining > 0:
-            lines.append(f"另有 {remaining} 个已关注配方也需要此物品")
-        return lines
+        return [recipe_notice(record, item_id) for record in matches]
+
+    def tracked_records(
+        self, tracked_recipe_ids: Iterable[str]
+    ) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
+        tracked = {str(value) for value in tracked_recipe_ids if str(value)}
+        found: dict[str, tuple[dict[str, Any], list[str]]] = {}
+        for mode in GAME_MODES:
+            for record in self._records[mode]:
+                recipe_id = str(record.get("id") or "")
+                if recipe_id not in tracked:
+                    continue
+                if recipe_id not in found:
+                    found[recipe_id] = (record, [mode])
+                else:
+                    found[recipe_id][1].append(mode)
+        return [
+            (record, tuple(modes))
+            for record, modes in sorted(
+                found.values(),
+                key=lambda value: recipe_search_text(value[0]),
+            )
+        ]
+
+    def category_path(self, record: dict[str, Any]) -> list[dict[str, str]]:
+        product = record.get("product")
+        raw_path = product.get("category_path") if isinstance(product, dict) else None
+        path: list[dict[str, str]] = []
+        for category_id in raw_path if isinstance(raw_path, list) else []:
+            identifier = str(category_id)
+            category = self.handbook_categories.get(identifier)
+            if category is None:
+                continue
+            path.append(
+                {
+                    "id": identifier,
+                    "name": str(category.get("name") or identifier),
+                    "parent": str(category.get("parent") or ""),
+                }
+            )
+        return path
 
     def _load(self) -> None:
         if not self.data_path.exists():
@@ -67,13 +134,23 @@ class RecipeCatalog:
             document = json.loads(self.data_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RecipeDataError(f"本地配方数据无法读取：{exc}") from exc
-        if not isinstance(document, dict) or int(document.get("schema_version", 0)) != 1:
+        if not isinstance(document, dict) or int(document.get("schema_version", 0)) not in {
+            1,
+            2,
+        }:
             raise RecipeDataError("本地配方数据版本不受支持。")
         modes = document.get("modes")
         if not isinstance(modes, dict):
             raise RecipeDataError("本地配方数据缺少 modes。")
         self.generated_at = str(document.get("generated_at") or "")
         self.source = str(document.get("source") or "")
+        raw_categories = document.get("handbook_categories")
+        if isinstance(raw_categories, dict):
+            self.handbook_categories = {
+                str(category_id): dict(value)
+                for category_id, value in raw_categories.items()
+                if isinstance(value, dict)
+            }
         for mode in GAME_MODES:
             value = modes.get(mode)
             records = (
@@ -149,6 +226,10 @@ def recipe_requirements_text(record: dict[str, Any], *, max_items: int = 5) -> s
 
 
 def requirement_line(record: dict[str, Any], item_id: str) -> str:
+    return recipe_notice(record, item_id).compact_text
+
+
+def recipe_notice(record: dict[str, Any], item_id: str) -> RecipeNotice:
     required_count: object = 0
     matched_requirement: dict[str, Any] = {}
     requirements = record.get("requirements")
@@ -161,10 +242,28 @@ def requirement_line(record: dict[str, Any], item_id: str) -> str:
     qualifier_text = "".join(
         f" · {qualifier}" for qualifier in _requirement_qualifiers(matched_requirement)
     )
-    return (
-        f"{recipe_title(record)} · {recipe_source_text(record)} · "
-        f"需此物品 ×{_format_count(required_count)}{qualifier_text}"
+    return RecipeNotice(
+        recipe_id=str(record.get("id") or ""),
+        product_text=recipe_title(record),
+        source_text=recipe_source_text(record),
+        requirement_text=(
+            f"需当前物品 ×{_format_count(required_count)}{qualifier_text}"
+        ),
     )
+
+
+def recipe_requirement_rows(record: dict[str, Any]) -> list[tuple[str, str, str]]:
+    requirements = record.get("requirements")
+    if not isinstance(requirements, list):
+        return []
+    rows: list[tuple[str, str, str]] = []
+    for item in requirements:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("short_name") or "未知物品")
+        conditions = "；".join(_requirement_qualifiers(item)) or "消耗材料"
+        rows.append((name, conditions, f"×{_format_count(item.get('count'))}"))
+    return rows
 
 
 def _requirement_qualifiers(item: dict[str, Any]) -> list[str]:

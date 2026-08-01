@@ -95,6 +95,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "raid_log_opacity": 72,
     "raid_log_max_lines": 200,
     "tracked_recipe_ids": [],
+    "recipe_overlay_accent_color": "#E8C47A",
     "sound_enabled": True,
     "popup_enabled": True,
     "performance_mode_enabled": True,
