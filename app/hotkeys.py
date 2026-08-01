@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import threading
 from collections.abc import Callable
 from contextlib import suppress
 
@@ -34,26 +33,54 @@ class HotkeyManager:
 
         bindings = {}
         if capture_hotkey.strip():
-            bindings[normalize_hotkey(capture_hotkey)] = _threaded(on_capture)
+            bindings[normalize_hotkey(capture_hotkey)] = _direct(on_capture)
         if schedule_hotkey.strip() and on_schedule is not None:
-            bindings[normalize_hotkey(schedule_hotkey)] = _threaded(on_schedule)
+            bindings[normalize_hotkey(schedule_hotkey)] = _direct(on_schedule)
         if item_lookup_hotkey.strip() and on_item_lookup is not None:
-            bindings[normalize_hotkey(item_lookup_hotkey)] = _threaded(on_item_lookup)
+            bindings[normalize_hotkey(item_lookup_hotkey)] = _direct(on_item_lookup)
         if hideout_scan_hotkey.strip() and on_hideout_scan is not None:
-            bindings[normalize_hotkey(hideout_scan_hotkey)] = _threaded(on_hideout_scan)
+            bindings[normalize_hotkey(hideout_scan_hotkey)] = _direct(on_hideout_scan)
         if reminder_hold_hotkey.strip() and on_reminder_hold is not None:
-            bindings[normalize_hotkey(reminder_hold_hotkey)] = _threaded(on_reminder_hold)
+            bindings[normalize_hotkey(reminder_hold_hotkey)] = _direct(on_reminder_hold)
         if display_filter_restore_hotkey.strip() and on_display_filter_restore is not None:
-            bindings[normalize_hotkey(display_filter_restore_hotkey)] = _threaded(
+            bindings[normalize_hotkey(display_filter_restore_hotkey)] = _direct(
                 on_display_filter_restore
             )
         for hotkey, callback in extra_hotkeys or []:
             if hotkey.strip():
-                bindings[normalize_hotkey(hotkey)] = _threaded(callback)
+                bindings[normalize_hotkey(hotkey)] = _direct(callback)
         if not bindings:
             return
-        self._listener = keyboard.GlobalHotKeys(bindings)
-        self._listener.start()
+
+        parsed_bindings = [
+            (frozenset(keyboard.HotKey.parse(hotkey)), callback)
+            for hotkey, callback in bindings.items()
+        ]
+        pressed: set[object] = set()
+        activated: set[int] = set()
+        listener: object
+
+        def on_press(key: object) -> None:
+            canonical = listener.canonical(key)  # type: ignore[attr-defined]
+            if canonical in pressed:
+                return
+            pressed.add(canonical)
+            current = frozenset(pressed)
+            for index, (required, callback) in enumerate(parsed_bindings):
+                if current == required and index not in activated:
+                    activated.add(index)
+                    callback()
+
+        def on_release(key: object) -> None:
+            canonical = listener.canonical(key)  # type: ignore[attr-defined]
+            pressed.discard(canonical)
+            for index, (required, _callback) in enumerate(parsed_bindings):
+                if not required.issubset(pressed):
+                    activated.discard(index)
+
+        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        self._listener = listener
+        listener.start()  # type: ignore[attr-defined]
 
     def unregister(self, join_timeout: float = 1.0) -> None:
         if self._listener is None:
@@ -98,8 +125,8 @@ def normalize_hotkey(value: str) -> str:
     return "+".join(normalized)
 
 
-def _threaded(callback: Callable[[], None]) -> Callable[[], None]:
+def _direct(callback: Callable[[], None]) -> Callable[[], None]:
     def wrapped() -> None:
-        threading.Thread(target=callback, daemon=True).start()
+        callback()
 
     return wrapped

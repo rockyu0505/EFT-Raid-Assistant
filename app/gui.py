@@ -12,7 +12,15 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QEasingCurve, QPropertyAnimation, QTimer, Qt, Signal
+from PySide6.QtCore import (
+    QModelIndex,
+    QEasingCurve,
+    QPropertyAnimation,
+    QSignalBlocker,
+    QTimer,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QBrush,
@@ -97,6 +105,8 @@ from app.models import TRADERS, TraderReminder
 from app.ocr import OcrUnavailableError, run_ocr, timer_to_seconds
 from app.prices import CHINESE_ALIASES_PATH, PriceLookupError, TarkovPriceClient
 from app.reminders import ReminderManager
+from app.ui.raid_overlays import RaidControlOverlay, RaidLogOverlay
+from app.ui.state import LogBus, SettingsStore
 
 
 DISPLAY_FILTER_SLIDERS = {
@@ -112,6 +122,8 @@ HOTKEY_CONFIG_LABELS = [
     ("item_lookup_hotkey", "物品查价"),
     ("hideout_scan_hotkey", "识别藏身处"),
     ("reminder_hold_hotkey", "隐藏/显示补货提示"),
+    ("raid_panel_hotkey", "打开/关闭局内控制"),
+    ("raid_log_hotkey", "打开/关闭局内日志"),
     ("display_filter_restore_hotkey", "恢复 Gamma"),
 ]
 
@@ -218,6 +230,8 @@ class MainWindow(QMainWindow):
     item_lookup_requested = Signal()
     hideout_scan_requested = Signal()
     reminder_hold_requested = Signal()
+    raid_panel_toggle_requested = Signal()
+    raid_log_toggle_requested = Signal()
     display_filter_restore_requested = Signal()
     display_filter_preset_requested = Signal(str)
     price_result_ready = Signal(object, str)
@@ -233,6 +247,8 @@ class MainWindow(QMainWindow):
         self.resize(980, 720)
 
         self.config = load_config()
+        self.settings_store = SettingsStore(self.config, self)
+        self.log_bus = LogBus(self)
         self._first_run = not CONFIG_PATH.exists()
         self._runtime_enabled_features: set[str] = set()
         self._maybe_run_feature_setup()
@@ -254,6 +270,14 @@ class MainWindow(QMainWindow):
             else None
         )
         self.reminder_overlay = ReminderOverlay() if self._feature_enabled("trader_reminders") else None
+        self.raid_control_overlay = RaidControlOverlay()
+        self.raid_log_overlay = RaidLogOverlay(
+            max_lines=int(self.config.get("raid_log_max_lines", 200))
+        )
+        self.raid_log_overlay.set_opacity_percent(
+            int(self.config.get("raid_log_opacity", 72))
+        )
+        self.log_bus.line_ready.connect(self.raid_log_overlay.append_line)
         self._display_filter_baseline = None
         self._display_filter_index = -1
         self._display_filter_controls_loading = False
@@ -262,6 +286,9 @@ class MainWindow(QMainWindow):
         self._display_filter_eye_timer.timeout.connect(self._on_display_filter_eye_care_check)
         self._resource_cleanup_timer = QTimer(self)
         self._resource_cleanup_timer.timeout.connect(self._on_resource_cleanup_timer)
+        self._config_save_timer = QTimer(self)
+        self._config_save_timer.setSingleShot(True)
+        self._config_save_timer.timeout.connect(self._save_config)
         self._run_log_path = APP_DIR / "debug" / "latest_run.log"
         self._reset_run_log()
         self._cached_item_region: Region | None = None
@@ -291,6 +318,8 @@ class MainWindow(QMainWindow):
         self.item_lookup_requested.connect(self.capture_item_price)
         self.hideout_scan_requested.connect(self.capture_hideout_progress)
         self.reminder_hold_requested.connect(self.toggle_reminder_hold)
+        self.raid_panel_toggle_requested.connect(self.toggle_raid_control_overlay)
+        self.raid_log_toggle_requested.connect(self.toggle_raid_log_overlay)
         self.display_filter_restore_requested.connect(self.restore_display_filter)
         self.display_filter_preset_requested.connect(self.apply_display_filter_preset_by_name)
         self.price_result_ready.connect(self._on_price_result_ready)
@@ -299,12 +328,35 @@ class MainWindow(QMainWindow):
         self.price_history_json_failed.connect(self._on_price_history_json_failed)
         self.hideout_scan_ready.connect(self._on_hideout_scan_ready)
         self.hideout_cache_ready.connect(self._on_hideout_cache_ready)
+        self.raid_control_overlay.game_mode_changed.connect(
+            self._on_raid_game_mode_changed
+        )
+        self.raid_control_overlay.language_changed.connect(
+            lambda value: self._set_live_setting("item_display_language", value)
+        )
+        self.raid_control_overlay.price_duration_changed.connect(
+            lambda value: self._set_live_setting("price_overlay_seconds", value)
+        )
+        self.raid_control_overlay.feedback_duration_changed.connect(
+            lambda value: self._set_live_setting("feedback_overlay_seconds", value)
+        )
+        self.raid_control_overlay.panel_opacity_changed.connect(
+            lambda value: self._set_live_setting("raid_panel_opacity", value)
+        )
+        self.raid_control_overlay.gamma_values_changed.connect(
+            self._on_raid_gamma_values_changed
+        )
+        self.raid_control_overlay.gamma_restore_requested.connect(
+            lambda: self.restore_display_filter(show_feedback=False)
+        )
 
         self._build_ui()
+        self.log_bus.visible_line_ready.connect(self._append_main_log_line)
         self._build_tray_icon()
         self._refresh_item_completer()
         self._register_hotkeys()
         self._update_cache_status_label()
+        self._sync_raid_control_overlay()
         self._apply_performance_settings()
         if self._should_auto_refresh_price_cache():
             self.refresh_price_cache(background=True)
@@ -345,6 +397,8 @@ class MainWindow(QMainWindow):
             self.feedback_overlay.hide()
         if self.reminder_overlay is not None:
             self.reminder_overlay.hide()
+        self.raid_control_overlay.hide()
+        self.raid_log_overlay.hide()
         if self.tray_icon is not None:
             self.tray_icon.hide()
         self._join_workers(timeout=1.0)
@@ -433,11 +487,17 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         show_action = QAction("显示主窗口", self)
         show_action.triggered.connect(self.show_from_tray)
+        raid_control_action = QAction("打开/关闭局内控制", self)
+        raid_control_action.triggered.connect(self.toggle_raid_control_overlay)
+        raid_log_action = QAction("打开/关闭局内日志", self)
+        raid_log_action.triggered.connect(self.toggle_raid_log_overlay)
         settings_action = QAction("设置", self)
         settings_action.triggered.connect(self.open_settings)
         exit_action = QAction("退出", self)
         exit_action.triggered.connect(self.request_exit)
         menu.addAction(show_action)
+        menu.addAction(raid_control_action)
+        menu.addAction(raid_log_action)
         if self._feature_enabled("price_lookup"):
             price_action = QAction("立即查价", self)
             price_action.triggered.connect(lambda: self.item_lookup_requested.emit())
@@ -510,13 +570,26 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
-        sidebar.setFixedWidth(150)
+        sidebar.setObjectName("appSidebar")
+        sidebar.setFixedWidth(168)
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(10, 13, 10, 10)
         layout.setSpacing(8)
+
+        eyebrow = QLabel("EFT / RAID")
+        eyebrow.setObjectName("brandEyebrow")
+        title = QLabel("ASSISTANT")
+        title.setObjectName("brandTitle")
+        meta = QLabel("LOCAL OPS CONSOLE")
+        meta.setObjectName("brandMeta")
+        layout.addWidget(eyebrow)
+        layout.addWidget(title)
+        layout.addWidget(meta)
+        layout.addSpacing(10)
 
         for index, (title, _builder) in enumerate(self._panel_defs):
             button = QPushButton(title)
+            button.setObjectName("navButton")
             button.setCheckable(True)
             button.setMinimumHeight(38)
             button.clicked.connect(lambda checked=False, page=index: self._select_panel(page))
@@ -525,6 +598,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
 
         settings_button = QPushButton("设置")
+        settings_button.setObjectName("navButton")
         settings_button.setMinimumHeight(34)
         settings_button.clicked.connect(self.open_settings)
         layout.addWidget(settings_button)
@@ -1215,11 +1289,19 @@ class MainWindow(QMainWindow):
         reload_aliases_action.triggered.connect(self.reload_chinese_aliases)
         open_aliases_action = QAction("打开中文别名文件", self)
         open_aliases_action.triggered.connect(self.open_chinese_aliases)
+        raid_control_action = QAction("打开/关闭局内控制", self)
+        raid_control_action.triggered.connect(self.toggle_raid_control_overlay)
+        raid_log_action = QAction("打开/关闭局内日志", self)
+        raid_log_action.triggered.connect(self.toggle_raid_log_overlay)
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.request_exit)
 
         settings_menu = self.menuBar().addMenu("设置")
         settings_menu.addAction(settings_action)
+
+        raid_menu = self.menuBar().addMenu("局内")
+        raid_menu.addAction(raid_control_action)
+        raid_menu.addAction(raid_log_action)
 
         if self._feature_enabled("price_lookup"):
             data_menu = self.menuBar().addMenu("数据")
@@ -1384,6 +1466,65 @@ class MainWindow(QMainWindow):
             limit = 600
         self.log.document().setMaximumBlockCount(max(100, limit))
 
+    def _raid_status_text(self) -> str:
+        if self.price_client is None:
+            return "价格模块未启用 · 其他局内设置仍可使用"
+        return (
+            f"{_game_mode_label(self.current_price_game_mode)} · "
+            f"{self.price_client.cache_status()}"
+        )
+
+    def _sync_raid_control_overlay(self) -> None:
+        presets = self._display_filter_presets() if self._feature_enabled("display_filter") else []
+        self.raid_control_overlay.sync(self.config, presets, self._raid_status_text())
+
+    def toggle_raid_control_overlay(self) -> None:
+        if self._closing:
+            return
+        self._sync_raid_control_overlay()
+        visible = self.raid_control_overlay.toggle()
+        state = "打开" if visible else "关闭"
+        self._log_event(f"局内控制窗已{state}。")
+
+    def toggle_raid_log_overlay(self) -> None:
+        if self._closing:
+            return
+        visible = self.raid_log_overlay.toggle()
+        state = "打开" if visible else "关闭"
+        self._log_event(f"局内日志窗已{state}。")
+
+    def _set_live_setting(self, key: str, value: object) -> None:
+        if not self.settings_store.set(key, value):
+            return
+        self._config_save_timer.start(350)
+
+    def _on_raid_game_mode_changed(self, mode: str) -> None:
+        if mode not in {"pve", "regular"}:
+            return
+        changed = self.settings_store.set("price_game_mode_default", mode)
+        if self.price_client is not None:
+            self.current_price_game_mode = self.price_client.set_game_mode(mode)
+        else:
+            self.current_price_game_mode = mode
+        if hasattr(self, "price_mode_combo"):
+            with QSignalBlocker(self.price_mode_combo):
+                index = self.price_mode_combo.findData(self.current_price_game_mode)
+                self.price_mode_combo.setCurrentIndex(max(0, index))
+        self._update_cache_status_label()
+        self._refresh_item_completer()
+        self.raid_control_overlay.status_label.setText(self._raid_status_text())
+        if changed:
+            self._config_save_timer.start(350)
+            self._log_event(
+                f"局内价格模式已切换为 {_game_mode_label(self.current_price_game_mode)}。"
+            )
+
+    def _on_raid_gamma_values_changed(self, values: object) -> None:
+        if not isinstance(values, dict):
+            return
+        self._apply_display_filter_preset(values, notify=False)
+        self._config_save_timer.start(350)
+
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.config, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1400,6 +1541,9 @@ class MainWindow(QMainWindow):
         self._register_hotkeys()
         self._start_display_filter_eye_care_timer()
         self._apply_performance_settings()
+        self.raid_log_overlay.set_max_lines(int(self.config.get("raid_log_max_lines", 200)))
+        self.raid_log_overlay.set_opacity_percent(int(self.config.get("raid_log_opacity", 72)))
+        self._sync_raid_control_overlay()
         self._log("设置已更新。")
         if features_changed:
             self._log_event("功能开关已保存；主界面面板和模块热键会在重启后生效。")
@@ -1445,10 +1589,11 @@ class MainWindow(QMainWindow):
             return
         mode = self._selected_price_game_mode()
         self.current_price_game_mode = self.price_client.set_game_mode(mode)
-        self.config["price_game_mode_default"] = self.current_price_game_mode
+        self.settings_store.set("price_game_mode_default", self.current_price_game_mode)
         save_config(self.config)
         self._update_cache_status_label()
         self._refresh_item_completer()
+        self._sync_raid_control_overlay()
         self._log(f"Price mode set manually: {_game_mode_label(self.current_price_game_mode)}.")
 
     def _should_auto_refresh_price_cache(self) -> bool:
@@ -1469,6 +1614,16 @@ class MainWindow(QMainWindow):
         hideout_enabled = self._feature_enabled("hideout")
         filter_enabled = self._feature_enabled("display_filter")
         preset_hotkeys = self._display_filter_preset_hotkey_bindings() if filter_enabled else []
+        overlay_hotkeys = [
+            (
+                str(self.config.get("raid_panel_hotkey", "F9")),
+                lambda: self.raid_panel_toggle_requested.emit(),
+            ),
+            (
+                str(self.config.get("raid_log_hotkey", "F10")),
+                lambda: self.raid_log_toggle_requested.emit(),
+            ),
+        ]
         try:
             self.hotkeys.register(
                 capture_hotkey=str(self.config.get("capture_hotkey", "F8"))
@@ -1495,7 +1650,7 @@ class MainWindow(QMainWindow):
                 if filter_enabled
                 else "",
                 on_display_filter_restore=lambda: self.display_filter_restore_requested.emit(),
-                extra_hotkeys=preset_hotkeys,
+                extra_hotkeys=[*overlay_hotkeys, *preset_hotkeys],
             )
         except Exception as exc:
             self._log(f"热键注册失败：{exc}")
@@ -1506,6 +1661,8 @@ class MainWindow(QMainWindow):
             f"物品查价={self.config.get('item_lookup_hotkey', 'Q') if price_enabled else '关闭'}，"
             f"藏身处={self.config.get('hideout_scan_hotkey', 'F6') if hideout_enabled else '关闭'}，"
             f"隐藏/显示补货提示={self.config.get('reminder_hold_hotkey', 'F7') if trader_enabled else '关闭'}，"
+            f"局内控制={self.config.get('raid_panel_hotkey', 'F9')}，"
+            f"局内日志={self.config.get('raid_log_hotkey', 'F10')}，"
             f"Gamma预设={len(preset_hotkeys)} 个"
         )
 
@@ -1517,6 +1674,8 @@ class MainWindow(QMainWindow):
             self.config.get("item_lookup_hotkey", "") if self._feature_enabled("price_lookup") else "",
             self.config.get("hideout_scan_hotkey", "") if self._feature_enabled("hideout") else "",
             self.config.get("reminder_hold_hotkey", "") if self._feature_enabled("trader_reminders") else "",
+            self.config.get("raid_panel_hotkey", ""),
+            self.config.get("raid_log_hotkey", ""),
             self.config.get("display_filter_restore_hotkey", ""),
         ]:
             text = str(value).strip()
@@ -1790,6 +1949,8 @@ class MainWindow(QMainWindow):
         self.cache_status_label.setText(
             f"价格: {self.price_client.cache_status()} / 中文别名: {self.price_client.alias_status()}"
         )
+        if hasattr(self, "raid_control_overlay"):
+            self.raid_control_overlay.status_label.setText(self._raid_status_text())
 
     def capture_and_ocr(self) -> None:
         if self._closing or not self._feature_enabled("trader_reminders") or self.reminders is None:
@@ -2626,9 +2787,14 @@ class MainWindow(QMainWindow):
                 handle.write(line + "\n")
         except OSError:
             pass
-        if visible and hasattr(self, "log"):
-            self.log.append(line)
-            self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+        if hasattr(self, "log_bus"):
+            self.log_bus.publish(line, visible=visible)
+
+    def _append_main_log_line(self, line: str) -> None:
+        if not hasattr(self, "log"):
+            return
+        self.log.append(line)
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
 
     def _log_event(self, message: str) -> None:
         self._log(message, visible=True)
@@ -2974,6 +3140,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_features_tab(), "功能")
         tabs.addTab(self._build_reminders_tab(), "提醒")
         tabs.addTab(self._build_prices_tab(), "价格")
+        tabs.addTab(self._build_overlays_tab(), "局内界面")
         tabs.addTab(self._build_performance_tab(), "性能")
         tabs.addTab(self._build_capture_tab(), "截图")
         tabs.setCurrentIndex(0)
@@ -3132,11 +3299,15 @@ class SettingsDialog(QDialog):
         self.item_lookup_hotkey = self._make_hotkey_field("物品查价")
         self.hideout_scan_hotkey = self._make_hotkey_field("识别藏身处")
         self.reminder_hold_hotkey = self._make_hotkey_field("隐藏/显示补货提示")
+        self.raid_panel_hotkey = self._make_hotkey_field("打开/关闭局内控制")
+        self.raid_log_hotkey = self._make_hotkey_field("打开/关闭局内日志")
         self.display_filter_restore_hotkey = self._make_hotkey_field("恢复 Gamma")
         layout.addRow("识别倒计时", self.capture_hotkey)
         layout.addRow("物品查价", self.item_lookup_hotkey)
         layout.addRow("识别藏身处", self.hideout_scan_hotkey)
         layout.addRow("隐藏/显示补货提示", self.reminder_hold_hotkey)
+        layout.addRow("打开/关闭局内控制", self.raid_panel_hotkey)
+        layout.addRow("打开/关闭局内日志", self.raid_log_hotkey)
         layout.addRow("恢复 Gamma", self.display_filter_restore_hotkey)
         return tab
 
@@ -3206,6 +3377,25 @@ class SettingsDialog(QDialog):
         layout.addRow("操作反馈显示秒数", self.feedback_overlay_seconds)
         layout.addRow(self.sound_enabled)
         layout.addRow(self.popup_enabled)
+        return tab
+
+    def _build_overlays_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QFormLayout(tab)
+        self.raid_panel_opacity = QSpinBox()
+        self.raid_panel_opacity.setRange(55, 100)
+        self.raid_panel_opacity.setSuffix(" %")
+        self.raid_log_opacity = QSpinBox()
+        self.raid_log_opacity.setRange(45, 100)
+        self.raid_log_opacity.setSuffix(" %")
+        self.raid_log_max_lines = QSpinBox()
+        self.raid_log_max_lines.setRange(20, 2000)
+        layout.addRow("右上控制窗透明度", self.raid_panel_opacity)
+        layout.addRow("左下日志窗透明度", self.raid_log_opacity)
+        layout.addRow("局内日志保留行数", self.raid_log_max_lines)
+        note = QLabel("控制窗会接收键盘和鼠标；日志窗不抢焦点并允许鼠标穿透。")
+        note.setWordWrap(True)
+        layout.addRow(note)
         return tab
 
     def _build_performance_tab(self) -> QWidget:
@@ -3298,6 +3488,8 @@ class SettingsDialog(QDialog):
         self.item_lookup_hotkey.setText(str(self._config.get("item_lookup_hotkey", "Q")))
         self.hideout_scan_hotkey.setText(str(self._config.get("hideout_scan_hotkey", "F6")))
         self.reminder_hold_hotkey.setText(str(self._config.get("reminder_hold_hotkey", "F7")))
+        self.raid_panel_hotkey.setText(str(self._config.get("raid_panel_hotkey", "F9")))
+        self.raid_log_hotkey.setText(str(self._config.get("raid_log_hotkey", "F10")))
         self.display_filter_restore_hotkey.setText(
             str(self._config.get("display_filter_restore_hotkey", "Ctrl+F9"))
         )
@@ -3341,6 +3533,9 @@ class SettingsDialog(QDialog):
         self.feedback_overlay_seconds.setValue(int(self._config.get("feedback_overlay_seconds", 6)))
         self.sound_enabled.setChecked(bool(self._config.get("sound_enabled", True)))
         self.popup_enabled.setChecked(bool(self._config.get("popup_enabled", True)))
+        self.raid_panel_opacity.setValue(int(self._config.get("raid_panel_opacity", 84)))
+        self.raid_log_opacity.setValue(int(self._config.get("raid_log_opacity", 72)))
+        self.raid_log_max_lines.setValue(int(self._config.get("raid_log_max_lines", 200)))
         self.performance_mode_enabled.setChecked(
             bool(self._config.get("performance_mode_enabled", True))
         )
@@ -3366,6 +3561,8 @@ class SettingsDialog(QDialog):
             "item_lookup_hotkey": self.item_lookup_hotkey.text().strip(),
             "hideout_scan_hotkey": self.hideout_scan_hotkey.text().strip(),
             "reminder_hold_hotkey": self.reminder_hold_hotkey.text().strip(),
+            "raid_panel_hotkey": self.raid_panel_hotkey.text().strip(),
+            "raid_log_hotkey": self.raid_log_hotkey.text().strip(),
             "display_filter_restore_hotkey": self.display_filter_restore_hotkey.text().strip(),
             "display_filter_presets": self._config.get("display_filter_presets", []),
             "enabled_features": [
@@ -3403,6 +3600,9 @@ class SettingsDialog(QDialog):
             "feedback_overlay_seconds": self.feedback_overlay_seconds.value(),
             "sound_enabled": self.sound_enabled.isChecked(),
             "popup_enabled": self.popup_enabled.isChecked(),
+            "raid_panel_opacity": self.raid_panel_opacity.value(),
+            "raid_log_opacity": self.raid_log_opacity.value(),
+            "raid_log_max_lines": self.raid_log_max_lines.value(),
             "performance_mode_enabled": self.performance_mode_enabled.isChecked(),
             "performance_gc_after_worker": self.performance_gc_after_worker.isChecked(),
             "performance_skip_auto_price_refresh": (

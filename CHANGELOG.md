@@ -5,6 +5,10 @@
 - Added a first-run feature setup dialog and Settings feature toggles so users can enable only the panels they need; changes take effect after restart.
 - Changed feature toggles to be hard module gates: disabled modules do not create their runtime managers, register hotkeys, start background refreshes, or apply display filters.
 - Changed Settings to open on the hotkey tab by default and moved low-frequency capture ROI/manual resolution controls into a collapsed advanced capture section.
+- Added a dark, translucent upper-right in-raid control panel (`F9`) for live price mode, display language, overlay timing, panel opacity, and Gamma adjustment.
+- Added a non-focus, mouse-through lower-left raid log (`F10`) with configurable opacity and retained-line count.
+- Added a shared UI theme, settings store, and log event bus as the first stage of splitting the desktop shell away from the monolithic main-window implementation.
+- Removed the redundant extra daemon thread previously created for every global-hotkey press; Qt-bound actions now cross into the UI through signals directly.
 - Added an initial Windows Gamma Ramp display-filter prototype with selectable presets, per-preset hotkeys, a restore hotkey, and restore-on-exit protection.
 - Added Gamma tuning sliders, curve preview, named preset save/delete, and a mouse-interactive always-on-top tuning window for in-game live adjustment.
 - Added explicit Gamma preset creation from the current slider values in both the main panel and the in-game tuning window.
