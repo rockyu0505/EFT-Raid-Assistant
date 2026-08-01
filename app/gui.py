@@ -851,16 +851,21 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _configure_recipe_detail_tree(tree: QTreeWidget, first_header: str) -> None:
-        tree.setHeaderLabels([first_header, "工具", "数量", "耗时 / 限购", "备注"])
+        tree.setHeaderLabels(
+            [first_header, "工具", "数量", "耗时 / 限购", "任务依赖"]
+        )
         tree.setAlternatingRowColors(True)
         tree.setUniformRowHeights(True)
         tree.header().setStretchLastSection(False)
-        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        tree.header().setMinimumSectionSize(42)
+        for column in range(tree.columnCount()):
+            tree.header().setSectionResizeMode(
+                column, QHeaderView.ResizeMode.Interactive
+            )
+        tree.setColumnWidth(0, 430)
         tree.setColumnWidth(1, 58)
+        tree.setColumnWidth(2, 80)
+        tree.setColumnWidth(3, 115)
         tree.setColumnWidth(4, 260)
         tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
         tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)

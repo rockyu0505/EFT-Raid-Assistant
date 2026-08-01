@@ -241,12 +241,12 @@ def recipe_unlock_note(record: dict[str, Any], display_language: str) -> str:
         return ""
     task = record.get("unlock_task")
     if not isinstance(task, dict):
-        return "完成对应任务后解锁"
+        return "对应任务"
     name_en = str(task.get("name_en") or task.get("id") or "未知任务")
     name_zh = str(task.get("name_zh") or "")
     task_name = name_en if display_language.casefold() == "en" else name_zh or name_en
     trader = str(task.get("trader") or "Unknown trader")
-    return f"完成 {trader} 的“{task_name}”任务后解锁"
+    return f"{trader} · {task_name}"
 
 
 def recipe_requirements_text(record: dict[str, Any], *, max_items: int = 5) -> str:

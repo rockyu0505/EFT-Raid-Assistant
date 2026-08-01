@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QHeaderView
 
 from app.config import DEFAULT_CONFIG
 from app.gui import MainWindow, PriceToast, SettingsDialog, _build_price_view
@@ -131,16 +131,16 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertEqual(recipe_acquisition_text(record), "01:01:01")
         self.assertEqual(
             recipe_unlock_note(record, "zh"),
-            "完成 Mechanic 的“试驾”任务后解锁",
+            "Mechanic · 试驾",
         )
         self.assertEqual(
             recipe_unlock_note(record, "en"),
-            "完成 Mechanic 的“Test Drive”任务后解锁",
+            "Mechanic · Test Drive",
         )
         record["unlock_task"]["name_zh"] = ""
         self.assertEqual(
             recipe_unlock_note(record, "zh"),
-            "完成 Mechanic 的“Test Drive”任务后解锁",
+            "Mechanic · Test Drive",
         )
         self.assertEqual(
             recipe_acquisition_text({"kind": "barter", "buy_limit": 3}),
@@ -218,7 +218,15 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertGreaterEqual(window.minimumWidth(), 1080)
         self.assertEqual(window.recipe_result_tree.headerItem().text(1), "工具")
         self.assertEqual(window.recipe_result_tree.headerItem().text(3), "耗时 / 限购")
-        self.assertEqual(window.recipe_result_tree.headerItem().text(4), "备注")
+        self.assertEqual(window.recipe_result_tree.headerItem().text(4), "任务依赖")
+        for tree in (window.recipe_result_tree, window.tracked_recipe_tree):
+            self.assertTrue(
+                all(
+                    tree.header().sectionResizeMode(column)
+                    == QHeaderView.ResizeMode.Interactive
+                    for column in range(tree.columnCount())
+                )
+            )
 
         product_item = window.recipe_result_tree.topLevelItem(0)
         self.assertTrue(product_item.text(0).endswith(f"（{product_item.childCount()}）"))
@@ -264,11 +272,7 @@ class RecipeCatalogTests(unittest.TestCase):
             )
         )
         self.assertTrue(
-            any(
-                item.text(4).startswith("完成 ")
-                and item.text(4).endswith("任务后解锁")
-                for item in recipe_items
-            )
+            any(" · " in item.text(4) for item in recipe_items)
         )
         self.assertTrue(
             any(

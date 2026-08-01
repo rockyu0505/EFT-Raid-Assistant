@@ -2,6 +2,7 @@
 
 ## 0.6.0 - Unreleased
 
+- Renamed recipe notes to a compact task-dependency column and made every recipe tree column user-resizable.
 - Added a first-run feature setup dialog and Settings feature toggles so users can enable only the panels they need; changes take effect after restart.
 - Changed feature toggles to be hard module gates: disabled modules do not create their runtime managers, register hotkeys, start background refreshes, or apply display filters.
 - Changed Settings to open on the hotkey tab by default and moved low-frequency capture ROI/manual resolution controls into a collapsed advanced capture section.
