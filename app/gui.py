@@ -790,19 +790,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.recipe_category_tree)
 
         self.recipe_result_tree = QTreeWidget()
-        self.recipe_result_tree.setHeaderLabels(
-            ["产物 / 配方 / 所需物品", "来源 / 条件", "数量"]
-        )
-        self.recipe_result_tree.setAlternatingRowColors(True)
-        self.recipe_result_tree.setUniformRowHeights(True)
-        self.recipe_result_tree.header().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self.recipe_result_tree.header().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.recipe_result_tree.header().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
+        self._configure_recipe_detail_tree(
+            self.recipe_result_tree,
+            "产物 / 配方 / 所需物品",
         )
         self.recipe_result_tree.itemChanged.connect(self._on_recipe_item_changed)
         splitter.addWidget(self.recipe_result_tree)
@@ -831,22 +821,12 @@ class MainWindow(QMainWindow):
         tracked_layout.addWidget(color_group)
 
         self.tracked_recipe_tree = QTreeWidget()
-        self.tracked_recipe_tree.setHeaderLabels(
-            ["已关注产物 / 配方 / 所需物品", "模式与来源", "数量"]
+        self._configure_recipe_detail_tree(
+            self.tracked_recipe_tree,
+            "已关注产物 / 配方 / 所需物品",
         )
-        self.tracked_recipe_tree.setAlternatingRowColors(True)
-        self.tracked_recipe_tree.setUniformRowHeights(True)
         self.tracked_recipe_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
-        )
-        self.tracked_recipe_tree.header().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self.tracked_recipe_tree.header().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.tracked_recipe_tree.header().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
         )
         self.tracked_recipe_tree.itemChanged.connect(self._on_recipe_item_changed)
         tracked_layout.addWidget(self.tracked_recipe_tree, 1)
@@ -865,6 +845,19 @@ class MainWindow(QMainWindow):
         self._update_recipe_color_preview()
         self._populate_recipe_tree()
         return panel
+
+    @staticmethod
+    def _configure_recipe_detail_tree(tree: QTreeWidget, first_header: str) -> None:
+        tree.setHeaderLabels([first_header, "工具", "数量"])
+        tree.setAlternatingRowColors(True)
+        tree.setUniformRowHeights(True)
+        tree.header().setStretchLastSection(False)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        tree.setColumnWidth(1, 58)
+        tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
+        tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
 
     def _tracked_recipe_ids(self) -> set[str]:
         value = self.config.get("tracked_recipe_ids", [])
@@ -1041,11 +1034,16 @@ class MainWindow(QMainWindow):
             ):
                 product_item = QTreeWidgetItem(
                     [
-                        _recipe_product_name(product_records[0]),
-                        f"{len(product_records)} 个具体配方",
+                        f"{_recipe_product_name(product_records[0])}"
+                        f"（{len(product_records)}）",
+                        "",
                         "",
                     ]
                 )
+                product_font = product_item.font(0)
+                product_font.setBold(True)
+                product_item.setFont(0, product_font)
+                product_item.setToolTip(0, f"{len(product_records)} 个具体配方")
                 self.recipe_result_tree.addTopLevelItem(product_item)
                 for record in product_records:
                     recipe_id = str(record.get("id") or "")
@@ -1080,23 +1078,37 @@ class MainWindow(QMainWindow):
         checked: bool,
         mode_text: str = "",
     ) -> QTreeWidgetItem:
-        kind_text = "藏身处制作" if record.get("kind") == "craft" else "商人兑换"
         source_text = recipe_source_text(record)
         if mode_text:
-            source_text = f"{mode_text} · {source_text}"
+            source_text = f"{source_text}（{mode_text}）"
         recipe_item = QTreeWidgetItem(
-            [kind_text, source_text, _recipe_product_count_text(record)]
+            [source_text, "", _recipe_product_count_text(record)]
         )
         recipe_item.setFlags(recipe_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        recipe_item.setForeground(2, QBrush(QColor("#E8C47A")))
+        recipe_item.setTextAlignment(
+            2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
         recipe_id = str(record.get("id") or "")
         recipe_item.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
         recipe_item.setCheckState(
             0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         )
-        for name, conditions, count_text in recipe_requirement_rows(record):
-            requirement_item = QTreeWidgetItem([f"↳ {name}", conditions, count_text])
+        for requirement in recipe_requirement_rows(record):
+            tool_text = "✓" if requirement.is_tool else ""
+            requirement_item = QTreeWidgetItem(
+                [requirement.display_name, tool_text, requirement.count_text]
+            )
             requirement_item.setData(0, Qt.ItemDataRole.UserRole, recipe_id)
             requirement_item.setForeground(0, QBrush(QColor("#AAB3BE")))
+            requirement_item.setForeground(1, QBrush(QColor("#82D9A0")))
+            requirement_item.setForeground(2, QBrush(QColor("#8FC7FF")))
+            requirement_item.setTextAlignment(
+                1, Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+            )
+            requirement_item.setTextAlignment(
+                2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
             recipe_item.addChild(requirement_item)
         return recipe_item
 
@@ -1126,10 +1138,17 @@ class MainWindow(QMainWindow):
             ):
                 product_item = QTreeWidgetItem(
                     [
-                        _recipe_product_name(product_entries[0][0]),
-                        f"{len(product_entries)} 个已关注配方",
+                        f"{_recipe_product_name(product_entries[0][0])}"
+                        f"（{len(product_entries)}）",
+                        "",
                         "",
                     ]
+                )
+                product_font = product_item.font(0)
+                product_font.setBold(True)
+                product_item.setFont(0, product_font)
+                product_item.setToolTip(
+                    0, f"{len(product_entries)} 个已关注配方"
                 )
                 self.tracked_recipe_tree.addTopLevelItem(product_item)
                 for record, modes in product_entries:

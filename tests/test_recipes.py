@@ -15,7 +15,13 @@ from PySide6.QtWidgets import QApplication
 
 from app.config import DEFAULT_CONFIG
 from app.gui import MainWindow, PriceToast, _build_price_view
-from app.recipes import RecipeCatalog, RecipeNotice, recipe_search_text
+from app.recipes import (
+    RecipeCatalog,
+    RecipeNotice,
+    recipe_requirement_rows,
+    recipe_search_text,
+    recipe_source_text,
+)
 
 
 class _RecipeSmokeWindow(MainWindow):
@@ -60,7 +66,7 @@ class RecipeCatalogTests(unittest.TestCase):
                     "id": "powder",
                     "name": "火药",
                     "count": 2,
-                    "tool": False,
+                    "tool": True,
                     "min_level": 15,
                     "functional": True,
                 }
@@ -107,6 +113,12 @@ class RecipeCatalogTests(unittest.TestCase):
         path = RecipeCatalog(self.path).category_path(record)
         self.assertEqual([category["name"] for category in path], ["弹药", "子弹"])
 
+        self.assertEqual(recipe_source_text(record), "工作台 Lv2 制作")
+        requirement = recipe_requirement_rows(record)[0]
+        self.assertEqual(requirement.display_name, "火药（等级≥15；需可用）")
+        self.assertTrue(requirement.is_tool)
+        self.assertEqual(requirement.count_text, "×2")
+
     def test_recipe_notice_is_in_price_card_and_log(self) -> None:
         price = SimpleNamespace(
             game_mode="regular",
@@ -131,7 +143,7 @@ class RecipeCatalogTests(unittest.TestCase):
                 RecipeNotice(
                     recipe_id="craft-1",
                     product_text="测试弹药 ×60",
-                    source_text="制作 · 工作台 Lv2",
+                    source_text="工作台 Lv2 制作",
                     requirement_text="需当前物品 ×2",
                 )
             ],
@@ -172,15 +184,30 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertIn("共 1020 个配方", window.recipe_summary_label.text())
         self.assertEqual(window.recipe_color_label.text(), "#3366AA")
         self.assertGreaterEqual(window.minimumWidth(), 1080)
+        self.assertEqual(window.recipe_result_tree.headerItem().text(1), "工具")
 
-        requirement_rows = [
-            recipe_item.childCount()
+        product_item = window.recipe_result_tree.topLevelItem(0)
+        self.assertTrue(product_item.text(0).endswith(f"（{product_item.childCount()}）"))
+        recipe_item = product_item.child(0)
+        self.assertRegex(recipe_item.text(0), r"(制作|兑换)(（任务解锁）)?$")
+        self.assertEqual(recipe_item.text(1), "")
+        self.assertTrue(recipe_item.text(2).startswith("产出 ×"))
+        self.assertEqual(recipe_item.foreground(2).color().name(), "#e8c47a")
+        requirement_item = recipe_item.child(0)
+        self.assertIn(requirement_item.text(1), ("", "✓"))
+        self.assertEqual(requirement_item.foreground(2).color().name(), "#8fc7ff")
+
+        requirement_items = [
+            recipe_item.child(requirement_index)
             for product_index in range(window.recipe_result_tree.topLevelItemCount())
             for product_item in [window.recipe_result_tree.topLevelItem(product_index)]
             for recipe_index in range(product_item.childCount())
             for recipe_item in [product_item.child(recipe_index)]
+            for requirement_index in range(recipe_item.childCount())
         ]
-        self.assertTrue(any(count > 0 for count in requirement_rows))
+        self.assertTrue(requirement_items)
+        self.assertTrue(any(item.text(1) == "✓" for item in requirement_items))
+        self.assertTrue(any("（等级≥" in item.text(0) for item in requirement_items))
 
         tracked_product = window.tracked_recipe_tree.topLevelItem(0)
         tracked_product.child(0).setSelected(True)

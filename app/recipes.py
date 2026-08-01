@@ -28,6 +28,20 @@ class RecipeNotice:
         return f"{self.product_text} · {self.source_text} · {self.requirement_text}"
 
 
+@dataclass(frozen=True)
+class RecipeRequirementRow:
+    name: str
+    count_text: str
+    is_tool: bool
+    qualifiers: tuple[str, ...] = ()
+
+    @property
+    def display_name(self) -> str:
+        if not self.qualifiers:
+            return self.name
+        return f"{self.name}（{'；'.join(self.qualifiers)}）"
+
+
 class RecipeCatalog:
     def __init__(self, data_path: Path = RECIPE_DATA_PATH) -> None:
         self.data_path = data_path
@@ -200,11 +214,12 @@ def recipe_title(record: dict[str, Any]) -> str:
 
 
 def recipe_source_text(record: dict[str, Any]) -> str:
-    kind = "制作" if record.get("kind") == "craft" else "兑换"
+    action = "制作" if record.get("kind") == "craft" else "兑换"
     source = str(record.get("source") or "未知来源")
     level = int(record.get("level") or 0)
-    unlock = " · 任务解锁" if bool(record.get("task_unlock")) else ""
-    return f"{kind} · {source} Lv{level}{unlock}"
+    level_text = f" Lv{level}" if level > 0 else ""
+    unlock = "（任务解锁）" if bool(record.get("task_unlock")) else ""
+    return f"{source}{level_text} {action}{unlock}"
 
 
 def recipe_requirements_text(record: dict[str, Any], *, max_items: int = 5) -> str:
@@ -252,17 +267,32 @@ def recipe_notice(record: dict[str, Any], item_id: str) -> RecipeNotice:
     )
 
 
-def recipe_requirement_rows(record: dict[str, Any]) -> list[tuple[str, str, str]]:
+def recipe_requirement_rows(record: dict[str, Any]) -> list[RecipeRequirementRow]:
     requirements = record.get("requirements")
     if not isinstance(requirements, list):
         return []
-    rows: list[tuple[str, str, str]] = []
+    rows: list[RecipeRequirementRow] = []
     for item in requirements:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name") or item.get("short_name") or "未知物品")
-        conditions = "；".join(_requirement_qualifiers(item)) or "消耗材料"
-        rows.append((name, conditions, f"×{_format_count(item.get('count'))}"))
+        qualifiers: list[str] = []
+        try:
+            min_level = int(item.get("min_level") or 0)
+        except (TypeError, ValueError):
+            min_level = 0
+        if min_level > 0:
+            qualifiers.append(f"等级≥{min_level}")
+        if bool(item.get("functional")):
+            qualifiers.append("需可用")
+        rows.append(
+            RecipeRequirementRow(
+                name=name,
+                count_text=f"×{_format_count(item.get('count'))}",
+                is_tool=bool(item.get("tool")),
+                qualifiers=tuple(qualifiers),
+            )
+        )
     return rows
 
 
