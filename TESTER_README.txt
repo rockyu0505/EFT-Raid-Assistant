@@ -1,37 +1,48 @@
-EFT Raid Assistant test package
-================================
+EFT Raid Assistant 0.7.0-dev 测试清单
+====================================
 
-Quick start
------------
-1. Install Miniconda or Anaconda if conda is not installed.
-   Recommended Miniconda page:
-   https://docs.conda.io/en/latest/miniconda.html
+启动
+----
+1. 完整解压 zip，保留 EFT Raid Assistant.exe 与 _internal 文件夹。
+2. 双击 exe；无需安装 Python、Conda 或 OCR 环境。
+3. 首次启动默认只启用“局内查价”，其他标注 Beta 的模块可在“设置 → 功能”按需开启，保存后应立即出现或消失，无需重启。
 
-2. Double-click install_env.bat.
-   This creates or updates the conda environment named:
-   eft-raid-assistant
+核心查价
+--------
+1. Tarkov 中打开装备、背包或容器界面。
+2. 鼠标悬停物品，等待完整名称提示框出现。
+3. 按 Q；检查主窗口和右上价格浮窗是否显示对应的 PvE/PvP 本地价格。
+4. 在 F9 局内控制窗切换模式、语言和显示时长，确认立即生效。
 
-3. Double-click start_eft_raid_assistant.bat.
+本轮重点回归
+------------
+- 配方页与已关注总览的表头右侧、水平滚动条和右下角不应出现白色块。
+- 设置字体大小后，配方树字号和行距应同步按比例增长。
+- 每个配方列宽均可拖动；关闭再打开软件后仍应保留。
+- 主窗口底部日志可滚动、拖动分隔线调整高度并收起/展开。
+- F9 与 F10 浮窗可拖动；关闭再打开软件后应恢复上次位置。
+- 数据页应显示价格缓存是否过期、别名、配方、藏身处和最近错误状态。
+- “文件 → 导出诊断包”应生成 zip，且不影响原有配置和缓存。
+- 功能开关应立即增删面板与热键；关闭 Gamma 模块时若滤镜已开启，应先恢复原始画面。
 
-4. In Tarkov, wait until the item hover name box appears, then press N.
+默认热键
+--------
+Q       局内物品查价
+F6      识别藏身处升级材料（启用 Beta 模块后）
+F7      隐藏/显示补货提示（启用 Beta 模块后）
+F8      识别商人倒计时（启用 Beta 模块后）
+F9      打开/关闭局内控制窗
+F10     打开/关闭局内日志窗
+Ctrl+F9 恢复系统 Gamma（启用 Beta 模块后）
 
-What the installer does
------------------------
-- Creates or updates the conda environment from environment.yml.
-- Installs Python dependencies.
-- Installs RapidOCR and ONNX Runtime Python dependencies.
+反馈问题
+--------
+请优先发送由“文件 → 导出诊断包”生成的 zip，并说明：
+- Windows 版本与显示器数量/缩放比例。
+- Tarkov 分辨率与窗口模式。
+- PvE 或 PvP。
+- 操作步骤和预期结果。
 
-Useful hotkeys
---------------
-- N: item price lookup
-- F8: trader restock timer OCR
-- F10: schedule selected reminders
-
-Notes
------
-- The app only captures screenshots and runs OCR. It does not click, move the mouse,
-  read game memory, or interact with the game process.
-- If item lookup does nothing, make sure the Tarkov window is the foreground window.
-- If OCR is bad, send the files under debug/ together with the app log text.
-- Price caches are included for testing. Use Data > Refresh price cache in the app
-  if current prices look stale.
+安全边界
+--------
+本程序只做截图、OCR、本地缓存查询、浮窗和本地提醒；不会点击或移动鼠标、读取游戏内存、注入游戏进程或修改游戏文件。

@@ -25,6 +25,9 @@ QLabel#brandMeta {
     color: #6F7B89;
     font-size: 10px;
 }
+QLabel#dataErrorLabel {
+    color: #E8C47A;
+}
 QPushButton#navButton {
     min-height: 34px;
     padding-left: 13px;
@@ -116,6 +119,9 @@ QTableWidget, QTreeView {
     border-radius: 7px;
     selection-background-color: #344355;
 }
+QHeaderView {
+    background-color: #18212C;
+}
 QHeaderView::section {
     padding: 6px 8px;
     color: #C9D0DA;
@@ -158,10 +164,28 @@ QScrollBar:vertical {
     width: 9px;
     background: transparent;
 }
+QScrollBar:horizontal {
+    height: 9px;
+    background: transparent;
+}
 QScrollBar::handle:vertical {
     min-height: 28px;
     border-radius: 4px;
     background: #3C4857;
+}
+QScrollBar::handle:horizontal {
+    min-width: 28px;
+    border-radius: 4px;
+    background: #3C4857;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+    background: transparent;
+}
+QAbstractScrollArea::corner {
+    background-color: #0F151D;
+    border: none;
 }
 QToolTip {
     padding: 5px 7px;

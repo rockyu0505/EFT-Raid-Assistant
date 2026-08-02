@@ -5,10 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from app.config import APP_DIR
+from app.config import RESOURCE_DIR
 
 
-RECIPE_DATA_PATH = APP_DIR / "data" / "recipes.json"
+RECIPE_DATA_PATH = RESOURCE_DIR / "data" / "recipes.json"
 GAME_MODES = ("regular", "pve")
 
 

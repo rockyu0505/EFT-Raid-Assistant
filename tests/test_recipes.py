@@ -360,6 +360,50 @@ class RecipeCatalogTests(unittest.TestCase):
         window.deleteLater()
         apply_app_theme(self.app, int(DEFAULT_CONFIG["ui_font_size"]))
 
+    def test_feature_switch_rebuilds_main_ui_without_restart(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["enabled_features"] = ["price_lookup"]
+        config["feature_setup_complete"] = True
+        with patch("app.gui.load_config", return_value=config):
+            window = _RecipeSmokeWindow()
+
+        previous = window._enabled_features().copy()
+        config["enabled_features"] = ["recipe_tracking"]
+        window._apply_runtime_feature_configuration(previous)
+        self.app.processEvents()
+
+        self.assertIsNone(window.price_client)
+        self.assertIsNotNone(window.recipe_catalog)
+        self.assertTrue(hasattr(window, "recipe_category_tree"))
+        self.assertFalse(hasattr(window, "price_mode_combo"))
+        self.assertEqual(
+            [title for title, _builder in window._panel_defs],
+            ["数据", "关注配方"],
+        )
+        window.hide()
+        window.deleteLater()
+
+    def test_recipe_column_width_and_log_state_are_remembered(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["enabled_features"] = ["recipe_tracking"]
+        config["feature_setup_complete"] = True
+        config["recipe_result_column_widths"] = [520, 72, 96, 130, 300]
+        with patch("app.gui.load_config", return_value=config):
+            window = _RecipeSmokeWindow()
+
+        self.assertEqual(window.recipe_result_tree.columnWidth(0), 520)
+        window.recipe_result_tree.setColumnWidth(1, 92)
+        self.app.processEvents()
+        self.assertEqual(config["recipe_result_column_widths"][1], 92)
+
+        window._set_main_log_collapsed(True)
+        self.assertTrue(config["main_log_collapsed"])
+        self.assertFalse(window.log.isVisible())
+        window._set_main_log_collapsed(False)
+        self.assertFalse(config["main_log_collapsed"])
+        window.hide()
+        window.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -204,6 +204,37 @@ class JsonPriceClientTests(unittest.TestCase):
         fetch_json.assert_called_once()
         fetch_graphql.assert_not_called()
 
+    def test_frozen_seed_cache_is_loaded_when_writable_cache_is_missing(self) -> None:
+        root = Path(self.temporary_directory.name)
+        writable_cache = root / "portable" / "cache"
+        bundled_cache = root / "bundle" / "cache"
+        bundled_cache.mkdir(parents=True)
+        for mode in ("regular", "pve"):
+            (bundled_cache / f"tarkov_items_{mode}.json").write_text(
+                json.dumps(
+                    {
+                        "fetched_at": 1_786_000_000,
+                        "source": "seed",
+                        "game_mode": mode,
+                        "items": [{"id": f"seed-{mode}", "name": mode}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        with patch.object(prices, "CACHE_DIR", writable_cache), patch.object(
+            prices, "RESOURCE_CACHE_DIR", bundled_cache
+        ):
+            client = TarkovPriceClient(
+                cache_path=root / "missing-legacy.json",
+                aliases_path=root / "aliases.json",
+                minimum_item_count=1,
+            )
+
+        self.assertEqual(client._items_by_mode["regular"][0]["id"], "seed-regular")
+        self.assertEqual(client._items_by_mode["pve"][0]["id"], "seed-pve")
+        self.assertFalse(writable_cache.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

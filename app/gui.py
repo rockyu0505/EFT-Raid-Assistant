@@ -14,8 +14,10 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QModelIndex,
+    QPoint,
     QEasingCurve,
     QPropertyAnimation,
+    QRect,
     QSignalBlocker,
     QTimer,
     Qt,
@@ -43,6 +45,7 @@ from PySide6.QtWidgets import (
     QCompleter,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QFormLayout,
     QGraphicsOpacityEffect,
@@ -91,7 +94,7 @@ from app.capture import (
     resolve_capture_region,
     scale_metric,
 )
-from app.config import APP_DIR, load_config, save_config
+from app.config import APP_DIR, RESOURCE_DIR, load_config, save_config
 from app.config import CONFIG_PATH, DEFAULT_ENABLED_FEATURES, FEATURE_DEFINITIONS
 from app.display_filter import (
     DisplayFilterBaseline,
@@ -101,6 +104,7 @@ from app.display_filter import (
     start_display_filter,
     update_display_filter,
 )
+from app.diagnostics import create_diagnostic_bundle
 from app.hideout import HideoutDataError, HideoutTracker
 from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
 from app.hotkeys import HotkeyManager, normalize_hotkey
@@ -111,7 +115,7 @@ from app.item_ocr import (
 )
 from app.models import TRADERS, TraderReminder
 from app.ocr import OcrUnavailableError, run_ocr, timer_to_seconds
-from app.prices import CHINESE_ALIASES_PATH, PriceLookupError, TarkovPriceClient
+from app.prices import PriceLookupError, TarkovPriceClient, ensure_editable_aliases_path
 from app.reminders import ReminderManager
 from app.recipes import (
     RecipeCatalog,
@@ -284,10 +288,14 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("塔科夫局内助手")
+        self.config = load_config()
+        if os.environ.get("EFT_SMOKE_TEST") == "1":
+            self.config["feature_setup_complete"] = True
+            self.config["refresh_prices_on_startup"] = False
         self.resize(1520, 920)
         self.setMinimumSize(1160, 720)
+        self._restore_main_window_geometry()
 
-        self.config = load_config()
         self.settings_store = SettingsStore(self.config, self)
         self.log_bus = LogBus(self)
         self._first_run = not CONFIG_PATH.exists()
@@ -300,6 +308,7 @@ class MainWindow(QMainWindow):
         self.hideout_tracker = HideoutTracker() if self._feature_enabled("hideout") else None
         self.recipe_catalog: RecipeCatalog | None = None
         self._recipe_data_error = ""
+        self._last_data_error = ""
         if self._feature_enabled("recipe_tracking"):
             try:
                 self.recipe_catalog = RecipeCatalog()
@@ -324,6 +333,16 @@ class MainWindow(QMainWindow):
         )
         self.raid_log_overlay.set_opacity_percent(
             int(self.config.get("raid_log_opacity", 72))
+        )
+        self.raid_control_overlay.set_saved_position(
+            self.config.get("raid_panel_position")
+        )
+        self.raid_log_overlay.set_saved_position(self.config.get("raid_log_position"))
+        self.raid_control_overlay.position_changed.connect(
+            lambda x, y: self._set_live_setting("raid_panel_position", [x, y])
+        )
+        self.raid_log_overlay.position_changed.connect(
+            lambda x, y: self._set_live_setting("raid_log_position", [x, y])
         )
         self.log_bus.line_ready.connect(self.raid_log_overlay.append_line)
         self._display_filter_baseline: DisplayFilterBaseline | None = None
@@ -435,6 +454,7 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         self._closing = True
+        self._capture_main_window_geometry()
         if self._feature_enabled("display_filter") and bool(
             self.config.get("display_filter_restore_on_exit", True)
         ):
@@ -455,6 +475,39 @@ class MainWindow(QMainWindow):
             self.tray_icon.hide()
         self._join_workers(timeout=1.0)
         self._cleanup_memory()
+
+    def _restore_main_window_geometry(self) -> None:
+        value = self.config.get("main_window_geometry")
+        if not isinstance(value, list) or len(value) < 4:
+            return
+        try:
+            x, y, width, height = (int(value[index]) for index in range(4))
+        except (TypeError, ValueError):
+            return
+        width = max(self.minimumWidth(), width)
+        height = max(self.minimumHeight(), height)
+        candidate = QRect(x, y, width, height)
+        screens = QApplication.screens()
+        if screens and not any(
+            screen.availableGeometry().intersects(candidate) for screen in screens
+        ):
+            return
+        self.resize(width, height)
+        self.move(QPoint(x, y))
+        if len(value) >= 5 and bool(value[4]):
+            self.setWindowState(
+                self.windowState() | Qt.WindowState.WindowMaximized
+            )
+
+    def _capture_main_window_geometry(self) -> None:
+        geometry = self.normalGeometry() if self.isMaximized() else self.geometry()
+        self.config["main_window_geometry"] = [
+            geometry.x(),
+            geometry.y(),
+            geometry.width(),
+            geometry.height(),
+            self.isMaximized(),
+        ]
 
     def _configured_enabled_features(self) -> set[str]:
         value = self.config.get("enabled_features", DEFAULT_ENABLED_FEATURES)
@@ -478,7 +531,7 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.config.update(dialog.values())
         else:
-            self.config["enabled_features"] = ["price_lookup", "trader_reminders"]
+            self.config["enabled_features"] = DEFAULT_ENABLED_FEATURES.copy()
         self.config["feature_setup_complete"] = True
         save_config(self.config)
 
@@ -489,6 +542,8 @@ class MainWindow(QMainWindow):
         if self._feature_enabled("trader_reminders"):
             panels.append(("商人补货", self._build_trader_panel))
         if self._feature_enabled("price_lookup"):
+            panels.append(("数据", self._build_data_panel))
+        elif self._feature_enabled("hideout") or self._feature_enabled("recipe_tracking"):
             panels.append(("数据", self._build_data_panel))
         if self._feature_enabled("hideout"):
             panels.append(("藏身处", self._build_hideout_panel))
@@ -502,6 +557,12 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowIcon(_load_app_icon(self))
+        self.menuBar().clear()
+        self.panel_buttons.clear()
+        self.watch_checks.clear()
+        self.timer_fields.clear()
+        self.restock_items.clear()
+        self.status_items.clear()
         self._build_menu()
 
         root = QWidget()
@@ -521,15 +582,74 @@ class MainWindow(QMainWindow):
         self.panel_stack.setCurrentIndex(0)
         self._select_panel(0)
 
-        log_group = QGroupBox("运行日志")
-        log_layout = QVBoxLayout(log_group)
+        self.main_log_group = QGroupBox("运行日志")
+        log_layout = QVBoxLayout(self.main_log_group)
+        log_actions = QHBoxLayout()
+        log_actions.addStretch(1)
+        self.main_log_toggle_button = QPushButton("收起日志")
+        self.main_log_toggle_button.clicked.connect(
+            lambda: self._set_main_log_collapsed(
+                not bool(self.config.get("main_log_collapsed", False))
+            )
+        )
+        log_actions.addWidget(self.main_log_toggle_button)
+        log_layout.addLayout(log_actions)
         log_layout.addWidget(self._build_log_panel())
-        content_layout.addWidget(self.panel_stack, 1)
-        content_layout.addWidget(log_group)
+
+        self.main_content_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.main_content_splitter.setChildrenCollapsible(False)
+        self.main_content_splitter.addWidget(self.panel_stack)
+        self.main_content_splitter.addWidget(self.main_log_group)
+        self.main_content_splitter.setStretchFactor(0, 1)
+        self.main_content_splitter.setStretchFactor(1, 0)
+        self.main_content_splitter.splitterMoved.connect(
+            self._on_main_content_splitter_moved
+        )
+        log_height = max(100, _safe_int(self.config.get("main_log_height")) or 170)
+        self.main_content_splitter.setSizes(
+            [max(420, self.height() - log_height), log_height]
+        )
+        content_layout.addWidget(self.main_content_splitter, 1)
+        self._set_main_log_collapsed(
+            bool(self.config.get("main_log_collapsed", False)),
+            persist=False,
+        )
 
         layout.addWidget(sidebar)
         layout.addWidget(content, 1)
         self.setCentralWidget(root)
+
+    def _set_main_log_collapsed(
+        self, collapsed: bool, *, persist: bool = True
+    ) -> None:
+        if not hasattr(self, "main_log_group") or not hasattr(self, "log"):
+            return
+        collapsed = bool(collapsed)
+        if not collapsed and hasattr(self, "main_content_splitter"):
+            self.main_log_group.setMaximumHeight(16777215)
+            self.log.show()
+            height = max(100, _safe_int(self.config.get("main_log_height")) or 170)
+            total = max(self.main_content_splitter.height(), height + 420)
+            self.main_content_splitter.setSizes([max(420, total - height), height])
+        else:
+            self.log.hide()
+            self.main_log_group.setMaximumHeight(
+                self.main_log_toggle_button.sizeHint().height() + 46
+            )
+        self.main_log_toggle_button.setText("展开日志" if collapsed else "收起日志")
+        self.config["main_log_collapsed"] = collapsed
+        if persist:
+            self._config_save_timer.start(250)
+
+    def _on_main_content_splitter_moved(
+        self, _position: int, _index: int
+    ) -> None:
+        if bool(self.config.get("main_log_collapsed", False)):
+            return
+        sizes = self.main_content_splitter.sizes()
+        if len(sizes) >= 2 and sizes[1] > 0:
+            self.config["main_log_height"] = max(100, sizes[1])
+            self._config_save_timer.start(350)
 
     def _build_tray_icon(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -682,21 +802,48 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        actions = QGroupBox("数据")
+        status = QGroupBox("数据状态")
+        status_layout = QVBoxLayout(status)
+        self.data_status_label = QLabel("正在读取本地数据状态...")
+        self.data_status_label.setWordWrap(True)
+        self.data_error_label = QLabel("")
+        self.data_error_label.setObjectName("dataErrorLabel")
+        self.data_error_label.setWordWrap(True)
+        status_layout.addWidget(self.data_status_label)
+        status_layout.addWidget(self.data_error_label)
+
+        actions = QGroupBox("数据维护")
         actions_layout = QVBoxLayout(actions)
-        refresh_button = QPushButton("刷新价格缓存")
-        refresh_button.clicked.connect(lambda: self.refresh_price_cache(background=True))
-        reload_button = QPushButton("重新加载中文别名")
-        reload_button.clicked.connect(self.reload_chinese_aliases)
-        open_alias_button = QPushButton("打开中文别名文件")
-        open_alias_button.clicked.connect(self.open_chinese_aliases)
-        actions_layout.addWidget(refresh_button)
-        actions_layout.addWidget(reload_button)
-        actions_layout.addWidget(open_alias_button)
+        if self._feature_enabled("price_lookup"):
+            refresh_button = QPushButton("刷新价格缓存")
+            refresh_button.clicked.connect(
+                lambda: self.refresh_price_cache(background=True)
+            )
+            reload_button = QPushButton("重新加载中文别名")
+            reload_button.clicked.connect(self.reload_chinese_aliases)
+            open_alias_button = QPushButton("打开中文别名文件")
+            open_alias_button.clicked.connect(self.open_chinese_aliases)
+            actions_layout.addWidget(refresh_button)
+            actions_layout.addWidget(reload_button)
+            actions_layout.addWidget(open_alias_button)
+        if self._feature_enabled("hideout"):
+            refresh_hideout_button = QPushButton("刷新藏身处需求数据")
+            refresh_hideout_button.clicked.connect(
+                lambda: self.refresh_hideout_cache(background=True)
+            )
+            actions_layout.addWidget(refresh_hideout_button)
+        diagnostics_button = QPushButton("导出诊断包")
+        diagnostics_button.setToolTip(
+            "导出版本、设置摘要和最近调试文件，便于定位问题；不会修改现有数据。"
+        )
+        diagnostics_button.clicked.connect(self.export_diagnostics)
+        actions_layout.addWidget(diagnostics_button)
         actions_layout.addStretch(1)
 
+        layout.addWidget(status)
         layout.addWidget(actions)
         layout.addStretch(1)
+        QTimer.singleShot(0, self._update_data_status_summary)
         return panel
 
     def _build_hideout_panel(self) -> QWidget:
@@ -791,12 +938,19 @@ class MainWindow(QMainWindow):
         self.recipe_category_tree.itemSelectionChanged.connect(
             self._populate_recipe_results
         )
+        self.recipe_category_tree.itemExpanded.connect(
+            self._on_recipe_category_expansion_changed
+        )
+        self.recipe_category_tree.itemCollapsed.connect(
+            self._on_recipe_category_expansion_changed
+        )
         splitter.addWidget(self.recipe_category_tree)
 
         self.recipe_result_tree = QTreeWidget()
         self._configure_recipe_detail_tree(
             self.recipe_result_tree,
             "产物 / 配方 / 所需物品",
+            "recipe_result_column_widths",
         )
         self.recipe_result_tree.itemChanged.connect(self._on_recipe_item_changed)
         splitter.addWidget(self.recipe_result_tree)
@@ -828,6 +982,7 @@ class MainWindow(QMainWindow):
         self._configure_recipe_detail_tree(
             self.tracked_recipe_tree,
             "已关注产物 / 配方 / 所需物品",
+            "tracked_recipe_column_widths",
         )
         self.tracked_recipe_tree.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
@@ -868,8 +1023,12 @@ class MainWindow(QMainWindow):
             tree.header().setFont(font)
             tree.scheduleDelayedItemsLayout()
 
-    @staticmethod
-    def _configure_recipe_detail_tree(tree: QTreeWidget, first_header: str) -> None:
+    def _configure_recipe_detail_tree(
+        self,
+        tree: QTreeWidget,
+        first_header: str,
+        width_config_key: str,
+    ) -> None:
         tree.setHeaderLabels(
             [first_header, "工具", "数量", "耗时 / 限购", "任务依赖"]
         )
@@ -881,14 +1040,51 @@ class MainWindow(QMainWindow):
             tree.header().setSectionResizeMode(
                 column, QHeaderView.ResizeMode.Interactive
             )
-        tree.setColumnWidth(0, 430)
-        tree.setColumnWidth(1, 58)
-        tree.setColumnWidth(2, 80)
-        tree.setColumnWidth(3, 115)
-        tree.setColumnWidth(4, 260)
+        defaults = [430, 58, 80, 115, 260]
+        configured = self.config.get(width_config_key, defaults)
+        widths = configured if isinstance(configured, list) else defaults
+        for column, default_width in enumerate(defaults):
+            try:
+                width = int(widths[column])
+            except (IndexError, TypeError, ValueError):
+                width = default_width
+            tree.setColumnWidth(column, max(42, min(1600, width)))
         tree.headerItem().setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
         tree.headerItem().setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
         tree.headerItem().setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)
+        tree.header().sectionResized.connect(
+            lambda _column, _old, _new, current_tree=tree, key=width_config_key: (
+                self._remember_recipe_column_widths(current_tree, key)
+            )
+        )
+
+    def _remember_recipe_column_widths(
+        self, tree: QTreeWidget, config_key: str
+    ) -> None:
+        widths = [tree.columnWidth(column) for column in range(tree.columnCount())]
+        if self.settings_store.set(config_key, widths):
+            self._config_save_timer.start(350)
+
+    def _on_recipe_category_expansion_changed(
+        self, item: QTreeWidgetItem
+    ) -> None:
+        if self._recipe_tree_loading:
+            return
+        category_id = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+        if not category_id or category_id == "__all__":
+            return
+        expanded = {
+            str(value)
+            for value in self.config.get("recipe_expanded_categories", [])
+            if str(value)
+        }
+        if item.isExpanded():
+            expanded.add(category_id)
+        else:
+            expanded.discard(category_id)
+        self.settings_store.set("recipe_expanded_categories", sorted(expanded))
+        self.settings_store.set("recipe_category_expansion_initialized", True)
+        self._config_save_timer.start(350)
 
     def _tracked_recipe_ids(self) -> set[str]:
         value = self.config.get("tracked_recipe_ids", [])
@@ -1002,7 +1198,18 @@ class MainWindow(QMainWindow):
                     0, Qt.ItemDataRole.UserRole, "__uncategorized__"
                 )
                 self.recipe_category_tree.addTopLevelItem(uncategorized)
-            self.recipe_category_tree.expandToDepth(0)
+            if bool(
+                self.config.get("recipe_category_expansion_initialized", False)
+            ):
+                expanded = {
+                    str(value)
+                    for value in self.config.get("recipe_expanded_categories", [])
+                    if str(value)
+                }
+                for category_id, item in item_by_id.items():
+                    item.setExpanded(category_id in expanded)
+            else:
+                self.recipe_category_tree.expandToDepth(0)
             self.recipe_category_tree.setCurrentItem(all_item)
         finally:
             self.recipe_category_tree.blockSignals(False)
@@ -1949,6 +2156,8 @@ class MainWindow(QMainWindow):
         raid_control_action.triggered.connect(self.toggle_raid_control_overlay)
         raid_log_action = QAction("打开/关闭局内日志", self)
         raid_log_action.triggered.connect(self.toggle_raid_log_overlay)
+        diagnostics_action = QAction("导出诊断包", self)
+        diagnostics_action.triggered.connect(self.export_diagnostics)
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.request_exit)
 
@@ -1966,6 +2175,8 @@ class MainWindow(QMainWindow):
             data_menu.addAction(open_aliases_action)
 
         file_menu = self.menuBar().addMenu("文件")
+        file_menu.addAction(diagnostics_action)
+        file_menu.addSeparator()
         file_menu.addAction(quit_action)
 
     def _build_status_bar(self) -> QWidget:
@@ -2125,9 +2336,10 @@ class MainWindow(QMainWindow):
     def _raid_status_text(self) -> str:
         if self.price_client is None:
             return "价格模块未启用 · 其他局内设置仍可使用"
+        stale_hours = _safe_int(self.config.get("price_cache_stale_hours")) or 24
         return (
             f"{_game_mode_label(self.current_price_game_mode)} · "
-            f"{self.price_client.cache_status()}"
+            f"{self.price_client.cache_status(stale_hours)}"
         )
 
     def _sync_raid_control_overlay(self) -> None:
@@ -2211,6 +2423,8 @@ class MainWindow(QMainWindow):
         if font_size != previous_font_size:
             apply_app_theme(QApplication.instance(), font_size)
             self._sync_recipe_tree_fonts()
+        if features_changed:
+            self._apply_runtime_feature_configuration(previous_features)
         if hasattr(self, "price_mode_combo"):
             mode_index = self.price_mode_combo.findData(
                 str(self.config.get("price_game_mode_default", "pve"))
@@ -2225,7 +2439,7 @@ class MainWindow(QMainWindow):
         self._sync_raid_control_overlay()
         self._log("设置已更新。")
         if features_changed:
-            self._log_event("功能开关已保存；主界面面板和模块热键会在重启后生效。")
+            self._log_event("功能开关已应用，主界面和模块热键已同步更新。")
         self._update_cache_status_label()
         self._refresh_item_completer()
         if (
@@ -2236,6 +2450,112 @@ class MainWindow(QMainWindow):
             self._populate_recipe_tree()
         if self._should_auto_refresh_price_cache():
             self.refresh_price_cache(background=True)
+
+    def _apply_runtime_feature_configuration(
+        self, previous_features: set[str]
+    ) -> None:
+        new_features = self._configured_enabled_features()
+        if new_features == previous_features:
+            return
+
+        if (
+            "display_filter" in previous_features
+            and "display_filter" not in new_features
+            and self._display_filter_baseline is not None
+        ):
+            self.restore_display_filter(show_feedback=False)
+
+        if "trader_reminders" not in new_features:
+            if self.reminders is not None:
+                self.reminders.shutdown()
+            self.reminders = None
+            if self.reminder_overlay is not None:
+                self.reminder_overlay.hide()
+            self.reminder_overlay = None
+        elif self.reminders is None:
+            self.reminders = ReminderManager()
+            self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
+            self.reminder_overlay = ReminderOverlay()
+
+        if "price_lookup" not in new_features:
+            if self.price_overlay is not None:
+                self.price_overlay.hide()
+            self.price_overlay = None
+            self.price_client = None
+        elif self.price_client is None:
+            self.price_client = TarkovPriceClient()
+            self.current_price_game_mode = self.price_client.set_game_mode(
+                str(self.config.get("price_game_mode_default", "pve"))
+            )
+            self.price_overlay = PriceOverlay()
+
+        if "hideout" not in new_features:
+            self.hideout_tracker = None
+        elif self.hideout_tracker is None:
+            self.hideout_tracker = HideoutTracker()
+
+        self._recipe_data_error = ""
+        if "recipe_tracking" not in new_features:
+            self.recipe_catalog = None
+        elif self.recipe_catalog is None:
+            try:
+                self.recipe_catalog = RecipeCatalog()
+            except RecipeDataError as exc:
+                self._recipe_data_error = str(exc)
+
+        feedback_features = {"trader_reminders", "hideout", "display_filter"}
+        if new_features.intersection(feedback_features):
+            if self.feedback_overlay is None:
+                self.feedback_overlay = FeedbackOverlay()
+        elif self.feedback_overlay is not None:
+            self.feedback_overlay.hide()
+            self.feedback_overlay = None
+
+        previous_log = self.log.toPlainText() if hasattr(self, "log") else ""
+        self._runtime_enabled_features = new_features
+        self._clear_feature_ui_references()
+        self._build_ui()
+        if previous_log and hasattr(self, "log"):
+            self.log.setPlainText(previous_log)
+
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
+            self.tray_icon.deleteLater()
+            self.tray_icon = None
+        self._build_tray_icon()
+
+    def _clear_feature_ui_references(self) -> None:
+        names = (
+            "detected_size_label",
+            "cache_status_label",
+            "item_name_field",
+            "item_price_label",
+            "item_capture_button",
+            "lookup_button",
+            "open_item_crop_button",
+            "price_mode_combo",
+            "table",
+            "capture_button",
+            "schedule_button",
+            "clear_button",
+            "open_crop_button",
+            "data_status_label",
+            "data_error_label",
+            "hideout_status_label",
+            "hideout_table",
+            "display_filter_status_label",
+            "recipe_search_field",
+            "recipe_summary_label",
+            "recipe_tabs",
+            "recipe_category_tree",
+            "recipe_result_tree",
+            "recipe_color_swatch",
+            "recipe_color_label",
+            "tracked_recipe_tree",
+        )
+        for name in names:
+            if hasattr(self, name):
+                delattr(self, name)
 
     def reload_chinese_aliases(self) -> None:
         if self.price_client is None:
@@ -2250,10 +2570,37 @@ class MainWindow(QMainWindow):
         if not self._feature_enabled("price_lookup"):
             self._log("查价模块未启用，已跳过打开中文别名文件。")
             return
-        CHINESE_ALIASES_PATH.parent.mkdir(exist_ok=True)
-        if not CHINESE_ALIASES_PATH.exists():
-            CHINESE_ALIASES_PATH.write_text("{}\n", encoding="utf-8")
-        os.startfile(CHINESE_ALIASES_PATH)  # type: ignore[attr-defined]
+        aliases_path = ensure_editable_aliases_path()
+        os.startfile(aliases_path)  # type: ignore[attr-defined]
+
+    def export_diagnostics(self) -> None:
+        default_name = f"EFT-Raid-Assistant-diagnostics-{datetime.now():%Y%m%d-%H%M%S}.zip"
+        destination, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出诊断包",
+            str(APP_DIR / default_name),
+            "ZIP 压缩包 (*.zip)",
+        )
+        if not destination:
+            return
+        path = Path(destination)
+        if path.suffix.casefold() != ".zip":
+            path = path.with_suffix(".zip")
+        try:
+            created = create_diagnostic_bundle(path, self.config)
+        except (OSError, ValueError) as exc:
+            self._last_data_error = f"诊断包导出失败：{exc}"
+            self._update_data_status_summary()
+            QMessageBox.warning(self, "诊断包导出失败", str(exc))
+            return
+        self._last_data_error = ""
+        self._update_data_status_summary()
+        self._log(f"诊断包已导出：{created}")
+        QMessageBox.information(
+            self,
+            "诊断包已导出",
+            f"文件已保存到：\n{created}",
+        )
 
     def _save_config(self) -> None:
         if self.watch_checks:
@@ -2291,8 +2638,11 @@ class MainWindow(QMainWindow):
         if bool(self.config.get("performance_mode_enabled", True)) and bool(
             self.config.get("performance_skip_auto_price_refresh", True)
         ):
-            self._log("性能模式：已跳过自动刷新价格缓存，可在数据面板手动刷新。")
-            return False
+            stale_hours = _safe_int(self.config.get("price_cache_stale_hours")) or 24
+            if not self.price_client.cache_is_stale(stale_hours):
+                self._log("性能模式：价格缓存仍新鲜，已跳过启动刷新。")
+                return False
+            self._log("价格缓存已过期，将执行低流量 ETag 检查并按需刷新。")
         return True
 
     def _register_hotkeys(self) -> None:
@@ -2421,6 +2771,7 @@ class MainWindow(QMainWindow):
         source_label = "JSON API" if result.source == "json" else "GraphQL"
         if result.error:
             status = f"{source_label} 价格缓存刷新失败：{result.error}"
+            self._last_data_error = status
             self._log(status)
             self._update_cache_status_label()
             if result.source == "json":
@@ -2451,6 +2802,7 @@ class MainWindow(QMainWindow):
             f"PvE {counts.get('pve', 0)} 个物品"
         )
         self._log(status)
+        self._last_data_error = ""
         self._update_cache_status_label()
         self._refresh_item_completer()
 
@@ -2491,7 +2843,12 @@ class MainWindow(QMainWindow):
         if self._closing or not self._feature_enabled("hideout"):
             return
         self.hideout_status_label.setText(status)
+        if "失败" in status or "异常" in status:
+            self._last_data_error = status
+        else:
+            self._last_data_error = ""
         self._log(status)
+        self._update_data_status_summary()
 
     def capture_hideout_progress(self) -> None:
         if self._closing or not self._feature_enabled("hideout") or self.hideout_tracker is None:
@@ -2621,23 +2978,70 @@ class MainWindow(QMainWindow):
         if path.exists():
             os.startfile(path)  # type: ignore[attr-defined]
             return
-        QMessageBox.information(self, "No hideout screenshot", "还没有藏身处截图。")
+        QMessageBox.information(self, "没有藏身处截图", "还没有藏身处截图。")
 
     def open_hideout_ocr_text(self) -> None:
         path = hideout_ocr_text_path()
         if path.exists():
             os.startfile(path)  # type: ignore[attr-defined]
             return
-        QMessageBox.information(self, "No hideout OCR text", "还没有藏身处 OCR 文本。")
+        QMessageBox.information(self, "没有藏身处 OCR 文本", "还没有藏身处 OCR 文本。")
 
     def _update_cache_status_label(self) -> None:
-        if not hasattr(self, "cache_status_label") or self.price_client is None:
-            return
-        self.cache_status_label.setText(
-            f"价格: {self.price_client.cache_status()} / 中文别名: {self.price_client.alias_status()}"
-        )
+        if hasattr(self, "cache_status_label") and self.price_client is not None:
+            stale_hours = _safe_int(self.config.get("price_cache_stale_hours")) or 24
+            self.cache_status_label.setText(
+                f"价格: {self.price_client.cache_status(stale_hours)} / "
+                f"中文别名: {self.price_client.alias_status()}"
+            )
+        self._update_data_status_summary()
         if hasattr(self, "raid_control_overlay"):
             self.raid_control_overlay.status_label.setText(self._raid_status_text())
+
+    def _update_data_status_summary(self) -> None:
+        if not hasattr(self, "data_status_label"):
+            return
+        lines: list[str] = []
+        if self.price_client is not None:
+            stale_hours = _safe_int(self.config.get("price_cache_stale_hours")) or 24
+            lines.append(
+                f"价格（{_game_mode_label(self.current_price_game_mode)}）："
+                f"{self.price_client.cache_status(stale_hours)}"
+            )
+            lines.append(f"中文别名：{self.price_client.alias_status()}")
+        else:
+            lines.append("价格：模块未启用")
+
+        if self.recipe_catalog is not None:
+            lines.append(
+                "配方："
+                f"PvP {self.recipe_catalog.record_count('regular')} 条 / "
+                f"PvE {self.recipe_catalog.record_count('pve')} 条"
+                + (
+                    f" · 生成于 {self.recipe_catalog.generated_at}"
+                    if self.recipe_catalog.generated_at
+                    else ""
+                )
+            )
+        elif self._recipe_data_error:
+            lines.append(f"配方：不可用（{self._recipe_data_error}）")
+        else:
+            lines.append("配方：模块未启用")
+
+        if self.hideout_tracker is not None:
+            lines.append(
+                f"藏身处需求：本地已有 {self.hideout_tracker.requirement_count()} 个设施"
+            )
+        else:
+            lines.append("藏身处需求：模块未启用")
+
+        self.data_status_label.setText("\n".join(lines))
+        if hasattr(self, "data_error_label"):
+            self.data_error_label.setText(
+                f"最近一次数据错误：{self._last_data_error}"
+                if self._last_data_error
+                else "最近一次数据错误：无"
+            )
 
     def capture_and_ocr(self) -> None:
         if self._closing or not self._feature_enabled("trader_reminders") or self.reminders is None:
@@ -2772,8 +3176,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._cached_item_region = None
             self._item_region_calibrated = False
-            self._log(f"Item screenshot failed: {exc}")
-            QMessageBox.warning(self, "Item screenshot failed", str(exc))
+            self._log(f"物品截图失败：{exc}")
+            QMessageBox.warning(self, "物品截图失败", str(exc))
             return
 
         if hasattr(self, "detected_size_label"):
@@ -2793,7 +3197,7 @@ class MainWindow(QMainWindow):
                 )
             except OcrUnavailableError as exc:
                 self._log(str(exc))
-                QMessageBox.warning(self, "OCR unavailable", str(exc))
+                QMessageBox.warning(self, "OCR 不可用", str(exc))
                 return
             except Exception as exc:
                 self._log(f"Inventory tab check failed: {exc}")
@@ -2842,11 +3246,11 @@ class MainWindow(QMainWindow):
             result = run_item_name_ocr(item_debug_path())
         except OcrUnavailableError as exc:
             self._log(str(exc))
-            QMessageBox.warning(self, "OCR unavailable", str(exc))
+            QMessageBox.warning(self, "OCR 不可用", str(exc))
             return
         except Exception as exc:
-            self._log(f"Item OCR failed: {exc}")
-            QMessageBox.warning(self, "Item OCR failed", str(exc))
+            self._log(f"物品 OCR 失败：{exc}")
+            QMessageBox.warning(self, "物品 OCR 失败", str(exc))
             return
 
         self._log(f"Item OCR preprocessing: {result.variant_name}")
@@ -3787,12 +4191,12 @@ class FeatureSetupDialog(QDialog):
         layout = QVBoxLayout(self)
         title = QLabel("选择要启用的功能")
         title.setStyleSheet("font-size: 18px; font-weight: 700;")
-        detail = QLabel("软件会根据选择隐藏对应的主界面面板和热键；之后也可以在设置里修改，重启后生效。")
+        detail = QLabel("软件会根据选择显示对应的主界面面板和热键；之后也可以在设置里随时修改。")
         detail.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(detail)
 
-        initial = {"price_lookup", "trader_reminders"}
+        initial = set(DEFAULT_ENABLED_FEATURES)
         if bool(config.get("feature_setup_complete", False)):
             raw_enabled = config.get("enabled_features", DEFAULT_ENABLED_FEATURES)
             if isinstance(raw_enabled, list):
@@ -4036,7 +4440,7 @@ class SettingsDialog(QDialog):
     def _build_features_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        intro = QLabel("选择要在主界面启用的功能；保存后重启软件生效。")
+        intro = QLabel("选择要在主界面启用的功能；保存后立即生效。标注 Beta 的功能仍在持续完善。")
         intro.setWordWrap(True)
         layout.addWidget(intro)
         for feature_id, label in FEATURE_DEFINITIONS.items():
@@ -4066,7 +4470,12 @@ class SettingsDialog(QDialog):
         self.close_to_tray = QCheckBox("点击关闭按钮时询问最小化到托盘或退出")
         self.require_tarkov_foreground = QCheckBox("截图前要求 Tarkov 是前台窗口")
         self.require_inventory_check = QCheckBox("查价前先检测背包/详情界面")
-        self.refresh_prices_on_startup = QCheckBox("启动时刷新全量物品价格缓存")
+        self.refresh_prices_on_startup = QCheckBox(
+            "启动时检查价格更新（ETag，变化时才下载）"
+        )
+        self.price_cache_stale_hours = QSpinBox()
+        self.price_cache_stale_hours.setRange(1, 168)
+        self.price_cache_stale_hours.setSuffix(" 小时")
         self.price_overlay_seconds = QSpinBox()
         self.price_overlay_seconds.setRange(1, 120)
         self.item_display_language = QComboBox()
@@ -4080,6 +4489,7 @@ class SettingsDialog(QDialog):
         layout.addRow(self.require_tarkov_foreground)
         layout.addRow(self.require_inventory_check)
         layout.addRow(self.refresh_prices_on_startup)
+        layout.addRow("缓存过期阈值", self.price_cache_stale_hours)
         layout.addRow("浮窗显示秒数", self.price_overlay_seconds)
         layout.addRow("物品与任务名称语言", self.item_display_language)
         layout.addRow("默认价格模式", self.price_game_mode_default)
@@ -4129,7 +4539,9 @@ class SettingsDialog(QDialog):
         layout = QFormLayout(tab)
         self.performance_mode_enabled = QCheckBox("性能模式：限制后台任务并主动释放临时内存")
         self.performance_gc_after_worker = QCheckBox("后台任务结束后主动释放临时对象")
-        self.performance_skip_auto_price_refresh = QCheckBox("性能模式下跳过自动刷新价格缓存")
+        self.performance_skip_auto_price_refresh = QCheckBox(
+            "性能模式下仅在价格缓存过期时检查更新"
+        )
         self.performance_log_max_lines = QSpinBox()
         self.performance_log_max_lines.setRange(100, 5000)
         self.performance_cleanup_interval_seconds = QSpinBox()
@@ -4244,6 +4656,9 @@ class SettingsDialog(QDialog):
         self.refresh_prices_on_startup.setChecked(
             bool(self._config.get("refresh_prices_on_startup", True))
         )
+        self.price_cache_stale_hours.setValue(
+            _safe_int(self._config.get("price_cache_stale_hours")) or 24
+        )
         self.price_overlay_seconds.setValue(int(self._config.get("price_overlay_seconds", 10)))
         self.ui_font_size.setValue(_safe_int(self._config.get("ui_font_size")) or 11)
         display_language_index = self.item_display_language.findData(
@@ -4322,6 +4737,7 @@ class SettingsDialog(QDialog):
             "require_tarkov_foreground": self.require_tarkov_foreground.isChecked(),
             "require_inventory_check": self.require_inventory_check.isChecked(),
             "refresh_prices_on_startup": self.refresh_prices_on_startup.isChecked(),
+            "price_cache_stale_hours": self.price_cache_stale_hours.value(),
             "price_game_mode_default": self.price_game_mode_default.currentData() or "pve",
             "lead_time_seconds": self.lead_seconds.value(),
             "repeat_alert_seconds": self.repeat_seconds.value(),
@@ -4363,7 +4779,7 @@ def _centered(widget: QWidget) -> QWidget:
 
 def _load_app_icon(widget: QWidget) -> QIcon:
     for name in ("app_icon.ico", "app_icon.png"):
-        path = APP_DIR / "assets" / name
+        path = RESOURCE_DIR / "assets" / name
         if path.exists():
             icon = QIcon(str(path))
             if not icon.isNull():

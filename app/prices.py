@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import json
 import re
+import shutil
 import statistics
 import time
 import urllib.error
@@ -13,16 +14,19 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from app.config import APP_DIR
+from app.config import APP_DIR, RESOURCE_DIR
 from app.models import HistoricalPriceSummary, ItemPrice
 
 
 TARKOV_DEV_GRAPHQL = "https://api.tarkov.dev/graphql"
 TARKOV_DEV_JSON = "https://json.tarkov.dev"
 CACHE_DIR = APP_DIR / "cache"
+RESOURCE_CACHE_DIR = RESOURCE_DIR / "cache"
 LEGACY_ITEM_CACHE_PATH = CACHE_DIR / "tarkov_items.json"
 DATA_DIR = APP_DIR / "data"
+RESOURCE_DATA_DIR = RESOURCE_DIR / "data"
 CHINESE_ALIASES_PATH = DATA_DIR / "item_aliases_zh.json"
+BUNDLED_CHINESE_ALIASES_PATH = RESOURCE_DATA_DIR / "item_aliases_zh.json"
 GAME_MODES = ("regular", "pve")
 JSON_TRANSLATION_MODE = "regular"
 DEFAULT_MINIMUM_ITEM_COUNT = 1000
@@ -130,13 +134,13 @@ class TarkovPriceClient:
         endpoint: str = TARKOV_DEV_GRAPHQL,
         json_endpoint: str = TARKOV_DEV_JSON,
         cache_path: Path = LEGACY_ITEM_CACHE_PATH,
-        aliases_path: Path = CHINESE_ALIASES_PATH,
+        aliases_path: Path | None = None,
         minimum_item_count: int = DEFAULT_MINIMUM_ITEM_COUNT,
     ) -> None:
         self.endpoint = endpoint
         self.json_endpoint = json_endpoint.rstrip("/")
         self.legacy_cache_path = cache_path
-        self.aliases_path = aliases_path
+        self.aliases_path = aliases_path or _default_aliases_path()
         self.minimum_item_count = max(1, int(minimum_item_count))
         self.current_game_mode = "regular"
         self._items_by_mode: dict[str, list[dict[str, Any]]] = {mode: [] for mode in GAME_MODES}
@@ -473,8 +477,10 @@ class TarkovPriceClient:
                 raise
             raise PriceLookupError(f"价格缓存写入失败，旧缓存已保留：{exc}") from exc
 
-    def cache_status(self) -> str:
+    def cache_status(self, stale_hours: float = 24.0) -> str:
         parts: list[str] = []
+        stale_seconds = max(1.0, float(stale_hours)) * 3600.0
+        now = time.time()
         for mode in GAME_MODES:
             items = self._items_by_mode.get(mode) or []
             label = _game_mode_label(mode)
@@ -484,10 +490,23 @@ class TarkovPriceClient:
             fetched_at = self._fetched_at_by_mode.get(mode) or 0.0
             if fetched_at:
                 value = time.strftime("%m-%d %H:%M", time.localtime(fetched_at))
+                if now - fetched_at > stale_seconds:
+                    value = f"{value} ⚠过期"
             else:
-                value = "已加载"
+                value = "已加载 ⚠时间未知"
             parts.append(f"{label}:{value}")
         return " / ".join(parts)
+
+    def cache_is_stale(self, stale_hours: float = 24.0) -> bool:
+        stale_seconds = max(1.0, float(stale_hours)) * 3600.0
+        now = time.time()
+        for mode in GAME_MODES:
+            if not self._items_by_mode.get(mode):
+                return True
+            fetched_at = self._fetched_at_by_mode.get(mode) or 0.0
+            if not fetched_at or now - fetched_at > stale_seconds:
+                return True
+        return False
 
     def completion_entries(self, game_mode: str | None = None) -> list[CompletionEntry]:
         mode = _normalize_game_mode(game_mode or self.current_game_mode)
@@ -657,10 +676,15 @@ class TarkovPriceClient:
         return [point for point in points if isinstance(point, dict)]
 
     def _load_disk_cache(self, game_mode: str) -> None:
-        cache_path = _cache_path_for_mode(game_mode)
-        if not cache_path.exists() and game_mode == "regular" and self.legacy_cache_path.exists():
-            cache_path = self.legacy_cache_path
-        if not cache_path.exists():
+        cache_path = next(
+            (
+                path
+                for path in _cache_candidates(game_mode, self.legacy_cache_path)
+                if path.exists()
+            ),
+            None,
+        )
+        if cache_path is None:
             return
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
@@ -1004,6 +1028,39 @@ def _game_mode_label(game_mode: str) -> str:
 
 def _cache_path_for_mode(game_mode: str) -> Path:
     return CACHE_DIR / f"tarkov_items_{_normalize_game_mode(game_mode)}.json"
+
+
+def _resource_cache_path_for_mode(game_mode: str) -> Path:
+    return RESOURCE_CACHE_DIR / f"tarkov_items_{_normalize_game_mode(game_mode)}.json"
+
+
+def _cache_candidates(game_mode: str, legacy_path: Path) -> list[Path]:
+    candidates = [_cache_path_for_mode(game_mode)]
+    if RESOURCE_CACHE_DIR.resolve() != CACHE_DIR.resolve():
+        candidates.append(_resource_cache_path_for_mode(game_mode))
+    if game_mode == "regular":
+        candidates.append(legacy_path)
+        bundled_legacy = RESOURCE_CACHE_DIR / "tarkov_items.json"
+        if bundled_legacy.resolve() != legacy_path.resolve():
+            candidates.append(bundled_legacy)
+    return candidates
+
+
+def _default_aliases_path() -> Path:
+    if CHINESE_ALIASES_PATH.exists() or RESOURCE_DATA_DIR.resolve() == DATA_DIR.resolve():
+        return CHINESE_ALIASES_PATH
+    return BUNDLED_CHINESE_ALIASES_PATH
+
+
+def ensure_editable_aliases_path() -> Path:
+    CHINESE_ALIASES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if CHINESE_ALIASES_PATH.exists():
+        return CHINESE_ALIASES_PATH
+    if BUNDLED_CHINESE_ALIASES_PATH.exists():
+        shutil.copy2(BUNDLED_CHINESE_ALIASES_PATH, CHINESE_ALIASES_PATH)
+    else:
+        CHINESE_ALIASES_PATH.write_text("{}\n", encoding="utf-8")
+    return CHINESE_ALIASES_PATH
 
 
 def _resolve_alias_target(target: str, items: list[dict[str, Any]]) -> dict[str, Any] | None:

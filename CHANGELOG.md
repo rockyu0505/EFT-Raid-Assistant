@@ -1,10 +1,21 @@
 # Changelog
 
-## 0.6.0 - Unreleased
+## 0.7.0-dev - Unreleased
+
+- Fixed the blank white area after the last recipe-tree header column by theming the full header viewport, horizontal scrollbar, and scroll-area corner; added an offscreen pixel regression test.
+- Split frozen bundled resources from portable writable data so packaged recipes, aliases, icons, and seed caches load from `_internal`, while user config/cache/debug files remain beside the executable.
+- Added config migration and atomic writes; older installs no longer retain the indefinite startup-price-refresh skip.
+- Changed performance-mode startup refresh to skip fresh caches but perform a low-bandwidth ETag check when the configured staleness threshold is exceeded.
+- Added a data-status dashboard with price-cache freshness, alias, recipe, hideout, and last-error status plus a bounded diagnostic-zip exporter.
+- Changed feature toggles to rebuild the application shell and runtime modules immediately without restarting.
+- Added persistence for main-window geometry, resizable/collapsible log height, recipe column widths, category expansion, and both in-raid overlay positions.
+- Changed first-run defaults to enable only core price lookup and marked experimental modules as Beta.
+- Added atomic hideout requirement/progress writes and frozen seed-cache fallback for first launch.
+- Added a repeatable development-package script covering compile, tests, source/exe smoke checks, PyInstaller, zip validation, and SHA-256 generation.
 
 - Fixed live font scaling in recipe trees, added proportional tree-row spacing, and enlarged the main-window defaults.
 - Renamed recipe notes to a compact task-dependency column and made every recipe tree column user-resizable.
-- Added a first-run feature setup dialog and Settings feature toggles so users can enable only the panels they need; changes take effect after restart.
+- Added a first-run feature setup dialog and Settings feature toggles so users can enable only the panels they need; changes take effect immediately.
 - Changed feature toggles to be hard module gates: disabled modules do not create their runtime managers, register hotkeys, start background refreshes, or apply display filters.
 - Changed Settings to open on the hotkey tab by default and moved low-frequency capture ROI/manual resolution controls into a collapsed advanced capture section.
 - Added a dark, translucent upper-right in-raid control panel (`F9`) for live price mode, display language, overlay timing, panel opacity, and Gamma adjustment.
@@ -25,9 +36,9 @@
 - Changed hotkey settings to capture the next key press directly, detect conflicts, and allow replacing an existing binding.
 - Changed Gamma live tuning to apply silently while dragging sliders so visible logs and feedback toasts only appear for explicit hotkey toggles/restores or important safety events.
 - Added Gamma eye-care mode: when neither Tarkov nor the assistant UI is active, the app can automatically restore the original display state and show a one-time reminder.
-- Changed the visible log into a persistent main-window section shared by all feature panels, with automatic scrolling to the newest entry.
+- Changed the visible log into a persistent, resizable and collapsible main-window section shared by all feature panels, with automatic scrolling to the newest entry.
 - Hid foreground-window rejection messages from the visible log to avoid spam while users alt-tab or chat outside the game.
-- Added a performance settings tab with visible-log line limits, background-worker concurrency limits, worker-finished memory cleanup, periodic idle cleanup, and a default performance-mode skip for automatic price-cache refreshes.
+- Added a performance settings tab with visible-log line limits, background-worker concurrency limits, worker-finished memory cleanup, periodic idle cleanup, and cache-age-aware startup price checks.
 - Changed trader restock reminders from modal message boxes to a left-side non-focus, mouse-through overlay so reminders do not interrupt gameplay.
 - Added a configurable reminder visibility hotkey, defaulting to `F7`, to hide or show persistent restock reminder overlays.
 - Changed trader countdown OCR so `F8` immediately schedules reminders for checked traders instead of requiring a separate `F10` hotkey.

@@ -3,6 +3,7 @@ __pycache__/
 
 build/
 dist/
+release/
 debug/
 
 cache/

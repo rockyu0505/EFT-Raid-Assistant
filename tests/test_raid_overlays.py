@@ -139,6 +139,22 @@ class RaidOverlayTests(unittest.TestCase):
         self.assertEqual(all_lines, ["debug", "raid event"])
         self.assertEqual(visible_lines, ["raid event"])
 
+    def test_saved_overlay_position_is_restored_and_emitted_after_move(self) -> None:
+        overlay = RaidControlOverlay()
+        overlay.set_saved_position([120, 140])
+        overlay._position_on_screen()
+        self.assertEqual((overlay.x(), overlay.y()), (120, 140))
+
+        positions: list[tuple[int, int]] = []
+        overlay.position_changed.connect(lambda x, y: positions.append((x, y)))
+        overlay.show()
+        self.app.processEvents()
+        overlay.move(160, 180)
+        self.app.processEvents()
+
+        self.assertIn((160, 180), positions)
+        overlay.hide()
+
 
 if __name__ == "__main__":
     unittest.main()

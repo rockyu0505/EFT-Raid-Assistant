@@ -10,11 +10,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from app.config import APP_DIR
+from app.config import APP_DIR, RESOURCE_DIR
 
 
 TARKOV_DEV_GRAPHQL = "https://api.tarkov.dev/graphql"
 HIDEOUT_CACHE_PATH = APP_DIR / "cache" / "hideout_requirements_zh.json"
+BUNDLED_HIDEOUT_CACHE_PATH = RESOURCE_DIR / "cache" / "hideout_requirements_zh.json"
 HIDEOUT_PROGRESS_PATH = APP_DIR / "data" / "hideout_progress.json"
 
 HIDEOUT_QUERY = """
@@ -93,6 +94,10 @@ class HideoutTracker:
         self.ensure_requirements()
         return [str(station.get("name") or "") for station in self._stations]
 
+    def requirement_count(self) -> int:
+        """Return the number of cached hideout stations without using the network."""
+        return len(self._stations)
+
     def ensure_requirements(self) -> None:
         if not self._stations:
             self.refresh_requirements()
@@ -126,19 +131,14 @@ class HideoutTracker:
             raise HideoutDataError("藏身处 API 响应中没有设施列表。")
 
         self._stations = [station for station in stations if isinstance(station, dict)]
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-        self.cache_path.write_text(
-            json.dumps(
-                {
-                    "fetched_at": time.time(),
-                    "lang": "zh",
-                    "game_mode": "pve",
-                    "stations": self._stations,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        _write_json_atomic(
+            self.cache_path,
+            {
+                "fetched_at": time.time(),
+                "lang": "zh",
+                "game_mode": "pve",
+                "stations": self._stations,
+            },
         )
         return len(self._stations)
 
@@ -388,10 +388,17 @@ class HideoutTracker:
         return None
 
     def _load_requirements(self) -> None:
-        if not self.cache_path.exists():
+        cache_path = self.cache_path
+        if (
+            not cache_path.exists()
+            and BUNDLED_HIDEOUT_CACHE_PATH.resolve() != cache_path.resolve()
+            and BUNDLED_HIDEOUT_CACHE_PATH.exists()
+        ):
+            cache_path = BUNDLED_HIDEOUT_CACHE_PATH
+        if not cache_path.exists():
             return
         try:
-            data = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
         stations = data.get("stations")
@@ -410,12 +417,18 @@ class HideoutTracker:
             self._progress.setdefault("stations", {})
 
     def _save_progress(self) -> None:
-        self.progress_path.parent.mkdir(parents=True, exist_ok=True)
         self._progress["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.progress_path.write_text(
-            json.dumps(self._progress, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        _write_json_atomic(self.progress_path, self._progress)
+
+
+def _write_json_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _station_level(station: dict[str, Any], level_number: int) -> dict[str, Any] | None:

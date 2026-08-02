@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -9,18 +10,43 @@ from typing import Any
 from app.models import TRADERS
 
 
-APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent.parent
+CONFIG_VERSION = 2
+
+
+def resolve_app_directories(
+    *,
+    frozen: bool,
+    executable: str | Path,
+    module_file: str | Path,
+    bundle_dir: str | Path | None = None,
+) -> tuple[Path, Path]:
+    if frozen:
+        writable_dir = Path(executable).resolve().parent
+        resource_dir = Path(bundle_dir).resolve() if bundle_dir else writable_dir
+        return writable_dir, resource_dir
+    project_dir = Path(module_file).resolve().parent.parent
+    return project_dir, project_dir
+
+
+APP_DIR, RESOURCE_DIR = resolve_app_directories(
+    frozen=bool(getattr(sys, "frozen", False)),
+    executable=sys.executable,
+    module_file=__file__,
+    bundle_dir=getattr(sys, "_MEIPASS", None),
+)
+if os.environ.get("EFT_APP_DATA_DIR"):
+    APP_DIR = Path(os.environ["EFT_APP_DATA_DIR"]).resolve()
 CONFIG_PATH = APP_DIR / "config.json"
 
 
 FEATURE_DEFINITIONS: dict[str, str] = {
     "price_lookup": "局内查价",
-    "trader_reminders": "商人补货",
-    "hideout": "藏身处记录",
-    "display_filter": "画面增强（Gamma）",
+    "trader_reminders": "商人补货（Beta）",
+    "hideout": "藏身处记录（Beta）",
+    "display_filter": "画面增强 / Gamma（Beta）",
     "recipe_tracking": "关注制作/兑换配方",
 }
-DEFAULT_ENABLED_FEATURES = ["price_lookup", "trader_reminders", "hideout"]
+DEFAULT_ENABLED_FEATURES = ["price_lookup"]
 
 
 REMOVED_CONFIG_KEYS = {
@@ -34,6 +60,7 @@ REMOVED_CONFIG_KEYS = {
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "config_version": CONFIG_VERSION,
     "enabled_features": DEFAULT_ENABLED_FEATURES.copy(),
     "feature_setup_complete": False,
     "selected_traders": TRADERS.copy(),
@@ -104,7 +131,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "performance_gc_after_worker": True,
     "performance_cleanup_interval_seconds": 60,
     "performance_max_concurrent_workers": 2,
-    "performance_skip_auto_price_refresh": True,
+    "performance_skip_auto_price_refresh": False,
+    "price_cache_stale_hours": 24,
+    "main_window_geometry": [],
+    "main_log_height": 170,
+    "main_log_collapsed": False,
+    "recipe_result_column_widths": [430, 58, 80, 115, 260],
+    "tracked_recipe_column_widths": [430, 58, 80, 115, 260],
+    "recipe_expanded_categories": [],
+    "recipe_category_expansion_initialized": False,
+    "raid_panel_position": [],
+    "raid_log_position": [],
     "display_filter_restore_on_exit": True,
     "display_filter_eye_care_enabled": True,
     "display_filter_eye_care_check_seconds": 2,
@@ -151,8 +188,12 @@ def load_config() -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return copy.deepcopy(DEFAULT_CONFIG)
 
+    if not isinstance(data, dict):
+        return copy.deepcopy(DEFAULT_CONFIG)
+
+    migrated = _migrate_config(data)
     merged = copy.deepcopy(DEFAULT_CONFIG)
-    merged.update(data)
+    merged.update(migrated)
     merged["enabled_features"] = _clean_enabled_features(merged.get("enabled_features"))
     for key in REMOVED_CONFIG_KEYS:
         merged.pop(key, None)
@@ -162,14 +203,31 @@ def load_config() -> dict[str, Any]:
 def save_config(config: dict[str, Any]) -> None:
     """Persist user settings to config.json in the project directory."""
     cleaned = {key: value for key, value in config.items() if key not in REMOVED_CONFIG_KEYS}
+    cleaned["config_version"] = CONFIG_VERSION
     cleaned["enabled_features"] = _clean_enabled_features(cleaned.get("enabled_features"))
-    CONFIG_PATH.write_text(
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = CONFIG_PATH.with_suffix(f"{CONFIG_PATH.suffix}.tmp")
+    temporary_path.write_text(
         json.dumps(cleaned, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    temporary_path.replace(CONFIG_PATH)
 
 
 def _clean_enabled_features(value: object) -> list[str]:
     if not isinstance(value, list):
         return DEFAULT_ENABLED_FEATURES.copy()
     return [str(item) for item in value if str(item) in FEATURE_DEFINITIONS]
+
+
+def _migrate_config(value: dict[str, Any]) -> dict[str, Any]:
+    migrated = copy.deepcopy(value)
+    try:
+        version = int(migrated.get("config_version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    if version < 2:
+        # Older builds skipped startup cache checks indefinitely in performance mode.
+        migrated["performance_skip_auto_price_refresh"] = False
+    migrated["config_version"] = CONFIG_VERSION
+    return migrated

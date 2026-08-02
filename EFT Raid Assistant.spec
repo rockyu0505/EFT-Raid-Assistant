@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
@@ -24,6 +25,12 @@ env_bin_names = {
     'libwebpmux.dll',
     'lcms2.dll',
     'libexpat.dll',
+    'jpeg8.dll',
+    'tiff.dll',
+    'openjp2.dll',
+    'deflate.dll',
+    'Lerc.dll',
+    'yaml.dll',
     'ffi-8.dll',
     'libssl-3-x64.dll',
     'libcrypto-3-x64.dll',
@@ -43,6 +50,20 @@ rapidocr_datas = collect_data_files(
         'inference_engine/pytorch/networks/*.yaml',
     ],
 )
+app_datas = [
+    ('data', 'data'),
+    ('assets', 'assets'),
+    ('README.md', '.'),
+    ('RELEASE_README_zh.txt', '.'),
+    ('CHANGELOG.md', '.'),
+    ('LICENSE', '.'),
+    ('THIRD_PARTY_NOTICES.md', '.'),
+    ('VERSION', '.'),
+]
+release_cache_dir = Path(os.environ.get('EFT_RELEASE_CACHE_DIR', 'cache'))
+if release_cache_dir.exists():
+    app_datas.append((str(release_cache_dir), 'cache'))
+debug_build = os.environ.get('EFT_BUILD_CONSOLE') == '1'
 qt_hiddenimports = [
     'PySide6.QtCore',
     'PySide6.QtGui',
@@ -58,7 +79,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=qt_binaries + env_bin_binaries,
-    datas=rapidocr_datas + [('config.json', '.'), ('cache', 'cache'), ('data', 'data'), ('assets', 'assets'), ('README.md', '.'), ('RELEASE_README_zh.txt', '.'), ('CHANGELOG.md', '.'), ('LICENSE', '.'), ('THIRD_PARTY_NOTICES.md', '.'), ('VERSION', '.')],
+    datas=rapidocr_datas + app_datas,
     hiddenimports=qt_hiddenimports,
     hookspath=[],
     hooksconfig={},
@@ -67,6 +88,18 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+mkl_runtime_keep = {
+    'mkl_rt.3.dll',
+    'mkl_core.3.dll',
+    'mkl_intel_thread.3.dll',
+    'mkl_def.3.dll',
+}
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if not Path(entry[0]).name.lower().startswith('mkl')
+    or Path(entry[0]).name.lower() in mkl_runtime_keep
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -75,11 +108,11 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='EFT Raid Assistant',
-    debug=False,
+    debug=debug_build,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    console=debug_build,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

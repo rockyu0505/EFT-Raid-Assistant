@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import QPoint, QSignalBlocker, Qt, Signal
-from PySide6.QtGui import QCloseEvent, QCursor, QKeyEvent, QMouseEvent
+from PySide6.QtGui import QCloseEvent, QCursor, QKeyEvent, QMouseEvent, QMoveEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -87,6 +87,7 @@ QPlainTextEdit#raidLogText {
 
 
 class RaidControlOverlay(QWidget):
+    position_changed = Signal(int, int)
     game_mode_changed = Signal(str)
     language_changed = Signal(str)
     price_duration_changed = Signal(int)
@@ -99,6 +100,7 @@ class RaidControlOverlay(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._drag_offset: QPoint | None = None
+        self._saved_position: QPoint | None = None
         self._loading = False
         self._presets: list[dict[str, Any]] = []
         self._gamma_sliders: dict[str, QSlider] = {}
@@ -396,12 +398,26 @@ class RaidControlOverlay(QWidget):
         return values
 
     def _position_on_screen(self) -> None:
+        if self._saved_position is not None and _position_is_visible(
+            self._saved_position
+        ):
+            self.move(self._saved_position)
+            return
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen is None:
             return
         self.adjustSize()
         rect = screen.availableGeometry()
         self.move(rect.right() - self.width() - 28, rect.top() + 70)
+
+    def set_saved_position(self, value: object) -> None:
+        self._saved_position = _point_from_value(value)
+
+    def moveEvent(self, event: QMoveEvent) -> None:
+        self._saved_position = self.pos()
+        if self.isVisible():
+            self.position_changed.emit(self.x(), self.y())
+        super().moveEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:
@@ -430,8 +446,11 @@ class RaidControlOverlay(QWidget):
 
 
 class RaidLogOverlay(QWidget):
+    position_changed = Signal(int, int)
+
     def __init__(self, max_lines: int = 200) -> None:
         super().__init__()
+        self._saved_position: QPoint | None = None
         self.setWindowTitle("Raid Log")
         self.setWindowFlags(
             Qt.WindowType.Tool
@@ -499,11 +518,25 @@ class RaidLogOverlay(QWidget):
         return True
 
     def _position_on_screen(self) -> None:
+        if self._saved_position is not None and _position_is_visible(
+            self._saved_position
+        ):
+            self.move(self._saved_position)
+            return
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen is None:
             return
         rect = screen.availableGeometry()
         self.move(rect.left() + 24, rect.bottom() - self.height() - 54)
+
+    def set_saved_position(self, value: object) -> None:
+        self._saved_position = _point_from_value(value)
+
+    def moveEvent(self, event: QMoveEvent) -> None:
+        self._saved_position = self.pos()
+        if self.isVisible():
+            self.position_changed.emit(self.x(), self.y())
+        super().moveEvent(event)
 
 
 class _DragHandle(QFrame):
@@ -533,6 +566,20 @@ class _DragHandle(QFrame):
         self._drag_offset = None
         self.setCursor(Qt.CursorShape.OpenHandCursor)
         super().mouseReleaseEvent(event)
+
+
+def _point_from_value(value: object) -> QPoint | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        return QPoint(int(value[0]), int(value[1]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _position_is_visible(position: QPoint) -> bool:
+    probe = QPoint(position.x() + 20, position.y() + 20)
+    return any(screen.availableGeometry().contains(probe) for screen in QApplication.screens())
 
 
 def _float_value(value: object, fallback: float) -> float:
