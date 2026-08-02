@@ -289,7 +289,7 @@ def recipe_notice(record: dict[str, Any], item_id: str) -> RecipeNotice:
         product_text=recipe_title(record),
         source_text=recipe_source_text(record),
         requirement_text=(
-            f"需当前物品 ×{_format_count(required_count)}{qualifier_text}"
+            f"需求：{_format_count(required_count)} 个{qualifier_text}"
         ),
     )
 

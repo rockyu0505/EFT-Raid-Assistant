@@ -93,6 +93,7 @@ class RaidControlOverlay(QWidget):
     price_duration_changed = Signal(int)
     feedback_duration_changed = Signal(int)
     panel_opacity_changed = Signal(int)
+    display_target_changed = Signal(str)
     gamma_enabled_changed = Signal(bool)
     gamma_values_changed = Signal(object)
     gamma_restore_requested = Signal()
@@ -181,6 +182,7 @@ class RaidControlOverlay(QWidget):
         layout.addWidget(timing_section)
 
         gamma_section, gamma_layout = self._section("实时画面")
+        self.gamma_section = gamma_section
         self.gamma_toggle_button = QPushButton("画面增强：已关闭")
         self.gamma_toggle_button.setCheckable(True)
         self.gamma_toggle_button.clicked.connect(self._on_gamma_enabled_changed)
@@ -189,10 +191,13 @@ class RaidControlOverlay(QWidget):
         self.gamma_status_label.setObjectName("raidPanelMeta")
         self.gamma_status_label.setWordWrap(True)
         gamma_layout.addWidget(self.gamma_status_label, 1, 0, 1, 2)
+        self.display_target_combo = QComboBox()
+        gamma_layout.addWidget(QLabel("目标显示器"), 2, 0)
+        gamma_layout.addWidget(self.display_target_combo, 2, 1)
         self.gamma_preset_combo = QComboBox()
-        gamma_layout.addWidget(QLabel("Gamma 方案"), 2, 0)
-        gamma_layout.addWidget(self.gamma_preset_combo, 2, 1)
-        for row, (key, definition) in enumerate(GAMMA_CONTROLS.items(), start=3):
+        gamma_layout.addWidget(QLabel("Gamma 方案"), 3, 0)
+        gamma_layout.addWidget(self.gamma_preset_combo, 3, 1)
+        for row, (key, definition) in enumerate(GAMMA_CONTROLS.items(), start=4):
             label, minimum, maximum, _scale, _decimals = definition
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setRange(minimum, maximum)
@@ -212,7 +217,7 @@ class RaidControlOverlay(QWidget):
         )
         gamma_layout.addWidget(
             self.gamma_restore_button,
-            len(GAMMA_CONTROLS) + 3,
+            len(GAMMA_CONTROLS) + 4,
             0,
             1,
             2,
@@ -234,6 +239,13 @@ class RaidControlOverlay(QWidget):
         self.price_duration.valueChanged.connect(self._on_price_duration_changed)
         self.feedback_duration.valueChanged.connect(self._on_feedback_duration_changed)
         self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        self.display_target_combo.currentIndexChanged.connect(
+            lambda: self.display_target_changed.emit(
+                str(self.display_target_combo.currentData() or "")
+            )
+            if not self._loading
+            else None
+        )
         self.gamma_preset_combo.currentIndexChanged.connect(self._on_gamma_preset_changed)
 
     def _section(self, title: str) -> tuple[QFrame, QGridLayout]:
@@ -259,6 +271,7 @@ class RaidControlOverlay(QWidget):
         presets: list[dict[str, Any]],
         status: str,
         gamma_active: bool = False,
+        display_targets: list[tuple[str, str]] | None = None,
     ) -> None:
         self._loading = True
         try:
@@ -276,6 +289,16 @@ class RaidControlOverlay(QWidget):
             opacity = int(config.get("raid_panel_opacity", 84))
             self.opacity_slider.setValue(max(55, min(100, opacity)))
             self._presets = [dict(preset) for preset in presets]
+            options = list(display_targets or [])
+            if not options:
+                options = [("", "Windows 主显示器（自动）")]
+            with QSignalBlocker(self.display_target_combo):
+                self.display_target_combo.clear()
+                for target_id, label in options:
+                    self.display_target_combo.addItem(label, target_id)
+                target_id = str(config.get("display_filter_target_id", ""))
+                target_index = self.display_target_combo.findData(target_id)
+                self.display_target_combo.setCurrentIndex(max(0, target_index))
             with QSignalBlocker(self.gamma_preset_combo):
                 self.gamma_preset_combo.clear()
                 for preset in self._presets:
@@ -284,6 +307,7 @@ class RaidControlOverlay(QWidget):
                 index = self.gamma_preset_combo.findText(active)
                 self.gamma_preset_combo.setCurrentIndex(max(0, index))
             gamma_enabled = bool(self._presets)
+            self.gamma_section.setVisible(gamma_enabled)
             self.gamma_preset_combo.setEnabled(gamma_enabled)
             for slider in self._gamma_sliders.values():
                 slider.setEnabled(gamma_enabled)
@@ -300,6 +324,7 @@ class RaidControlOverlay(QWidget):
                 self.set_gamma_status("点击开启后，方案和滑条才会修改画面。")
             self._load_selected_gamma_preset()
             self._set_window_opacity(opacity)
+            self.adjustSize()
         finally:
             self._loading = False
 

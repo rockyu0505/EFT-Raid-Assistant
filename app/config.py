@@ -10,7 +10,7 @@ from typing import Any
 from app.models import TRADERS
 
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 
 def resolve_app_directories(
@@ -94,6 +94,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "price_overlay_enabled": True,
     "price_overlay_seconds": 10,
     "close_to_tray": True,
+    "ui_theme": "light",
     "ui_font_size": 11,
     "item_display_language": "zh",
     "price_value_basis": "slot",
@@ -146,6 +147,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "display_filter_eye_care_enabled": True,
     "display_filter_eye_care_check_seconds": 2,
     "display_filter_active_preset": "",
+    "display_filter_target_id": "",
     "display_filter_presets": [
         {
             "name": "Indoor Lift",

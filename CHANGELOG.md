@@ -2,6 +2,11 @@
 
 ## 0.7.0-dev - Unreleased
 
+- Added light (default), dark, and high-contrast application themes with immediate Settings switching while keeping in-raid translucent overlays dark.
+- Changed tracked-material notices to use the title “制作/兑换配方”, emphasize the target product, and show the current material as “需求：N 个”.
+- Removed the Gamma section from the F9 overlay when the display-filter feature is disabled.
+- Added Windows display-output enumeration, persisted per-display targeting, monitor/adapter labels, a nonvisual Gamma Ramp read/write probe, and target-safe restore/switch behavior for multi-monitor systems.
+- Disabled the global color-matrix fallback for explicit per-display operations so a rejected target cannot silently modify every screen.
 - Fixed the blank white area after the last recipe-tree header column by theming the full header viewport, horizontal scrollbar, and scroll-area corner; added an offscreen pixel regression test.
 - Split frozen bundled resources from portable writable data so packaged recipes, aliases, icons, and seed caches load from `_internal`, while user config/cache/debug files remain beside the executable.
 - Added config migration and atomic writes; older installs no longer retain the indefinite startup-price-refresh skip.

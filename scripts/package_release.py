@@ -94,6 +94,12 @@ def main() -> int:
         timeout=180,
     )
     _run(
+        [str(app_dir / f"{APP_NAME}.exe"), "--display-smoke-test"],
+        cwd=app_dir,
+        env=packaged_env,
+        timeout=60,
+    )
+    _run(
         [str(app_dir / f"{APP_NAME}.exe"), "--smoke-test"],
         cwd=app_dir,
         env=packaged_env,

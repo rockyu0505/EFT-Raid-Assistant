@@ -12,6 +12,7 @@ from app.ui.theme import apply_app_theme
 
 def main() -> int:
     smoke_test = "--smoke-test" in sys.argv
+    display_smoke_test = "--display-smoke-test" in sys.argv
     if "--ocr-smoke-test" in sys.argv:
         from PIL import Image
 
@@ -26,8 +27,21 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("Tarkov Raid Assistant")
     app.setQuitOnLastWindowClosed(False)
+    if display_smoke_test:
+        from app.display_filter import enumerate_display_targets, probe_display_target
+
+        targets = enumerate_display_targets()
+        if not targets:
+            raise RuntimeError("No active Windows display targets were found.")
+        for target in targets:
+            probe_display_target(target.target_id)
+        return 0
     config = load_config()
-    apply_app_theme(app, config.get("ui_font_size", 11))
+    apply_app_theme(
+        app,
+        config.get("ui_font_size", 11),
+        config.get("ui_theme", "light"),
+    )
 
     window = MainWindow()
     window.show()

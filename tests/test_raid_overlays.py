@@ -49,6 +49,35 @@ class RaidOverlayTests(unittest.TestCase):
         self.assertEqual(overlay.price_duration.value(), 12)
         self.assertEqual(overlay.gamma_values()["gamma"], 0.72)
         self.assertEqual(overlay.status_label.text(), "PvP · cache ready")
+        self.assertFalse(overlay.gamma_section.isHidden())
+
+    def test_gamma_section_is_removed_when_feature_is_disabled(self) -> None:
+        overlay = RaidControlOverlay()
+        overlay.sync({"price_game_mode_default": "pve"}, [], "ready")
+
+        self.assertTrue(overlay.gamma_section.isHidden())
+
+    def test_control_loads_and_emits_selected_display(self) -> None:
+        overlay = RaidControlOverlay()
+        targets = [
+            (r"\\.\DISPLAY1", "显示器 1（主显示器）"),
+            (r"\\.\DISPLAY2", "显示器 2"),
+        ]
+        overlay.sync(
+            {
+                "price_game_mode_default": "pve",
+                "display_filter_target_id": r"\\.\DISPLAY2",
+            },
+            [{"name": "Default", "gamma": 1.0}],
+            "ready",
+            display_targets=targets,
+        )
+        emitted: list[str] = []
+        overlay.display_target_changed.connect(emitted.append)
+
+        self.assertEqual(overlay.display_target_combo.currentData(), r"\\.\DISPLAY2")
+        overlay.display_target_combo.setCurrentIndex(0)
+        self.assertEqual(emitted, [r"\\.\DISPLAY1"])
 
     def test_control_emits_user_changes(self) -> None:
         overlay = RaidControlOverlay()

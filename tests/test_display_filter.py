@@ -56,6 +56,31 @@ class DisplayFilterTests(unittest.TestCase):
         self.assertEqual(set_effect.call_args_list[-1].args[0], baseline_effect)
         uninitialize.assert_called_once_with()
 
+    def test_targeted_gamma_uses_same_display_for_start_update_and_restore(self) -> None:
+        ramp = tuple(tuple(range(256)) for _ in range(3))
+        with patch("app.display_filter.get_gamma_ramp", return_value=ramp) as get_ramp, patch(
+            "app.display_filter.set_gamma_ramp"
+        ) as set_ramp:
+            baseline = start_display_filter({"gamma": 0.8}, r"\\.\DISPLAY2")
+            update_display_filter({"gamma": 0.7}, baseline)
+            restore_display_filter(baseline)
+
+        get_ramp.assert_called_once_with(r"\\.\DISPLAY2")
+        self.assertEqual(baseline.target_id, r"\\.\DISPLAY2")
+        self.assertEqual(set_ramp.call_args_list[0].args[1], r"\\.\DISPLAY2")
+        self.assertEqual(set_ramp.call_args_list[1].args[1], r"\\.\DISPLAY2")
+        self.assertEqual(set_ramp.call_args_list[2].args[1], r"\\.\DISPLAY2")
+
+    def test_targeted_gamma_does_not_fall_back_to_global_color_matrix(self) -> None:
+        with patch(
+            "app.display_filter.get_gamma_ramp",
+            side_effect=DisplayFilterError("unsupported"),
+        ), patch("app.display_filter._magnification_initialize") as initialize:
+            with self.assertRaisesRegex(DisplayFilterError, "不会自动回退"):
+                start_display_filter({"gamma": 0.8}, r"\\.\DISPLAY2")
+
+        initialize.assert_not_called()
+
     def test_eye_care_does_not_restore_while_any_assistant_window_is_active(self) -> None:
         window = Mock()
         window._closing = False

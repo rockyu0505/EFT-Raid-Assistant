@@ -110,7 +110,7 @@ class RecipeCatalogTests(unittest.TestCase):
 
         self.assertEqual(len(lines), 1)
         self.assertIn("测试弹药 ×60", lines[0])
-        self.assertIn("需当前物品 ×2", lines[0])
+        self.assertIn("需求：2 个", lines[0])
         self.assertIn("物品等级≥15", lines[0])
         self.assertIn("需可用状态", lines[0])
 
@@ -176,7 +176,7 @@ class RecipeCatalogTests(unittest.TestCase):
                     recipe_id="craft-1",
                     product_text="测试弹药 ×60",
                     source_text="工作台 Lv2 制作",
-                    requirement_text="需当前物品 ×2",
+                    requirement_text="需求：2 个",
                 )
             ],
             recipe_accent_color="#33AA77",
@@ -185,11 +185,14 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertEqual(len(view.recipe_notices), 1)
         self.assertIn("测试弹药", view.label_html)
         self.assertIn("#33AA77", view.label_html)
-        self.assertIn("关注配方", view.log_text)
+        self.assertIn("制作/兑换配方", view.log_text)
+        self.assertIn("需求：2 个", view.label_html)
 
         toast = PriceToast(view)
         self.assertFalse(toast._recipe_box.isHidden())
         self.assertIn("测试弹药", toast._recipe_content_label.text())
+        self.assertEqual(toast._recipe_title_label.text(), "制作/兑换配方")
+        self.assertIn("需求：2 个", toast._recipe_content_label.text())
         self.assertIn("#33AA77", toast._recipe_box.styleSheet())
         toast.close()
 
@@ -315,15 +318,23 @@ class RecipeCatalogTests(unittest.TestCase):
     def test_interface_font_setting_applies_live(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)
         config["ui_font_size"] = 15
+        config["ui_theme"] = "dark"
         dialog = SettingsDialog(config)
 
         self.assertEqual(dialog.ui_font_size.value(), 15)
+        self.assertEqual(dialog.ui_theme.currentData(), "dark")
         dialog.ui_font_size.setValue(17)
+        dialog.ui_theme.setCurrentIndex(dialog.ui_theme.findData("high_contrast"))
         self.assertEqual(dialog.values()["ui_font_size"], 17)
-        apply_app_theme(self.app, 17)
+        self.assertEqual(dialog.values()["ui_theme"], "high_contrast")
+        apply_app_theme(self.app, 17, "high_contrast")
         self.assertEqual(self.app.font().pointSize(), 17)
 
-        apply_app_theme(self.app, int(DEFAULT_CONFIG["ui_font_size"]))
+        apply_app_theme(
+            self.app,
+            int(DEFAULT_CONFIG["ui_font_size"]),
+            DEFAULT_CONFIG["ui_theme"],
+        )
         dialog.close()
 
     def test_recipe_tree_font_and_spacing_scale_live(self) -> None:

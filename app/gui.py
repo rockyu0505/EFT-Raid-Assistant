@@ -99,7 +99,11 @@ from app.config import CONFIG_PATH, DEFAULT_ENABLED_FEATURES, FEATURE_DEFINITION
 from app.display_filter import (
     DisplayFilterBaseline,
     DisplayFilterError,
+    DisplayTarget,
     build_gamma_ramp,
+    enumerate_display_targets,
+    preferred_display_target_id,
+    probe_display_target,
     restore_display_filter as restore_system_display_filter,
     start_display_filter,
     update_display_filter,
@@ -129,7 +133,7 @@ from app.recipes import (
 )
 from app.ui.raid_overlays import RaidControlOverlay, RaidLogOverlay
 from app.ui.state import LogBus, SettingsStore
-from app.ui.theme import apply_app_theme
+from app.ui.theme import THEME_LABELS, apply_app_theme
 
 
 DISPLAY_FILTER_SLIDERS = {
@@ -297,6 +301,11 @@ class MainWindow(QMainWindow):
         self._restore_main_window_geometry()
 
         self.settings_store = SettingsStore(self.config, self)
+        self._display_targets: list[DisplayTarget] = enumerate_display_targets()
+        self.config["display_filter_target_id"] = preferred_display_target_id(
+            self.config.get("display_filter_target_id", ""),
+            self._display_targets,
+        )
         self.log_bus = LogBus(self)
         self._first_run = not CONFIG_PATH.exists()
         self._runtime_enabled_features: set[str] = set()
@@ -410,6 +419,9 @@ class MainWindow(QMainWindow):
         )
         self.raid_control_overlay.panel_opacity_changed.connect(
             lambda value: self._set_live_setting("raid_panel_opacity", value)
+        )
+        self.raid_control_overlay.display_target_changed.connect(
+            self._on_raid_display_target_changed
         )
         self.raid_control_overlay.gamma_enabled_changed.connect(
             self._on_raid_gamma_enabled_changed
@@ -1562,11 +1574,17 @@ class MainWindow(QMainWindow):
         self.display_filter_preset_combo.currentIndexChanged.connect(
             self._on_display_filter_preset_changed
         )
+        self.display_filter_target_combo = QComboBox()
+        self._populate_display_target_combo(self.display_filter_target_combo)
+        self.display_filter_target_combo.currentIndexChanged.connect(
+            self._on_display_filter_target_changed
+        )
 
         self.display_filter_sliders: dict[str, QSlider] = {}
         self.display_filter_value_labels: dict[str, QLabel] = {}
         self.display_filter_summary_label = QLabel("")
         self.display_filter_summary_label.setWordWrap(True)
+        controls_layout.addRow("目标显示器", self.display_filter_target_combo)
         controls_layout.addRow("配色方案", self.display_filter_preset_combo)
         for key, (label, minimum, maximum, _scale, _decimals) in DISPLAY_FILTER_SLIDERS.items():
             slider = QSlider(Qt.Orientation.Horizontal)
@@ -1594,6 +1612,12 @@ class MainWindow(QMainWindow):
         self.display_filter_live_preview = QCheckBox("开启后，拖动滑条立即更新画面")
         self.display_filter_live_preview.setChecked(False)
         group_layout.addWidget(self.display_filter_live_preview)
+        target_note = QLabel(
+            "每次只修改所选 Windows 显示输出。名称中会同时显示物理显示器和显示适配器；"
+            "HDR、夜间模式、独占全屏或显卡驱动仍可能拦截 Gamma。"
+        )
+        target_note.setWordWrap(True)
+        group_layout.addWidget(target_note)
 
         self.display_filter_preset_name = QLineEdit()
         self.display_filter_preset_name.setPlaceholderText("输入名称后保存为自定义方案")
@@ -1630,12 +1654,15 @@ class MainWindow(QMainWindow):
         restore_button.clicked.connect(lambda checked=False: self.restore_display_filter(show_feedback=False))
         floating_button = QPushButton("打开高级独立调节窗")
         floating_button.clicked.connect(self.open_display_filter_control_window)
+        probe_button = QPushButton("检测所选显示器")
+        probe_button.clicked.connect(self.probe_selected_display_filter_target)
         buttons = QWidget()
         buttons_layout = QHBoxLayout(buttons)
         buttons_layout.setContentsMargins(0, 0, 0, 0)
         buttons_layout.addWidget(apply_button)
         buttons_layout.addWidget(next_button)
         buttons_layout.addWidget(restore_button)
+        buttons_layout.addWidget(probe_button)
         buttons_layout.addWidget(floating_button)
         group_layout.addWidget(buttons)
 
@@ -1664,6 +1691,132 @@ class MainWindow(QMainWindow):
         if not isinstance(presets, list):
             return []
         return [preset for preset in presets if isinstance(preset, dict)]
+
+    def _display_filter_target_options(self, *, refresh: bool = False) -> list[tuple[str, str]]:
+        if refresh:
+            self._display_targets = enumerate_display_targets()
+        if not self._display_targets:
+            return [("", "Windows 主显示器（自动）")]
+        qt_screens = list(QApplication.screens())
+        screens = {
+            (
+                screen.geometry().x(),
+                screen.geometry().y(),
+                screen.geometry().width(),
+                screen.geometry().height(),
+            ): screen
+            for screen in qt_screens
+        }
+        options: list[tuple[str, str]] = []
+        for target_index, target in enumerate(self._display_targets):
+            label = target.label
+            screen = screens.get(target.geometry)
+            if screen is None and len(qt_screens) == len(self._display_targets):
+                screen = qt_screens[target_index]
+            if screen is not None and target.monitor_name.casefold() in {
+                "",
+                "generic pnp monitor",
+                "通用即插即用监视器",
+            }:
+                physical_name = str(screen.name()).strip()
+                if physical_name:
+                    label = label.replace(target.monitor_name or "通用显示器", physical_name, 1)
+            options.append((target.target_id, label))
+        return options
+
+    def _populate_display_target_combo(
+        self, combo: QComboBox, *, refresh: bool = False
+    ) -> None:
+        options = self._display_filter_target_options(refresh=refresh)
+        selected = preferred_display_target_id(
+            self.config.get("display_filter_target_id", ""),
+            self._display_targets,
+        )
+        self.config["display_filter_target_id"] = selected
+        with QSignalBlocker(combo):
+            combo.clear()
+            for target_id, label in options:
+                combo.addItem(label, target_id)
+            index = combo.findData(selected)
+            combo.setCurrentIndex(max(0, index))
+
+    def _selected_display_filter_target_id(self) -> str:
+        if hasattr(self, "display_filter_target_combo"):
+            selected = str(self.display_filter_target_combo.currentData() or "")
+        else:
+            selected = str(self.config.get("display_filter_target_id", ""))
+        return preferred_display_target_id(selected, self._display_targets)
+
+    def _display_filter_target_label(self, target_id: str) -> str:
+        for target in self._display_targets:
+            if target.target_id == target_id:
+                return target.label
+        return target_id or "Windows 主显示器（自动）"
+
+    def _set_display_filter_target(
+        self,
+        target_id: str,
+        *,
+        reapply: bool = False,
+        preset: dict[str, object] | None = None,
+    ) -> None:
+        selected = preferred_display_target_id(target_id, self._display_targets)
+        changed = str(self.config.get("display_filter_target_id", "")) != selected
+        self.config["display_filter_target_id"] = selected
+        for combo in (
+            getattr(self, "display_filter_target_combo", None),
+            getattr(self.raid_control_overlay, "display_target_combo", None),
+            getattr(self._display_filter_dialog, "target_combo", None),
+        ):
+            if not isinstance(combo, QComboBox):
+                continue
+            with QSignalBlocker(combo):
+                index = combo.findData(selected)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+        if changed:
+            self._config_save_timer.start(350)
+            self._log_event(
+                f"Gamma 目标显示器已切换：{self._display_filter_target_label(selected)}"
+            )
+        if reapply and self._display_filter_baseline is not None:
+            self._apply_display_filter_preset(
+                preset or self._display_filter_preset_from_controls(),
+                notify=False,
+            )
+
+    def _on_display_filter_target_changed(self) -> None:
+        target_id = str(self.display_filter_target_combo.currentData() or "")
+        self._set_display_filter_target(
+            target_id,
+            reapply=self._display_filter_baseline is not None,
+            preset=self._display_filter_preset_from_controls(),
+        )
+
+    def probe_selected_display_filter_target(self) -> None:
+        target_id = self._selected_display_filter_target_id()
+        label = self._display_filter_target_label(target_id)
+        try:
+            probe_display_target(target_id)
+        except DisplayFilterError as exc:
+            self.display_filter_status_label.setText(f"显示器检测失败：{exc}")
+            self._log_event(f"Gamma 显示器检测失败：{label} · {exc}")
+            self._show_operation_feedback(
+                "显示器检测失败",
+                label,
+                str(exc),
+                accent_color="#FF5A5F",
+            )
+            return
+        message = "Windows Gamma Ramp 接口可读写；检测过程写回原值，不改变画面。"
+        self.display_filter_status_label.setText(f"显示器检测通过：{label}")
+        self._log_event(f"Gamma 显示器检测通过：{label}")
+        self._show_operation_feedback(
+            "显示器检测通过",
+            label,
+            message,
+            accent_color="#36D27F",
+        )
 
     def _selected_display_filter_preset(self) -> dict[str, object] | None:
         presets = self._display_filter_presets()
@@ -1982,6 +2135,10 @@ class MainWindow(QMainWindow):
             return
         if self._display_filter_dialog is None:
             self._display_filter_dialog = DisplayFilterControlDialog(self)
+        self._populate_display_target_combo(
+            self._display_filter_dialog.target_combo,
+            refresh=True,
+        )
         self._display_filter_dialog.reload_presets(
             select_name=str(self.config.get("display_filter_active_preset", ""))
         )
@@ -2022,9 +2179,16 @@ class MainWindow(QMainWindow):
             self._log("Gamma 显示调校模块未启用，已跳过写入系统 Gamma。")
             return
         name = str(preset.get("name", "Unnamed"))
+        target_id = self._selected_display_filter_target_id()
         try:
+            if (
+                self._display_filter_baseline is not None
+                and self._display_filter_baseline.target_id != target_id
+            ):
+                restore_system_display_filter(self._display_filter_baseline)
+                self._display_filter_baseline = None
             if self._display_filter_baseline is None:
-                self._display_filter_baseline = start_display_filter(preset)
+                self._display_filter_baseline = start_display_filter(preset, target_id)
             else:
                 update_display_filter(preset, self._display_filter_baseline)
         except DisplayFilterError as exc:
@@ -2063,9 +2227,6 @@ class MainWindow(QMainWindow):
             )
 
     def restore_display_filter(self, *, show_feedback: bool = True) -> None:
-        if not self._feature_enabled("display_filter"):
-            self._log("Gamma 显示调校模块未启用，已跳过恢复 Gamma。")
-            return
         if self._display_filter_baseline is None:
             self.raid_control_overlay.set_gamma_active(False)
             self.raid_control_overlay.set_gamma_status("画面增强当前处于关闭状态。")
@@ -2349,6 +2510,7 @@ class MainWindow(QMainWindow):
             presets,
             self._raid_status_text(),
             gamma_active=self._display_filter_baseline is not None,
+            display_targets=self._display_filter_target_options(refresh=True),
         )
 
     def toggle_raid_control_overlay(self) -> None:
@@ -2400,6 +2562,13 @@ class MainWindow(QMainWindow):
         self._apply_display_filter_preset(values, notify=False)
         self._config_save_timer.start(350)
 
+    def _on_raid_display_target_changed(self, target_id: str) -> None:
+        self._set_display_filter_target(
+            target_id,
+            reapply=self._display_filter_baseline is not None,
+            preset=self.raid_control_overlay.gamma_values(),
+        )
+
     def _on_raid_gamma_enabled_changed(self, enabled: bool) -> None:
         if enabled:
             self._apply_display_filter_preset(
@@ -2416,12 +2585,14 @@ class MainWindow(QMainWindow):
             return
         previous_features = self._configured_enabled_features()
         previous_font_size = _safe_int(self.config.get("ui_font_size")) or 11
+        previous_theme = str(self.config.get("ui_theme", "light"))
         previous_language = str(self.config.get("item_display_language", "zh"))
         self.config.update(dialog.values())
         features_changed = previous_features != self._configured_enabled_features()
         font_size = _safe_int(self.config.get("ui_font_size")) or 11
-        if font_size != previous_font_size:
-            apply_app_theme(QApplication.instance(), font_size)
+        current_theme = str(self.config.get("ui_theme", "light"))
+        if font_size != previous_font_size or current_theme != previous_theme:
+            apply_app_theme(QApplication.instance(), font_size, current_theme)
             self._sync_recipe_tree_fonts()
         if features_changed:
             self._apply_runtime_feature_configuration(previous_features)
@@ -2544,6 +2715,7 @@ class MainWindow(QMainWindow):
             "hideout_status_label",
             "hideout_table",
             "display_filter_status_label",
+            "display_filter_target_combo",
             "recipe_search_field",
             "recipe_summary_label",
             "recipe_tabs",
@@ -4015,6 +4187,12 @@ class DisplayFilterControlDialog(QDialog):
         self.resize(520, 360)
 
         layout = QVBoxLayout(self)
+        target_row = QFormLayout()
+        self.target_combo = QComboBox()
+        self.main_window._populate_display_target_combo(self.target_combo, refresh=True)
+        self.target_combo.currentIndexChanged.connect(self._on_target_changed)
+        target_row.addRow("目标显示器", self.target_combo)
+        layout.addLayout(target_row)
         self.combo = QComboBox()
         self.combo.currentIndexChanged.connect(self._on_preset_changed)
         layout.addWidget(self.combo)
@@ -4135,6 +4313,13 @@ class DisplayFilterControlDialog(QDialog):
 
     def apply_current(self) -> None:
         self.main_window._apply_display_filter_preset(self._preset_from_controls(), notify=False)
+
+    def _on_target_changed(self) -> None:
+        target_id = str(self.target_combo.currentData() or "")
+        active = self.main_window._display_filter_baseline is not None
+        self.main_window._set_display_filter_target(target_id, reapply=False)
+        if active:
+            self.apply_current()
 
     def create_new(self) -> None:
         default_name = self.main_window._unique_display_filter_preset_name("自定义方案")
@@ -4267,13 +4452,17 @@ class SettingsDialog(QDialog):
     def _build_interface_tab(self) -> QWidget:
         tab = QWidget()
         layout = QFormLayout(tab)
+        self.ui_theme = QComboBox()
+        for theme_id, label in THEME_LABELS.items():
+            self.ui_theme.addItem(label, theme_id)
         self.ui_font_size = QSpinBox()
         self.ui_font_size.setRange(9, 18)
         self.ui_font_size.setSuffix(" pt")
+        layout.addRow("界面主题", self.ui_theme)
         layout.addRow("主界面字体大小", self.ui_font_size)
         note = QLabel(
-            "保存后立即应用到主窗口和设置界面；局内悬浮提示保留独立字号，"
-            "避免遮挡游戏画面。"
+            "主题和字体保存后立即应用到主窗口与设置界面；局内半透明提示继续使用"
+            "独立暗色样式和字号，避免遮挡游戏画面。"
         )
         note.setWordWrap(True)
         layout.addRow(note)
@@ -4660,6 +4849,8 @@ class SettingsDialog(QDialog):
             _safe_int(self._config.get("price_cache_stale_hours")) or 24
         )
         self.price_overlay_seconds.setValue(int(self._config.get("price_overlay_seconds", 10)))
+        theme_index = self.ui_theme.findData(str(self._config.get("ui_theme", "light")))
+        self.ui_theme.setCurrentIndex(max(0, theme_index))
         self.ui_font_size.setValue(_safe_int(self._config.get("ui_font_size")) or 11)
         display_language_index = self.item_display_language.findData(
             str(self._config.get("item_display_language", "zh"))
@@ -4732,6 +4923,7 @@ class SettingsDialog(QDialog):
             "price_overlay_enabled": self.price_overlay_enabled.isChecked(),
             "price_overlay_seconds": self.price_overlay_seconds.value(),
             "close_to_tray": self.close_to_tray.isChecked(),
+            "ui_theme": self.ui_theme.currentData() or "light",
             "ui_font_size": self.ui_font_size.value(),
             "item_display_language": self.item_display_language.currentData() or "zh",
             "require_tarkov_foreground": self.require_tarkov_foreground.isChecked(),
@@ -4923,17 +5115,21 @@ def _build_price_view(
     notices = tuple(recipe_notices or [])
     recipe_html = ""
     if notices:
-        notice_rows = "<br>".join(
-            f"<b>{html.escape(notice.product_text)}</b> · "
-            f"{html.escape(notice.source_text)} · "
-            f"{html.escape(notice.requirement_text)}"
+        notice_rows = "<div style='height:5px;'></div>".join(
+            f"<div style='margin-top:4px;'>"
+            f"<span style='color:#9AA5B2;'>目标产物</span><br>"
+            f"<span style='color:{safe_recipe_color}; font-size:14px; font-weight:800;'>"
+            f"{html.escape(notice.product_text)}</span><br>"
+            f"<span style='color:#AEB7C2;'>{html.escape(notice.source_text)}</span> · "
+            f"<span style='font-weight:800;'>{html.escape(notice.requirement_text)}</span>"
+            f"</div>"
             for notice in notices
         )
         recipe_html = (
             f"<div style='margin-top:8px; padding:7px 9px; "
             f"border:1px solid {safe_recipe_color}; border-radius:6px;'>"
             f"<span style='color:{safe_recipe_color}; font-weight:800;'>"
-            f"关注配方用途</span><br>{notice_rows}</div>"
+            f"制作/兑换配方</span><br>{notice_rows}</div>"
         )
     detail_html = "<br>".join(html.escape(line) for line in detail.splitlines())
     label_html = (
@@ -4953,7 +5149,7 @@ def _build_price_view(
         log_text = f"{log_text} | 藏身处 {hideout_text}"
     if notices:
         log_text = (
-            f"{log_text} | 关注配方 "
+            f"{log_text} | 制作/兑换配方 "
             + "；".join(notice.compact_text for notice in notices)
         )
     return PriceView(
@@ -5240,7 +5436,7 @@ class PriceToast(QWidget):
         recipe_layout = QVBoxLayout(self._recipe_box)
         recipe_layout.setContentsMargins(10, 8, 10, 9)
         recipe_layout.setSpacing(5)
-        self._recipe_title_label = QLabel("关注配方用途")
+        self._recipe_title_label = QLabel("制作/兑换配方")
         self._recipe_content_label = QLabel()
         self._recipe_content_label.setWordWrap(True)
         self._recipe_content_label.setTextFormat(Qt.TextFormat.RichText)
@@ -5308,18 +5504,22 @@ class PriceToast(QWidget):
             self._recipe_title_label.setStyleSheet(
                 f"font-size: 12px; font-weight: 800; color: {color};"
             )
-            rows = "<br><br>".join(
-                f"<b>{html.escape(notice.product_text)}</b><br>"
-                f"<span style='color:#BFC3C8;'>"
-                f"{html.escape(notice.source_text)} · "
+            rows = "<div style='height:7px;'></div>".join(
+                f"<div>"
+                f"<span style='color:#929CAA;'>目标产物</span><br>"
+                f"<span style='font-size:14px; font-weight:800; color:{color};'>"
+                f"{html.escape(notice.product_text)}</span><br>"
+                f"<span style='color:#BFC3C8;'>{html.escape(notice.source_text)}</span> · "
+                f"<span style='font-weight:800; color:#FBFAF4;'>"
                 f"{html.escape(notice.requirement_text)}</span>"
+                f"</div>"
                 for notice in view.recipe_notices
             )
             self._recipe_content_label.setText(rows)
             self._recipe_content_label.setStyleSheet(
                 "font-size: 12px; color: rgba(245, 242, 232, 0.90);"
             )
-            estimated_height = max(44, len(view.recipe_notices) * 44)
+            estimated_height = max(58, len(view.recipe_notices) * 62)
             self._recipe_scroll.setFixedHeight(min(260, estimated_height))
             self._recipe_box.show()
         else:
