@@ -638,20 +638,61 @@ class MainWindow(QMainWindow):
             return
         collapsed = bool(collapsed)
         if not collapsed and hasattr(self, "main_content_splitter"):
+            self.main_log_group.setMinimumHeight(0)
             self.main_log_group.setMaximumHeight(16777215)
             self.log.show()
             height = max(100, _safe_int(self.config.get("main_log_height")) or 170)
-            total = max(self.main_content_splitter.height(), height + 420)
+            total = max(
+                sum(self.main_content_splitter.sizes()),
+                self.main_content_splitter.height(),
+                height + 420,
+            )
             self.main_content_splitter.setSizes([max(420, total - height), height])
         else:
+            sizes = self.main_content_splitter.sizes()
+            if (
+                not bool(self.config.get("main_log_collapsed", False))
+                and len(sizes) >= 2
+                and sizes[1] > 100
+            ):
+                self.config["main_log_height"] = sizes[1]
             self.log.hide()
-            self.main_log_group.setMaximumHeight(
-                self.main_log_toggle_button.sizeHint().height() + 46
+            collapsed_height = max(
+                58,
+                self.main_log_toggle_button.sizeHint().height() + 46,
             )
+            self.main_log_group.setMinimumHeight(collapsed_height)
+            self.main_log_group.setMaximumHeight(collapsed_height)
+            total = max(
+                sum(sizes),
+                self.main_content_splitter.height(),
+                collapsed_height + 420,
+            )
+            self.main_content_splitter.setSizes(
+                [max(420, total - collapsed_height), collapsed_height]
+            )
+            QTimer.singleShot(0, self._pin_collapsed_main_log_to_bottom)
         self.main_log_toggle_button.setText("展开日志" if collapsed else "收起日志")
         self.config["main_log_collapsed"] = collapsed
         if persist:
             self._config_save_timer.start(250)
+
+    def _pin_collapsed_main_log_to_bottom(self) -> None:
+        if (
+            not hasattr(self, "main_content_splitter")
+            or not bool(self.config.get("main_log_collapsed", False))
+        ):
+            return
+        collapsed_height = self.main_log_group.maximumHeight()
+        total = max(
+            sum(self.main_content_splitter.sizes()),
+            self.main_content_splitter.height(),
+        )
+        if total <= 0:
+            return
+        self.main_content_splitter.setSizes(
+            [max(1, total - collapsed_height), collapsed_height]
+        )
 
     def _on_main_content_splitter_moved(
         self, _position: int, _index: int

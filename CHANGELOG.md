@@ -2,6 +2,7 @@
 
 ## 0.7.0-dev - Unreleased
 
+- Fixed the collapsed main log so it shrinks the splitter pane and stays pinned to the bottom edge instead of leaving a floating log header in the middle of the window.
 - Added light (default), dark, and high-contrast application themes with immediate Settings switching while keeping in-raid translucent overlays dark.
 - Changed tracked-material notices to use the title “制作/兑换配方”, emphasize the target product, and show the current material as “需求：N 个”.
 - Removed the Gamma section from the F9 overlay when the display-filter feature is disabled.

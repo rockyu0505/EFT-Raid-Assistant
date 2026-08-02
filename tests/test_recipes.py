@@ -407,10 +407,24 @@ class RecipeCatalogTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(config["recipe_result_column_widths"][1], 92)
 
+        window.resize(1200, 800)
+        window.show()
+        self.app.processEvents()
+        expanded_panel_height = window.panel_stack.height()
         window._set_main_log_collapsed(True)
+        self.app.processEvents()
         self.assertTrue(config["main_log_collapsed"])
         self.assertFalse(window.log.isVisible())
+        self.assertGreater(window.panel_stack.height(), expanded_panel_height)
+        self.assertLessEqual(
+            abs(
+                window.main_log_group.geometry().bottom()
+                - window.main_content_splitter.contentsRect().bottom()
+            ),
+            2,
+        )
         window._set_main_log_collapsed(False)
+        self.app.processEvents()
         self.assertFalse(config["main_log_collapsed"])
         window.hide()
         window.deleteLater()
