@@ -161,7 +161,8 @@ class TarkovPriceClient:
 
     def set_game_mode(self, game_mode: str) -> str:
         self.current_game_mode = _normalize_game_mode(game_mode)
-        self._load_disk_cache(self.current_game_mode)
+        if not self._items_by_mode.get(self.current_game_mode):
+            self._load_disk_cache(self.current_game_mode)
         return self.current_game_mode
 
     def lookup(self, query: str, game_mode: str | None = None) -> ItemPrice:

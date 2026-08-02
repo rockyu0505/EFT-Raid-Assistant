@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 import time
 from pathlib import Path
-from typing import Any
 
+import numpy as np
 from PIL import Image, ImageEnhance, ImageOps
 
 from app.config import APP_DIR
@@ -51,6 +51,27 @@ def refine_tooltip_name_crop(
 ) -> tuple[bool, list[str]]:
     """Find the tooltip bounds inside the hover search crop and save a tighter name crop."""
     image = Image.open(search_path).convert("RGB")
+    refined_image, refined, details = refine_tooltip_name_image(
+        image,
+        padding=padding,
+        cursor_anchor=cursor_anchor,
+        cursor_bottom_gap=cursor_bottom_gap,
+        cursor_gap_tolerance=cursor_gap_tolerance,
+    )
+    refined_image.save(output_path)
+    return refined, details
+
+
+def refine_tooltip_name_image(
+    image: Image.Image,
+    padding: tuple[int, int, int, int] = (10, 8, 10, 8),
+    cursor_anchor: tuple[int, int] | None = None,
+    cursor_bottom_gap: int = 20,
+    cursor_gap_tolerance: int = 36,
+) -> tuple[Image.Image, bool, list[str]]:
+    """Find the tooltip bounds and return the name crop without filesystem round-trips."""
+    del padding  # Border detection already returns the exact content bounds used by the legacy path.
+    image = image.convert("RGB")
     border_box = _find_tooltip_border_box(
         image,
         cursor_anchor=cursor_anchor,
@@ -59,15 +80,14 @@ def refine_tooltip_name_crop(
     )
     if border_box is not None:
         crop_box = _inset_box(border_box, 2, image.size)
-        image.crop(crop_box).save(output_path)
+        refined_image = image.crop(crop_box)
         x0, y0, x1, y1 = border_box
         details = [f"border:{x1 - x0}x{y1 - y0}"]
         if cursor_anchor is not None:
             details.append(f"cursor-gap:{cursor_anchor[1] - y1}/{cursor_bottom_gap}")
-        return True, details
+        return refined_image, True, details
 
-    image.save(output_path)
-    return False, []
+    return image, False, []
 
 
 def _find_tooltip_border_box(
@@ -84,7 +104,7 @@ def _find_tooltip_border_box(
 
     candidates: list[tuple[float, tuple[int, int, int, int]]] = []
     width, height = image.size
-    gray_pixels = gray.load()
+    gray_pixels = np.asarray(gray, dtype=np.uint8)
     min_box_height = max(20, round(height * 0.08))
     for index, (top_y, top_x0, top_x1) in enumerate(runs):
         for bottom_y, bottom_x0, bottom_x1 in runs[index + 1 :]:
@@ -179,103 +199,79 @@ def _penalize_parent_tooltip_boxes(
     return adjusted
 
 
-def _tooltip_border_mask(gray: Image.Image) -> list[bytearray]:
-    width, height = gray.size
-    pixels = gray.load()
-    mask: list[bytearray] = []
-    for y in range(height):
-        row = bytearray(width)
-        for x in range(width):
-            value = pixels[x, y]
-            if value < 65 or value > 230:
-                continue
-            has_dark_neighbor = False
-            for dx, dy in ((0, 2), (0, -2), (2, 0), (-2, 0)):
-                nx = min(width - 1, max(0, x + dx))
-                ny = min(height - 1, max(0, y + dy))
-                if pixels[nx, ny] < 55:
-                    has_dark_neighbor = True
-                    break
-            if has_dark_neighbor:
-                row[x] = 1
-        mask.append(row)
-    return mask
+def _tooltip_border_mask(gray: Image.Image) -> np.ndarray:
+    pixels = np.asarray(gray, dtype=np.uint8)
+    if pixels.ndim != 2 or pixels.size == 0:
+        return np.zeros((0, 0), dtype=np.bool_)
+
+    height, width = pixels.shape
+    y_positions = np.arange(height)
+    x_positions = np.arange(width)
+    dark_neighbor = np.zeros((height, width), dtype=np.bool_)
+    dark_neighbor |= pixels[np.minimum(y_positions + 2, height - 1), :] < 55
+    dark_neighbor |= pixels[np.maximum(y_positions - 2, 0), :] < 55
+    dark_neighbor |= pixels[:, np.minimum(x_positions + 2, width - 1)] < 55
+    dark_neighbor |= pixels[:, np.maximum(x_positions - 2, 0)] < 55
+    return (pixels >= 65) & (pixels <= 230) & dark_neighbor
 
 
 def _horizontal_border_runs(
-    mask: list[bytearray],
+    mask: np.ndarray,
     min_run: int,
 ) -> list[tuple[int, int, int]]:
+    if mask.ndim != 2 or mask.size == 0:
+        return []
+    padded = np.pad(mask.astype(np.int8, copy=False), ((0, 0), (1, 1)))
+    transitions = np.diff(padded, axis=1)
     runs: list[tuple[int, int, int]] = []
-    for y, row in enumerate(mask):
-        x = 0
-        width = len(row)
-        while x < width:
-            while x < width and not row[x]:
-                x += 1
-            x0 = x
-            while x < width and row[x]:
-                x += 1
-            if x - x0 >= min_run:
-                runs.append((y, x0, x))
+    for y in range(mask.shape[0]):
+        starts = np.flatnonzero(transitions[y] == 1)
+        ends = np.flatnonzero(transitions[y] == -1)
+        for x0, x1 in zip(starts.tolist(), ends.tolist()):
+            if x1 - x0 >= min_run:
+                runs.append((y, x0, x1))
     return runs
 
 
-def _horizontal_line_score(mask: list[bytearray], y: int, x0: int, x1: int) -> float:
-    if y < 0 or y >= len(mask) or x1 <= x0:
+def _horizontal_line_score(mask: np.ndarray, y: int, x0: int, x1: int) -> float:
+    if mask.ndim != 2 or y < 0 or y >= mask.shape[0] or x1 <= x0:
         return 0.0
-    row = mask[y]
-    return sum(row[x0:x1]) / (x1 - x0)
+    return float(np.count_nonzero(mask[y, x0:x1])) / (x1 - x0)
 
 
-def _vertical_line_score(mask: list[bytearray], x: int, y0: int, y1: int) -> float:
-    if not mask or y1 <= y0:
+def _vertical_line_score(mask: np.ndarray, x: int, y0: int, y1: int) -> float:
+    if mask.ndim != 2 or mask.size == 0 or y1 <= y0:
         return 0.0
-    width = len(mask[0])
+    height, width = mask.shape
     left = max(0, x - 3)
     right = min(width, x + 4)
     if right <= left:
         return 0.0
     total = (right - left) * (y1 - y0 + 1)
-    hits = 0
-    for y in range(max(0, y0), min(len(mask), y1 + 1)):
-        row = mask[y]
-        hits += sum(row[left:right])
-    return hits / total
+    hits = np.count_nonzero(mask[max(0, y0) : min(height, y1 + 1), left:right])
+    return float(hits) / total
 
 
 def _dark_interior_ratio(
-    pixels: Any,
+    pixels: np.ndarray,
     box: tuple[int, int, int, int],
 ) -> float:
     x0, y0, x1, y1 = box
-    values = 0
-    dark = 0
-    for y in range(y0 + 3, y1 - 2):
-        for x in range(x0 + 3, x1 - 3):
-            values += 1
-            if pixels[x, y] < 65:
-                dark += 1
-    if values == 0:
+    values = pixels[y0 + 3 : y1 - 2, x0 + 3 : x1 - 3]
+    if values.size == 0:
         return 0.0
-    return dark / values
+    return float(np.count_nonzero(values < 65)) / values.size
 
 
 def _bright_interior_ratio(
-    pixels: Any,
+    pixels: np.ndarray,
     box: tuple[int, int, int, int],
 ) -> float:
     x0, y0, x1, y1 = box
-    values = 0
-    bright = 0
-    for y in range(y0 + 3, y1 - 2):
-        for x in range(x0 + 3, x1 - 3):
-            values += 1
-            if pixels[x, y] > 115:
-                bright += 1
-    if values == 0:
+    values = pixels[y0 + 3 : y1 - 2, x0 + 3 : x1 - 3]
+    if values.size == 0:
         return 0.0
-    return bright / values
+    return float(np.count_nonzero(values > 115)) / values.size
 
 
 def _inset_box(
@@ -295,8 +291,23 @@ def run_item_name_ocr(
     return _run_rapidocr_item_name(crop_path, model_version)
 
 
-def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v4") -> ParsedItemName:
+def run_item_name_ocr_image(
+    image: Image.Image,
+    model_version: str = "v5",
+) -> ParsedItemName:
+    """OCR an in-memory UI crop and return likely item-name candidates."""
+    return _run_rapidocr_item_name_image(image.convert("RGB"), model_version)
+
+
+def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v5") -> ParsedItemName:
     image = Image.open(crop_path).convert("RGB")
+    return _run_rapidocr_item_name_image(image, model_version)
+
+
+def _run_rapidocr_item_name_image(
+    image: Image.Image,
+    model_version: str = "v5",
+) -> ParsedItemName:
     line_images = _split_text_line_images(image)
     variants = _build_item_variants(image)
     line_variants = [
@@ -425,6 +436,13 @@ def detect_inventory_tab_crop(crop_path: Path) -> tuple[bool, list[str], str]:
     INVENTORY_TAB_DEBUG_PATH.parent.mkdir(exist_ok=True)
     if crop_path != INVENTORY_TAB_DEBUG_PATH:
         tab_crop.save(INVENTORY_TAB_DEBUG_PATH)
+
+    return detect_inventory_tab_image(tab_crop)
+
+
+def detect_inventory_tab_image(tab_crop: Image.Image) -> tuple[bool, list[str], str]:
+    """Detect the inventory screen directly from an in-memory crop."""
+    tab_crop = tab_crop.convert("RGB")
 
     tab_visual_score = _active_tab_visual_score(tab_crop)
     if tab_visual_score >= 1.0:

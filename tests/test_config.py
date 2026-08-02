@@ -30,6 +30,7 @@ class ConfigTests(unittest.TestCase):
                     {
                         "config_version": 1,
                         "enabled_features": ["price_lookup"],
+                        "performance_gc_after_worker": True,
                         "performance_skip_auto_price_refresh": True,
                     }
                 ),
@@ -42,7 +43,11 @@ class ConfigTests(unittest.TestCase):
             saved = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(loaded["config_version"], CONFIG_VERSION)
             self.assertFalse(loaded["performance_skip_auto_price_refresh"])
+            self.assertEqual(loaded["performance_ocr_threads"], 2)
+            self.assertTrue(loaded["performance_price_timing_logs"])
+            self.assertNotIn("performance_gc_after_worker", loaded)
             self.assertEqual(saved["config_version"], CONFIG_VERSION)
+            self.assertNotIn("performance_gc_after_worker", saved)
             self.assertFalse(path.with_suffix(".json.tmp").exists())
 
 

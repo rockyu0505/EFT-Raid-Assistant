@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from PIL import Image
 from PySide6.QtCore import (
     QModelIndex,
     QPoint,
@@ -87,11 +88,10 @@ from app.capture import (
     capture_timer_strip,
     debug_paths,
     hideout_debug_path,
-    hover_search_debug_path,
-    inventory_tab_debug_path,
     is_tarkov_foreground,
     item_debug_path,
     resolve_capture_region,
+    save_item_lookup_debug_images,
     scale_metric,
 )
 from app.config import APP_DIR, RESOURCE_DIR, load_config, save_config
@@ -113,13 +113,14 @@ from app.hideout import HideoutDataError, HideoutTracker
 from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
 from app.hotkeys import HotkeyManager, normalize_hotkey
 from app.item_ocr import (
-    detect_inventory_tab_crop,
-    refine_tooltip_name_crop,
-    run_item_name_ocr,
+    detect_inventory_tab_image,
+    refine_tooltip_name_image,
+    run_item_name_ocr_image,
 )
 from app.models import TRADERS, TraderReminder
 from app.ocr import OcrUnavailableError, run_ocr, timer_to_seconds
 from app.prices import PriceLookupError, TarkovPriceClient, ensure_editable_aliases_path
+from app.rapid_ocr import configure_rapid_ocr_threads
 from app.reminders import ReminderManager
 from app.recipes import (
     RecipeCatalog,
@@ -283,6 +284,7 @@ class MainWindow(QMainWindow):
     display_filter_restore_requested = Signal()
     display_filter_preset_requested = Signal(str)
     price_result_ready = Signal(object, str)
+    price_lookup_timing_ready = Signal(str, float)
     price_history_ready = Signal(object, object, str)
     cache_refresh_ready = Signal(object)
     price_history_json_failed = Signal(object, str)
@@ -400,6 +402,7 @@ class MainWindow(QMainWindow):
         self.display_filter_restore_requested.connect(self.restore_display_filter)
         self.display_filter_preset_requested.connect(self.apply_display_filter_preset_by_name)
         self.price_result_ready.connect(self._on_price_result_ready)
+        self.price_lookup_timing_ready.connect(self._on_price_lookup_timing_ready)
         self.price_history_ready.connect(self._on_price_history_ready)
         self.cache_refresh_ready.connect(self._on_cache_refresh_ready)
         self.price_history_json_failed.connect(self._on_price_history_json_failed)
@@ -2517,6 +2520,10 @@ class MainWindow(QMainWindow):
 
     def _apply_performance_settings(self) -> None:
         self._apply_log_limit()
+        ocr_threads = configure_rapid_ocr_threads(
+            self.config.get("performance_ocr_threads", 2)
+        )
+        self.config["performance_ocr_threads"] = ocr_threads
         if bool(self.config.get("performance_mode_enabled", True)):
             try:
                 seconds = int(self.config.get("performance_cleanup_interval_seconds", 60))
@@ -3342,7 +3349,8 @@ class MainWindow(QMainWindow):
         if self._closing or not self._feature_enabled("price_lookup") or self.price_client is None:
             self._log("查价模块未启用，已跳过物品查价。")
             return
-        self._save_config()
+        pipeline_started = time.perf_counter()
+        timings: list[tuple[str, float]] = []
         if not self._ensure_tarkov_foreground("item lookup"):
             return
         manual_size = self._manual_size()
@@ -3355,76 +3363,102 @@ class MainWindow(QMainWindow):
                 time.sleep(wait_ms / 1000)
 
         capture_region: Region | None = None
-        save_full_screenshot = False
+        calibrated_now = False
         hover_cursor_anchor: tuple[int, int] | None = None
+        hover_search_image = None
+        item_image = None
+        inventory_image = None
+        stage_started = time.perf_counter()
         try:
             previous_region = self._cached_item_region
             capture_region = resolve_capture_region(capture_mode)
             resolution_changed = _region_size_signature(previous_region) != _region_size_signature(
                 capture_region
             )
-            save_full_screenshot = not self._item_region_calibrated or resolution_changed
+            calibrated_now = not self._item_region_calibrated or resolution_changed
             self._cached_item_region = capture_region
             self._item_region_calibrated = True
             if resolution_changed:
                 self._clear_state_detection_cache()
 
             if item_mode == "Hover tooltip":
-                _, _, size, region_name, hover_cursor_anchor = capture_hover_item_name_region(
-                    capture_mode,
-                    offset=tuple(self.config.get("hover_tooltip_offset", [12, -60])),
-                    crop_size=tuple(self.config.get("hover_tooltip_size", [360, 110])),
-                    search_margins=tuple(
-                        self.config.get("hover_search_margins", [560, 560, 240, 45])
-                    ),
-                    region=capture_region,
-                    save_full_screenshot=save_full_screenshot,
+                _, hover_search_image, size, region_name, hover_cursor_anchor = (
+                    capture_hover_item_name_region(
+                        capture_mode,
+                        offset=tuple(self.config.get("hover_tooltip_offset", [12, -60])),
+                        crop_size=tuple(self.config.get("hover_tooltip_size", [360, 110])),
+                        search_margins=tuple(
+                            self.config.get("hover_search_margins", [560, 560, 240, 45])
+                        ),
+                        region=capture_region,
+                        save_full_screenshot=False,
+                        save_debug_images=False,
+                    )
                 )
+                item_image = hover_search_image
             else:
-                _, _, size, region_name = capture_item_name_region(
+                _, item_image, size, region_name = capture_item_name_region(
                     capture_mode,
                     manual_size=manual_size,
                     roi_base=tuple(self.config.get("item_roi_base", [670, 120, 1420, 260])),
+                    region=capture_region,
+                    save_debug_images=False,
                 )
         except Exception as exc:
             self._cached_item_region = None
             self._item_region_calibrated = False
+            timings.append(("ROI截图失败", _elapsed_ms(stage_started)))
             self._log(f"物品截图失败：{exc}")
+            self._log_price_lookup_timings(timings, pipeline_started)
             QMessageBox.warning(self, "物品截图失败", str(exc))
             return
+        timings.append(("ROI截图", _elapsed_ms(stage_started)))
 
         if hasattr(self, "detected_size_label"):
             self.detected_size_label.setText(f"Capture: {size[0]}x{size[1]} ({region_name})")
         self._log(f"Captured item region: {size[0]}x{size[1]}, source: {region_name}.")
-        if save_full_screenshot:
-            self._log("Capture region calibrated; subsequent item lookups use ROI-only crops.")
+        if calibrated_now:
+            self._log("Capture region calibrated with ROI-only capture; full-screen PNG skipped.")
         else:
             self._log("Using ROI-only capture: tooltip + inventory tab.")
 
         if bool(self.config.get("require_inventory_check", True)):
+            stage_started = time.perf_counter()
             try:
-                detected, found = self._detect_inventory_from_capture(
+                detected, found, inventory_image = self._detect_inventory_from_capture(
                     capture_mode,
                     manual_size,
                     capture_region,
                 )
             except OcrUnavailableError as exc:
+                timings.append(("装备页检测失败", _elapsed_ms(stage_started)))
                 self._log(str(exc))
+                self._log_price_lookup_timings(timings, pipeline_started)
                 QMessageBox.warning(self, "OCR 不可用", str(exc))
                 return
             except Exception as exc:
+                timings.append(("装备页检测失败", _elapsed_ms(stage_started)))
                 self._log(f"Inventory tab check failed: {exc}")
+                self._log_price_lookup_timings(timings, pipeline_started)
                 return
+            timings.append(("装备页检测", _elapsed_ms(stage_started)))
             if not detected:
+                save_item_lookup_debug_images(
+                    hover_search=hover_search_image,
+                    item_name=item_image,
+                    inventory_tab=inventory_image,
+                )
                 self.item_price_label.setText("Price: inventory tab not detected")
                 if self.price_overlay is not None:
                     self.price_overlay.clear_prices()
                 self._log_event("已拒绝查价：没有检测到装备/背包页面。")
                 self._log(f"Inventory tab not detected. Keywords: {', '.join(found) or 'none'}")
+                self._log_price_lookup_timings(timings, pipeline_started)
                 return
             self._log(f"Inventory tab detected: {', '.join(found)}")
 
         if item_mode == "Hover tooltip":
+            stage_started = time.perf_counter()
             try:
                 tooltip_gap = scale_metric(
                     int(self.config.get("tooltip_cursor_bottom_gap", 20)),
@@ -3438,9 +3472,8 @@ class MainWindow(QMainWindow):
                     int(self.config.get("tooltip_cursor_reference_height", 2160)),
                     minimum=14,
                 )
-                refined, words = refine_tooltip_name_crop(
-                    hover_search_debug_path(),
-                    item_debug_path(),
+                item_image, refined, words = refine_tooltip_name_image(
+                    hover_search_image,
                     tuple(self.config.get("hover_name_padding", [10, 8, 10, 8])),
                     hover_cursor_anchor,
                     tooltip_gap,
@@ -3454,28 +3487,55 @@ class MainWindow(QMainWindow):
                 self._log("Tooltip name box located: " + (" ".join(words) or "no text"))
             else:
                 self._log("Tooltip name box not located; using wider OCR crop.")
+            timings.append(("Tooltip定位", _elapsed_ms(stage_started)))
 
+        stage_started = time.perf_counter()
         try:
-            result = run_item_name_ocr(item_debug_path())
+            result = run_item_name_ocr_image(item_image)
         except OcrUnavailableError as exc:
+            timings.append(("物品OCR失败", _elapsed_ms(stage_started)))
+            save_item_lookup_debug_images(
+                hover_search=hover_search_image,
+                item_name=item_image,
+                inventory_tab=inventory_image,
+            )
             self._log(str(exc))
+            self._log_price_lookup_timings(timings, pipeline_started)
             QMessageBox.warning(self, "OCR 不可用", str(exc))
             return
         except Exception as exc:
+            timings.append(("物品OCR失败", _elapsed_ms(stage_started)))
+            save_item_lookup_debug_images(
+                hover_search=hover_search_image,
+                item_name=item_image,
+                inventory_tab=inventory_image,
+            )
             self._log(f"物品 OCR 失败：{exc}")
+            self._log_price_lookup_timings(timings, pipeline_started)
             QMessageBox.warning(self, "物品 OCR 失败", str(exc))
             return
+        timings.append(("物品OCR", _elapsed_ms(stage_started)))
 
         self._log(f"Item OCR preprocessing: {result.variant_name}")
         self._log("Item candidate names: " + (", ".join(result.candidates) or "none"))
 
         if not result.candidates:
+            save_item_lookup_debug_images(
+                hover_search=hover_search_image,
+                item_name=item_image,
+                inventory_tab=inventory_image,
+            )
             self.item_price_label.setText("Price: no item name detected")
             self._log_event("无匹配物品：没有识别到可用的物品名。")
+            self._log_price_lookup_timings(timings, pipeline_started)
             return
 
         self.item_name_field.setText(result.candidates[0])
-        self._lookup_item_candidates(result.candidates)
+        self._lookup_item_candidates(
+            result.candidates,
+            timings=timings,
+            pipeline_started=pipeline_started,
+        )
 
     def capture_item_price_after_delay(self) -> None:
         if not self._feature_enabled("price_lookup") or self.price_client is None:
@@ -3504,7 +3564,9 @@ class MainWindow(QMainWindow):
             self._log_event("已跳过查价：物品名为空。")
             return
 
+        mode_started = time.perf_counter()
         mode = self.price_client.set_game_mode(self._selected_price_game_mode())
+        self._on_price_lookup_timing_ready("价格模式准备", _elapsed_ms(mode_started))
         self.current_price_game_mode = mode
         self.config["price_game_mode_default"] = mode
         label = _game_mode_label(mode)
@@ -3561,7 +3623,13 @@ class MainWindow(QMainWindow):
         value = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
         self._on_item_completion_activated(value)
 
-    def _lookup_item_candidates(self, names: list[str]) -> None:
+    def _lookup_item_candidates(
+        self,
+        names: list[str],
+        *,
+        timings: list[tuple[str, float]] | None = None,
+        pipeline_started: float | None = None,
+    ) -> None:
         if not self._feature_enabled("price_lookup") or self.price_client is None:
             self._log("查价模块未启用，已跳过候选查价。")
             return
@@ -3577,7 +3645,15 @@ class MainWindow(QMainWindow):
             self.item_price_label.setText("Price: no item name detected")
             self._log_event("无匹配物品：没有识别到可用的物品名。")
             return
+        mode_started = time.perf_counter()
         mode = self.price_client.set_game_mode(self._selected_price_game_mode())
+        mode_elapsed_ms = _elapsed_ms(mode_started)
+        if timings is not None:
+            timings.append(("价格模式准备", mode_elapsed_ms))
+            if pipeline_started is not None:
+                self._log_price_lookup_timings(timings, pipeline_started)
+        else:
+            self._on_price_lookup_timing_ready("价格模式准备", mode_elapsed_ms)
         self.current_price_game_mode = mode
         self.config["price_game_mode_default"] = mode
         label = _game_mode_label(mode)
@@ -3588,33 +3664,56 @@ class MainWindow(QMainWindow):
     def _lookup_price_worker(self, name: str, game_mode: str) -> None:
         if self._closing or self.price_client is None:
             return
+        started = time.perf_counter()
         try:
             price = self.price_client.lookup(name, game_mode)
         except PriceLookupError as exc:
-            if not self._closing:
-                self.price_result_ready.emit(None, str(exc))
+            price = None
+            error = str(exc)
         except Exception as exc:
-            if not self._closing:
-                self.price_result_ready.emit(None, f"查价异常：{exc}")
+            price = None
+            error = f"查价异常：{exc}"
         else:
-            if not self._closing:
-                self.price_result_ready.emit(price, "")
+            error = ""
+        if not self._closing:
+            self.price_lookup_timing_ready.emit("本地价格匹配", _elapsed_ms(started))
+            self.price_result_ready.emit(price, error)
 
     def _lookup_price_candidates_worker(self, names: list[str], game_mode: str) -> None:
         if self._closing or self.price_client is None:
             return
+        started = time.perf_counter()
         try:
             price = self.price_client.lookup_candidates(names, game_mode)
         except PriceLookupError as exc:
-            if not self._closing:
-                self.price_result_ready.emit(None, str(exc))
-            return
+            price = None
+            error = str(exc)
         except Exception as exc:
-            if not self._closing:
-                self.price_result_ready.emit(None, f"查价异常：{exc}")
-            return
+            price = None
+            error = f"查价异常：{exc}"
+        else:
+            error = ""
         if not self._closing:
-            self.price_result_ready.emit(price, "")
+            self.price_lookup_timing_ready.emit("本地候选匹配", _elapsed_ms(started))
+            self.price_result_ready.emit(price, error)
+
+    def _price_timing_logs_enabled(self) -> bool:
+        return bool(self.config.get("performance_price_timing_logs", True))
+
+    def _log_price_lookup_timings(
+        self,
+        timings: list[tuple[str, float]],
+        pipeline_started: float,
+    ) -> None:
+        if not self._price_timing_logs_enabled():
+            return
+        parts = [f"{label} {elapsed:.1f}ms" for label, elapsed in timings]
+        parts.append(f"前台合计 {_elapsed_ms(pipeline_started):.1f}ms")
+        self._log("查价性能：" + " · ".join(parts))
+
+    def _on_price_lookup_timing_ready(self, label: str, elapsed_ms: float) -> None:
+        if self._price_timing_logs_enabled():
+            self._log(f"查价性能：{label} {elapsed_ms:.2f}ms")
 
     def _price_history_worker(self, price: object, source: str = "json") -> None:
         if self._closing or self.price_client is None:
@@ -3668,24 +3767,25 @@ class MainWindow(QMainWindow):
         capture_mode: str,
         manual_size: tuple[int, int] | None,
         capture_region: Region | None,
-    ) -> tuple[bool, list[str]]:
+    ) -> tuple[bool, list[str], Image.Image | None]:
         signature = _region_size_signature(capture_region)
         cached = self._inventory_check_cache
         if cached is not None:
             cached_at, cached_signature, cached_detected, cached_found = cached
             if cached_signature == signature and self._state_detection_cache_is_fresh(cached_at):
                 self._log("Using cached inventory tab state.")
-                return cached_detected, cached_found
+                return cached_detected, cached_found, None
 
-        capture_inventory_tab_region(
+        inventory_image, _, _ = capture_inventory_tab_region(
             capture_mode,
             manual_size,
             tuple(self.config.get("inventory_tab_roi_base", [105, 0, 235, 48])),
             capture_region,
+            save_debug_image=False,
         )
-        detected, found, _ = detect_inventory_tab_crop(inventory_tab_debug_path())
+        detected, found, _ = detect_inventory_tab_image(inventory_image)
         self._inventory_check_cache = (time.monotonic(), signature, detected, found)
-        return detected, found
+        return detected, found, inventory_image
 
     def _state_detection_cache_is_fresh(self, cached_at: float) -> bool:
         ttl = max(0.0, float(self.config.get("state_detection_cache_seconds", 2)))
@@ -3718,8 +3818,6 @@ class MainWindow(QMainWindow):
                 current = threading.current_thread()
                 with self._workers_lock:
                     self._workers.discard(current)
-                if bool(self.config.get("performance_gc_after_worker", True)):
-                    self._cleanup_memory()
 
         thread = threading.Thread(target=run, name=name, daemon=True)
         with self._workers_lock:
@@ -3742,12 +3840,14 @@ class MainWindow(QMainWindow):
     def _on_resource_cleanup_timer(self) -> None:
         if self._closing or self._active_worker_count() > 0:
             return
+        tarkov_active, _ = is_tarkov_foreground()
+        if tarkov_active:
+            return
         self._cleanup_memory()
 
     def _cleanup_memory(self) -> None:
         if not bool(self.config.get("performance_mode_enabled", True)):
             return
-        self._inventory_check_cache = None
         gc.collect()
 
     def _join_workers(self, timeout: float = 1.0) -> None:
@@ -4767,8 +4867,12 @@ class SettingsDialog(QDialog):
     def _build_performance_tab(self) -> QWidget:
         tab = QWidget()
         layout = QFormLayout(tab)
-        self.performance_mode_enabled = QCheckBox("性能模式：限制后台任务并主动释放临时内存")
-        self.performance_gc_after_worker = QCheckBox("后台任务结束后主动释放临时对象")
+        self.performance_mode_enabled = QCheckBox("性能模式：限制后台任务并在非游戏时定期整理内存")
+        self.performance_ocr_threads = QComboBox()
+        self.performance_ocr_threads.addItem("低占用（1 线程）", 1)
+        self.performance_ocr_threads.addItem("推荐（2 线程）", 2)
+        self.performance_ocr_threads.addItem("快速（4 线程）", 4)
+        self.performance_price_timing_logs = QCheckBox("在运行日志中记录查价分阶段耗时")
         self.performance_skip_auto_price_refresh = QCheckBox(
             "性能模式下仅在价格缓存过期时检查更新"
         )
@@ -4779,7 +4883,8 @@ class SettingsDialog(QDialog):
         self.performance_max_concurrent_workers = QSpinBox()
         self.performance_max_concurrent_workers.setRange(1, 4)
         layout.addRow(self.performance_mode_enabled)
-        layout.addRow(self.performance_gc_after_worker)
+        layout.addRow("OCR CPU 占用", self.performance_ocr_threads)
+        layout.addRow(self.performance_price_timing_logs)
         layout.addRow(self.performance_skip_auto_price_refresh)
         layout.addRow("可见日志最多行数", self.performance_log_max_lines)
         layout.addRow("空闲清理间隔秒数", self.performance_cleanup_interval_seconds)
@@ -4913,8 +5018,12 @@ class SettingsDialog(QDialog):
         self.performance_mode_enabled.setChecked(
             bool(self._config.get("performance_mode_enabled", True))
         )
-        self.performance_gc_after_worker.setChecked(
-            bool(self._config.get("performance_gc_after_worker", True))
+        ocr_threads_index = self.performance_ocr_threads.findData(
+            _safe_int(self._config.get("performance_ocr_threads")) or 2
+        )
+        self.performance_ocr_threads.setCurrentIndex(max(0, ocr_threads_index))
+        self.performance_price_timing_logs.setChecked(
+            bool(self._config.get("performance_price_timing_logs", True))
         )
         self.performance_skip_auto_price_refresh.setChecked(
             bool(self._config.get("performance_skip_auto_price_refresh", True))
@@ -4981,7 +5090,10 @@ class SettingsDialog(QDialog):
             "raid_log_opacity": self.raid_log_opacity.value(),
             "raid_log_max_lines": self.raid_log_max_lines.value(),
             "performance_mode_enabled": self.performance_mode_enabled.isChecked(),
-            "performance_gc_after_worker": self.performance_gc_after_worker.isChecked(),
+            "performance_ocr_threads": self.performance_ocr_threads.currentData() or 2,
+            "performance_price_timing_logs": (
+                self.performance_price_timing_logs.isChecked()
+            ),
             "performance_skip_auto_price_refresh": (
                 self.performance_skip_auto_price_refresh.isChecked()
             ),
@@ -5370,6 +5482,10 @@ def _region_size_signature(region: Region | None) -> tuple[int, int] | None:
     if region is None:
         return None
     return region.width, region.height
+
+
+def _elapsed_ms(started: float) -> float:
+    return (time.perf_counter() - started) * 1000.0
 
 
 class PriceOverlay(QWidget):

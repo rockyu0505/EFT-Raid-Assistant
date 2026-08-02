@@ -73,6 +73,26 @@ class JsonPriceClientTests(unittest.TestCase):
             minimum_item_count=1,
         )
 
+    def test_set_game_mode_reuses_the_loaded_in_memory_cache(self) -> None:
+        loaded_items = [{"id": "loaded", "name": "Loaded item"}]
+        self.client._items_by_mode["pve"] = loaded_items
+
+        with patch.object(self.client, "_load_disk_cache") as load_disk_cache:
+            selected = self.client.set_game_mode("pve")
+
+        self.assertEqual(selected, "pve")
+        self.assertIs(self.client._items_by_mode["pve"], loaded_items)
+        load_disk_cache.assert_not_called()
+
+    def test_set_game_mode_loads_from_disk_only_when_memory_is_empty(self) -> None:
+        self.client._items_by_mode["pve"] = []
+
+        with patch.object(self.client, "_load_disk_cache") as load_disk_cache:
+            selected = self.client.set_game_mode("pve")
+
+        self.assertEqual(selected, "pve")
+        load_disk_cache.assert_called_once_with("pve")
+
     def test_json_refresh_is_default_and_merges_translations(self) -> None:
         documents = {
             "regular/items": (_item_document(27000), '"regular"'),

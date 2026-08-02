@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.7.0-dev - Unreleased
+## 0.7.0 - 2026-08-02
+
+- Reduced in-raid lookup CPU spikes by limiting RapidOCR to a configurable 1/2/4-thread budget, with 2 threads as the default.
+- Removed normal lookup screenshot filesystem round-trips, retained diagnostic images only on failures, and stopped forcing a full garbage collection after every worker.
+- Reused the already loaded price-mode cache instead of reparsing and reindexing all item data on every lookup.
+- Vectorized Tooltip border detection and added staged lookup timing diagnostics; warm in-game lookups now normally complete in roughly 60–100 ms on the validated system.
+- Kept periodic idle cleanup away from Tarkov foreground sessions and preserved the short-lived inventory-state cache.
 
 - Fixed the collapsed main log so it shrinks the splitter pane and stays pinned to the bottom edge instead of leaving a floating log header in the middle of the window.
 - Added light (default), dark, and high-contrast application themes with immediate Settings switching while keeping in-raid translucent overlays dark.

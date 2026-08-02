@@ -19,8 +19,30 @@ class RapidText:
     variant_name: str
 
 
-_ENGINES: dict[str, object] = {}
+DEFAULT_OCR_CPU_THREADS = 2
+SUPPORTED_OCR_CPU_THREADS = (1, 2, 4)
+
+
+_ENGINES: dict[tuple[str, int], object] = {}
 _ENGINE_INIT_MS: dict[str, int] = {}
+_OCR_CPU_THREADS = DEFAULT_OCR_CPU_THREADS
+
+
+def configure_rapid_ocr_threads(value: object) -> int:
+    """Select the CPU thread budget used by newly requested RapidOCR engines."""
+    global _OCR_CPU_THREADS
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = DEFAULT_OCR_CPU_THREADS
+    if requested not in SUPPORTED_OCR_CPU_THREADS:
+        requested = DEFAULT_OCR_CPU_THREADS
+    _OCR_CPU_THREADS = requested
+    return requested
+
+
+def rapid_ocr_threads() -> int:
+    return _OCR_CPU_THREADS
 
 
 def run_rapid_text(
@@ -58,9 +80,10 @@ def run_rapid_text(
 
 def _get_engine(model_version: str) -> object:
     key = _engine_key(model_version)
-    if key in _ENGINES:
+    engine_key = (key, _OCR_CPU_THREADS)
+    if engine_key in _ENGINES:
         _ENGINE_INIT_MS[key] = 0
-        return _ENGINES[key]
+        return _ENGINES[engine_key]
 
     try:
         from rapidocr import OCRVersion, RapidOCR  # type: ignore
@@ -71,9 +94,16 @@ def _get_engine(model_version: str) -> object:
     params: dict[str, Any] | None = None
     if key == "v5":
         params = {"Rec.ocr_version": OCRVersion.PPOCRV5}
-    _ENGINES[key] = RapidOCR(params=params)
+    params = dict(params or {})
+    params.update(
+        {
+            "EngineConfig.onnxruntime.intra_op_num_threads": _OCR_CPU_THREADS,
+            "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+        }
+    )
+    _ENGINES[engine_key] = RapidOCR(params=params)
     _ENGINE_INIT_MS[key] = round((time.perf_counter() - started) * 1000)
-    return _ENGINES[key]
+    return _ENGINES[engine_key]
 
 
 def _engine_key(model_version: str) -> str:

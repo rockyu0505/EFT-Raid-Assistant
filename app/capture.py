@@ -157,24 +157,19 @@ def capture_item_name_region(
     capture_mode: str,
     manual_size: tuple[int, int] | None,
     roi_base: tuple[int, int, int, int] = DEFAULT_ITEM_NAME_BOX,
+    region: Region | None = None,
+    save_debug_images: bool = True,
 ) -> tuple[Image.Image, Image.Image, tuple[int, int], str]:
     """Capture an adjustable item-name/details region for OCR price lookup."""
     DEBUG_DIR.mkdir(exist_ok=True)
-    region = _resolve_region(capture_mode)
-
-    with mss() as screen:
-        grabbed = screen.grab(region.as_mss())
-
-    image = Image.frombytes("RGB", grabbed.size, grabbed.rgb)
-    actual_size = image.size
-    scale_size = manual_size or actual_size
-
-    crop_box = scale_box(roi_base, scale_size)
-    crop_box = _fit_crop_box(crop_box, actual_size)
-    crop = image.crop(crop_box)
-
-    image.save(FULL_SCREENSHOT_PATH)
-    crop.save(ITEM_NAME_PATH)
+    region = region or _resolve_region(capture_mode)
+    actual_size = (region.width, region.height)
+    crop = _capture_scaled_roi(region, manual_size, roi_base)
+    image = crop
+    if save_debug_images:
+        image = _grab_region(region)
+        image.save(FULL_SCREENSHOT_PATH)
+        crop.save(ITEM_NAME_PATH)
     return image, crop, actual_size, region.name
 
 
@@ -185,6 +180,7 @@ def capture_hover_item_name_region(
     search_margins: tuple[int, int, int, int] | None = DEFAULT_HOVER_SEARCH_MARGINS,
     region: Region | None = None,
     save_full_screenshot: bool = True,
+    save_debug_images: bool = True,
 ) -> tuple[Image.Image, Image.Image, tuple[int, int], str, tuple[int, int]]:
     """Capture the tooltip search area near the current mouse cursor."""
     DEBUG_DIR.mkdir(exist_ok=True)
@@ -219,8 +215,9 @@ def capture_hover_item_name_region(
         image.save(FULL_SCREENSHOT_PATH)
     else:
         image = crop
-    crop.save(ITEM_HOVER_SEARCH_PATH)
-    crop.save(ITEM_NAME_PATH)
+    if save_debug_images:
+        crop.save(ITEM_HOVER_SEARCH_PATH)
+        crop.save(ITEM_NAME_PATH)
     return image, crop, (region.width, region.height), crop_region.name, cursor_anchor
 
 
@@ -229,12 +226,30 @@ def capture_inventory_tab_region(
     manual_size: tuple[int, int] | None,
     roi_base: tuple[int, int, int, int],
     region: Region | None = None,
+    save_debug_image: bool = True,
 ) -> tuple[Image.Image, tuple[int, int], str]:
     DEBUG_DIR.mkdir(exist_ok=True)
     region = region or _resolve_region(capture_mode)
     crop = _capture_scaled_roi(region, manual_size, roi_base)
-    crop.save(INVENTORY_TAB_PATH)
+    if save_debug_image:
+        crop.save(INVENTORY_TAB_PATH)
     return crop, (region.width, region.height), region.name
+
+
+def save_item_lookup_debug_images(
+    *,
+    hover_search: Image.Image | None = None,
+    item_name: Image.Image | None = None,
+    inventory_tab: Image.Image | None = None,
+) -> None:
+    """Persist only the item-lookup images needed to diagnose a failed lookup."""
+    DEBUG_DIR.mkdir(exist_ok=True)
+    if hover_search is not None:
+        hover_search.save(ITEM_HOVER_SEARCH_PATH)
+    if item_name is not None:
+        item_name.save(ITEM_NAME_PATH)
+    if inventory_tab is not None:
+        inventory_tab.save(INVENTORY_TAB_PATH)
 
 
 def capture_game_mode_region(

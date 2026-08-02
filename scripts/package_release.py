@@ -27,7 +27,7 @@ PUBLIC_FILES = (
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build a verified portable dev package.")
+    parser = argparse.ArgumentParser(description="Build a verified portable package.")
     parser.add_argument("--skip-tests", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()

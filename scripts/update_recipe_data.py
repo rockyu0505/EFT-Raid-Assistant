@@ -114,7 +114,7 @@ def main() -> int:
 def _fetch_json(resource_path: str) -> tuple[dict[str, Any], str]:
     request = urllib.request.Request(
         f"{JSON_API}/{resource_path}",
-        headers={"Accept": "application/json", "User-Agent": "EFT-Raid-Assistant/0.6"},
+        headers={"Accept": "application/json", "User-Agent": "EFT-Raid-Assistant/0.7.0"},
     )
     with urllib.request.urlopen(request, timeout=45) as response:
         raw = response.read()
