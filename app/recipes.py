@@ -22,6 +22,7 @@ class RecipeNotice:
     product_text: str
     source_text: str
     requirement_text: str
+    material_text: str = ""
 
     @property
     def compact_text(self) -> str:
@@ -281,16 +282,22 @@ def recipe_notice(record: dict[str, Any], item_id: str) -> RecipeNotice:
                 required_count = item.get("count")
                 matched_requirement = item
                 break
-    qualifier_text = "".join(
-        f" · {qualifier}" for qualifier in _requirement_qualifiers(matched_requirement)
+    count_text = _format_count(required_count)
+    qualifiers = _requirement_qualifiers(matched_requirement)
+    qualifier_text = "".join(f" · {qualifier}" for qualifier in qualifiers)
+    material_name = str(
+        matched_requirement.get("name")
+        or matched_requirement.get("short_name")
+        or "当前物品"
     )
     return RecipeNotice(
         recipe_id=str(record.get("id") or ""),
         product_text=recipe_title(record),
         source_text=recipe_source_text(record),
         requirement_text=(
-            f"需求：{_format_count(required_count)} 个{qualifier_text}"
+            f"需求：{count_text} 个{qualifier_text}"
         ),
+        material_text=f"{material_name} ×{count_text}{qualifier_text}",
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import math
 import re
 import shutil
 import statistics
@@ -16,6 +17,7 @@ from typing import Any
 
 from app.config import APP_DIR, RESOURCE_DIR
 from app.models import HistoricalPriceSummary, ItemPrice
+from app.price_estimator import SmartPriceEstimate, estimate_smart_listing_price
 
 
 TARKOV_DEV_GRAPHQL = "https://api.tarkov.dev/graphql"
@@ -30,6 +32,12 @@ BUNDLED_CHINESE_ALIASES_PATH = RESOURCE_DATA_DIR / "item_aliases_zh.json"
 GAME_MODES = ("regular", "pve")
 JSON_TRANSLATION_MODE = "regular"
 DEFAULT_MINIMUM_ITEM_COUNT = 1000
+SMART_HISTORY_CACHE_SECONDS = 15 * 60
+FLEA_MARKET_ITEM_TAX_RATE = 0.05
+FLEA_MARKET_REQUIREMENT_TAX_RATE = 0.05
+FLEA_MARKET_INTELLIGENCE_CENTER_DISCOUNT = 0.30
+FLEA_MARKET_HIDEOUT_MANAGEMENT_BONUS_PER_LEVEL = 0.003
+FLEA_MARKET_MAX_HIDEOUT_MANAGEMENT_LEVEL = 50
 TRADER_NAMES = {
     "54cb50c76803fa8b248b4571": "Prapor",
     "54cb57776803fa99248b456e": "Therapist",
@@ -119,6 +127,66 @@ class PriceLookupError(RuntimeError):
     pass
 
 
+def calculate_flea_market_fee(
+    base_price: object,
+    listing_price: object,
+    *,
+    intelligence_center_level: object = 0,
+    hideout_management_level: object = 0,
+) -> int | None:
+    """Estimate Tarkov 1.1's fee for one full-condition item listed for RUB."""
+    try:
+        item_value = float(base_price)
+        requirement_value = float(listing_price)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not math.isfinite(item_value)
+        or not math.isfinite(requirement_value)
+        or item_value <= 0
+        or requirement_value <= 0
+    ):
+        return None
+
+    offer_multiplier = math.log10(item_value / requirement_value)
+    requirement_multiplier = math.log10(requirement_value / item_value)
+    if requirement_value >= item_value:
+        requirement_multiplier = math.pow(requirement_multiplier, 1.08)
+    else:
+        offer_multiplier = math.pow(offer_multiplier, 1.08)
+
+    fee = (
+        item_value
+        * FLEA_MARKET_ITEM_TAX_RATE
+        * math.pow(4.0, offer_multiplier)
+        + requirement_value
+        * FLEA_MARKET_REQUIREMENT_TAX_RATE
+        * math.pow(4.0, requirement_multiplier)
+    )
+    try:
+        intel_level = int(intelligence_center_level)
+    except (TypeError, ValueError):
+        intel_level = 0
+    try:
+        management_level = int(hideout_management_level)
+    except (TypeError, ValueError):
+        management_level = 0
+    management_level = max(
+        0,
+        min(FLEA_MARKET_MAX_HIDEOUT_MANAGEMENT_LEVEL, management_level),
+    )
+    if intel_level >= 3:
+        discount = (
+            FLEA_MARKET_INTELLIGENCE_CENTER_DISCOUNT
+            + FLEA_MARKET_HIDEOUT_MANAGEMENT_BONUS_PER_LEVEL * management_level
+        )
+        fee *= 1.0 - discount
+
+    # Tarkov rounds the positive fee to the nearest whole rouble. Python's
+    # built-in round uses ties-to-even, so use the game's half-up behaviour.
+    return math.floor(fee + 0.5)
+
+
 @dataclass(frozen=True)
 class CompletionEntry:
     display: str
@@ -152,7 +220,13 @@ class TarkovPriceClient:
         self._full_name_lookup_by_mode: dict[str, dict[str, int]] = {
             mode: {} for mode in GAME_MODES
         }
+        self._id_lookup_by_mode: dict[str, dict[str, int]] = {
+            mode: {} for mode in GAME_MODES
+        }
         self._lookup_cache: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
+        self._historical_points_cache: dict[
+            tuple[str, str, str, int], tuple[float, list[dict[str, Any]]]
+        ] = {}
         self._json_etags: dict[str, str] = {}
         self._aliases: dict[str, str] = {}
         for mode in GAME_MODES:
@@ -234,6 +308,9 @@ class TarkovPriceClient:
         slots = _item_slots(width, height)
         item_types = _item_types(match)
         is_firearm = _is_firearm_item(match, item_types)
+        ammo_properties, ammo_pack_count, ammo_name, ammo_zh_name = (
+            self._ammo_details(match, mode, item_types)
+        )
         return ItemPrice(
             item_id=str(match.get("id") or ""),
             game_mode=mode,
@@ -262,7 +339,64 @@ class TarkovPriceClient:
             best_vendor_currency=best_vendor[3],
             wiki_link=match.get("wikiLink"),
             updated=match.get("updated"),
+            ammo_properties=ammo_properties,
+            ammo_pack_count=ammo_pack_count,
+            ammo_name=ammo_name,
+            ammo_zh_name=ammo_zh_name,
         )
+
+    def _ammo_details(
+        self,
+        item: dict[str, Any],
+        game_mode: str,
+        item_types: tuple[str, ...],
+    ) -> tuple[dict[str, object] | None, int | None, str, str]:
+        normalized_types = {_normalize(value) for value in item_types}
+        properties = item.get("properties")
+        if "ammo" in normalized_types and isinstance(properties, dict):
+            if properties.get("propertiesType") == "ItemPropertiesAmmo":
+                return (
+                    dict(properties),
+                    None,
+                    str(item.get("name") or ""),
+                    str(item.get("zhName") or ""),
+                )
+
+        if "ammobox" not in normalized_types:
+            return None, None, "", ""
+        contains = item.get("containsItems")
+        if not isinstance(contains, list):
+            return None, None, "", ""
+        items = self._items_by_mode.get(game_mode) or []
+        id_lookup = self._id_lookup_by_mode.get(game_mode) or {}
+        for contained in contains:
+            if not isinstance(contained, dict):
+                continue
+            reference = contained.get("item")
+            if isinstance(reference, dict):
+                ammo_item = reference
+            else:
+                item_id = str(reference or "")
+                item_index = id_lookup.get(item_id)
+                ammo_item = (
+                    items[item_index]
+                    if item_index is not None and item_index < len(items)
+                    else None
+                )
+            if not isinstance(ammo_item, dict):
+                continue
+            ammo_properties = ammo_item.get("properties")
+            if not isinstance(ammo_properties, dict):
+                continue
+            if ammo_properties.get("propertiesType") != "ItemPropertiesAmmo":
+                continue
+            return (
+                dict(ammo_properties),
+                _as_int(contained.get("count")),
+                str(ammo_item.get("name") or ""),
+                str(ammo_item.get("zhName") or ""),
+            )
+        return None, None, "", ""
 
     def historical_price_summary(
         self,
@@ -299,6 +433,49 @@ class TarkovPriceClient:
             low_price=min(clean_all_prices) if clean_all_prices else None,
             high_price=max(clean_all_prices) if clean_all_prices else None,
             days=days,
+        )
+
+    def smart_listing_estimate(
+        self,
+        price: ItemPrice,
+        *,
+        days: int = 2,
+        source: str = "json",
+        cache_seconds: float = SMART_HISTORY_CACHE_SECONDS,
+    ) -> SmartPriceEstimate:
+        """Fetch one item's history on demand and build a robust listing estimate."""
+        item_id = str(price.item_id or "").strip()
+        if not item_id:
+            raise PriceLookupError("物品 ID 为空，无法智能估价。")
+        mode = _normalize_game_mode(price.game_mode or self.current_game_mode)
+        refresh_source = _normalize_refresh_source(source)
+        history_days = max(1, int(days))
+        cache_key = (mode, item_id, refresh_source, history_days)
+        cached = self._historical_points_cache.get(cache_key)
+        now_monotonic = time.monotonic()
+        if cached is not None and now_monotonic - cached[0] <= max(0.0, cache_seconds):
+            points = cached[1]
+        else:
+            if refresh_source == "graphql":
+                points = self._fetch_historical_prices_graphql(
+                    item_id,
+                    mode,
+                    history_days,
+                )
+            else:
+                points = self._fetch_historical_prices_json(
+                    item_id,
+                    mode,
+                    history_days,
+                )
+            points = [dict(point) for point in points if isinstance(point, dict)]
+            self._historical_points_cache[cache_key] = (now_monotonic, points)
+
+        return estimate_smart_listing_price(
+            points,
+            current_last_low=price.last_low_price,
+            current_offer_count=price.last_offer_count,
+            now=time.time(),
         )
 
     def refresh_items(self, game_mode: str | None = None, source: str = "json") -> int:
@@ -736,8 +913,12 @@ class TarkovPriceClient:
         normalized_query = _normalize(query)
         best_item: dict[str, Any] | None = None
         best_score = 0.0
+        best_item_ids: set[str] = set()
 
-        for item in self._candidate_items_for_query(normalized_query, items, game_mode):
+        for item_index, item in enumerate(
+            self._candidate_items_for_query(normalized_query, items, game_mode)
+        ):
+            item_identity = str(item.get("id") or f"index:{item_index}")
             names = [
                 item.get("name"),
                 item.get("shortName"),
@@ -751,37 +932,49 @@ class TarkovPriceClient:
                 score = _match_score(normalized_query, _normalize(name))
                 score = _apply_feature_adjustments(normalized_query, str(name), item, score)
                 score = _apply_short_name_anchor(normalized_query, item, score)
-                if score > best_score:
+                if score > best_score + 1e-9:
                     best_item = item
                     best_score = score
+                    best_item_ids = {item_identity}
+                elif abs(score - best_score) <= 1e-9:
+                    best_item_ids.add(item_identity)
 
-        if best_score < 0.58:
+        if best_score < 0.58 or len(best_item_ids) != 1:
             return None, best_score
         return best_item, best_score
 
     def _build_search_index(self, game_mode: str) -> None:
         items = self._items_by_mode.get(game_mode) or []
         index: dict[str, set[int]] = {}
-        name_lookup: dict[str, int] = {}
+        name_lookup: dict[str, set[int]] = {}
         full_name_lookup: dict[str, set[int]] = {}
+        id_lookup: dict[str, int] = {}
         for item_index, item in enumerate(items):
+            item_id = str(item.get("id") or "")
+            if item_id:
+                id_lookup[item_id] = item_index
             for token in _item_index_tokens(item):
                 index.setdefault(token, set()).add(item_index)
             for value in _item_name_values(item):
                 normalized = _normalize(value)
                 if normalized:
-                    name_lookup.setdefault(normalized, item_index)
+                    name_lookup.setdefault(normalized, set()).add(item_index)
             for value in _item_full_name_values(item):
                 compact = _compact_exact_name_text(value)
                 if compact:
                     full_name_lookup.setdefault(compact, set()).add(item_index)
         self._search_index_by_mode[game_mode] = index
-        self._name_lookup_by_mode[game_mode] = name_lookup
+        self._name_lookup_by_mode[game_mode] = {
+            normalized: next(iter(indexes))
+            for normalized, indexes in name_lookup.items()
+            if len(indexes) == 1
+        }
         self._full_name_lookup_by_mode[game_mode] = {
             compact: next(iter(indexes))
             for compact, indexes in full_name_lookup.items()
             if len(indexes) == 1
         }
+        self._id_lookup_by_mode[game_mode] = id_lookup
 
     def _candidate_items_for_query(
         self,
@@ -1090,7 +1283,10 @@ def _match_score(query: str, candidate: str) -> float:
         shorter = min(len(query), len(candidate))
         longer = max(len(query), len(candidate))
         ratio = shorter / longer
-        if shorter < 8 and ratio < 0.5:
+        # A short name occupying only half of a noisy OCR string is not strong
+        # enough evidence for a price match (for example, "电路板" inside a
+        # mis-cropped "绳索电路板医").
+        if shorter < 8 and ratio <= 0.5:
             return 0.42 + 0.30 * ratio
         if ratio < 0.35:
             return 0.55 + 0.25 * ratio

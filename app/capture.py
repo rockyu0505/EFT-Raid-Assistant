@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -7,7 +9,7 @@ from typing import Any
 from PIL import Image
 from mss import mss
 
-from app.config import APP_DIR
+from app.config import APP_DIR, HOVER_SEARCH_MARGINS
 
 
 BASE_SCREEN_SIZE = (2048, 1152)
@@ -15,7 +17,7 @@ DEFAULT_TIMER_STRIP_BOX = (0, 150, 1500, 240)
 DEFAULT_ITEM_NAME_BOX = (670, 120, 1420, 260)
 DEFAULT_HOVER_TOOLTIP_OFFSET = (12, -60)
 DEFAULT_HOVER_TOOLTIP_SIZE = (360, 110)
-DEFAULT_HOVER_SEARCH_MARGINS = (560, 560, 240, 45)
+DEFAULT_HOVER_SEARCH_MARGINS = HOVER_SEARCH_MARGINS
 TARKOV_WINDOW_KEYWORDS = ("escapefromtarkov", "escape from tarkov", "tarkov")
 TARKOV_PROCESS_KEYWORDS = ("escapefromtarkov", "tarkov")
 DEBUG_DIR = APP_DIR / "debug"
@@ -24,6 +26,7 @@ TIMER_STRIP_PATH = DEBUG_DIR / "last_timer_strip.png"
 ITEM_NAME_PATH = DEBUG_DIR / "last_item_name.png"
 ITEM_HOVER_SEARCH_PATH = DEBUG_DIR / "last_item_hover_search.png"
 INVENTORY_TAB_PATH = DEBUG_DIR / "last_inventory_tab.png"
+CHARACTER_HEADER_PATH = DEBUG_DIR / "last_character_header.png"
 GAME_MODE_PATH = DEBUG_DIR / "last_game_mode.png"
 HIDEOUT_SCREENSHOT_PATH = DEBUG_DIR / "last_hideout_screenshot.png"
 
@@ -181,7 +184,16 @@ def capture_hover_item_name_region(
     region: Region | None = None,
     save_full_screenshot: bool = True,
     save_debug_images: bool = True,
-) -> tuple[Image.Image, Image.Image, tuple[int, int], str, tuple[int, int]]:
+    capture_guard: Callable[[Region], AbstractContextManager[None]] | None = None,
+) -> tuple[
+    Image.Image,
+    Image.Image,
+    tuple[int, int],
+    str,
+    tuple[int, int],
+    int | None,
+    int | None,
+]:
     """Capture the tooltip search area near the current mouse cursor."""
     DEBUG_DIR.mkdir(exist_ok=True)
     region = region or _resolve_region(capture_mode)
@@ -208,7 +220,11 @@ def capture_hover_item_name_region(
         height=crop_box[3] - crop_box[1],
         name=f"{region.name}; cursor tooltip search",
     )
-    crop = _grab_region(crop_region)
+    guard = capture_guard(crop_region) if capture_guard is not None else nullcontext()
+    with guard:
+        crop = _grab_region(crop_region)
+    client_right_edge_x = crop_region.width if crop_box[2] == region.width else None
+    client_top_edge_y = 0 if crop_box[1] == 0 else None
 
     if save_full_screenshot:
         image = _grab_region(region)
@@ -218,7 +234,15 @@ def capture_hover_item_name_region(
     if save_debug_images:
         crop.save(ITEM_HOVER_SEARCH_PATH)
         crop.save(ITEM_NAME_PATH)
-    return image, crop, (region.width, region.height), crop_region.name, cursor_anchor
+    return (
+        image,
+        crop,
+        (region.width, region.height),
+        crop_region.name,
+        cursor_anchor,
+        client_right_edge_x,
+        client_top_edge_y,
+    )
 
 
 def capture_inventory_tab_region(
@@ -241,6 +265,7 @@ def save_item_lookup_debug_images(
     hover_search: Image.Image | None = None,
     item_name: Image.Image | None = None,
     inventory_tab: Image.Image | None = None,
+    character_header: Image.Image | None = None,
 ) -> None:
     """Persist only the item-lookup images needed to diagnose a failed lookup."""
     DEBUG_DIR.mkdir(exist_ok=True)
@@ -250,6 +275,8 @@ def save_item_lookup_debug_images(
         item_name.save(ITEM_NAME_PATH)
     if inventory_tab is not None:
         inventory_tab.save(INVENTORY_TAB_PATH)
+    if character_header is not None:
+        character_header.save(CHARACTER_HEADER_PATH)
 
 
 def capture_game_mode_region(
@@ -382,37 +409,88 @@ def _try_tarkov_window() -> Region | None:
     except ImportError:
         return None
 
-    keywords = ("escapefromtarkov", "escape from tarkov", "tarkov")
+    try:
+        import win32process  # type: ignore
+    except ImportError:
+        win32process = None
+
     matches: list[Any] = []
 
-    def enum_handler(hwnd: int, _: object) -> None:
+    def window_identity(hwnd: int) -> tuple[bool, bool, str, str]:
+        title = win32gui.GetWindowText(hwnd).strip()
+        normalized_title = title.lower().replace(" ", "")
+        title_match = any(
+            keyword.replace(" ", "") in normalized_title
+            for keyword in TARKOV_WINDOW_KEYWORDS
+        )
+        process_name = ""
+        if win32process is not None:
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                process_name = _process_name_from_pid(pid)
+            except Exception:
+                process_name = ""
+        normalized_process = process_name.lower().replace(" ", "")
+        process_match = any(
+            keyword.replace(" ", "") in normalized_process
+            for keyword in TARKOV_PROCESS_KEYWORDS
+        )
+        return title_match, process_match, title, process_name
+
+    def is_game_window(hwnd: int) -> bool:
         if not win32gui.IsWindowVisible(hwnd):
-            return
-        title = win32gui.GetWindowText(hwnd).lower()
-        if any(keyword in title for keyword in keywords):
+            return False
+        try:
+            if win32gui.IsIconic(hwnd):
+                return False
+        except Exception:
+            pass
+        title_match, process_match, _, process_name = window_identity(hwnd)
+        if process_name:
+            return process_match
+        return title_match
+
+    def window_region(hwnd: int) -> Region:
+        title_match, process_match, title, process_name = window_identity(hwnd)
+        del title_match, process_match
+        try:
+            left, top, right, bottom = win32gui.GetClientRect(hwnd)
+            screen_left, screen_top = win32gui.ClientToScreen(hwnd, (left, top))
+            screen_right, screen_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
+        except Exception:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            screen_left, screen_top, screen_right, screen_bottom = left, top, right, bottom
+
+        width = max(1, screen_right - screen_left)
+        height = max(1, screen_bottom - screen_top)
+        identity = " / ".join(value for value in (title, process_name) if value) or "Tarkov"
+        return Region(
+            left=screen_left,
+            top=screen_top,
+            width=width,
+            height=height,
+            name=f"Tarkov window ({identity}) at {screen_left},{screen_top}",
+        )
+
+    try:
+        foreground = win32gui.GetForegroundWindow()
+    except Exception:
+        foreground = 0
+    if foreground and is_game_window(foreground):
+        return window_region(foreground)
+
+    def enum_handler(hwnd: int, _: object) -> None:
+        if is_game_window(hwnd):
             matches.append(hwnd)
 
     win32gui.EnumWindows(enum_handler, None)
     if not matches:
         return None
 
-    hwnd = matches[0]
-    try:
-        left, top, right, bottom = win32gui.GetClientRect(hwnd)
-        screen_left, screen_top = win32gui.ClientToScreen(hwnd, (left, top))
-        screen_right, screen_bottom = win32gui.ClientToScreen(hwnd, (right, bottom))
-    except Exception:
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        screen_left, screen_top, screen_right, screen_bottom = left, top, right, bottom
-
-    width = max(1, screen_right - screen_left)
-    height = max(1, screen_bottom - screen_top)
-    return Region(
-        left=screen_left,
-        top=screen_top,
-        width=width,
-        height=height,
-        name="Tarkov window",
+    regions = [window_region(hwnd) for hwnd in matches]
+    return max(
+        regions,
+        key=lambda candidate: candidate.width * candidate.height,
     )
 
 

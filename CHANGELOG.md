@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.7.2 - 2026-08-07
+
+- Added an immediate local listing suggestion that uses `lastLowPrice` directly, shows the 24-hour average and API sample time alongside it, and warns instead of silently changing the suggestion when market depth is thin or the references diverge.
+- Added an optional per-item smart listing estimate using 48 hours of log-price history, time/liquidity weighting, robust median/MAD outlier handling, and confirmed multi-snapshot regime shifts for events or early-wipe demand spikes.
+- Kept smart history off by default and asynchronous when enabled; the recent-low card appears first, history is cached for 15 minutes, and every usable smart estimate updates the suggested listing/net proceeds while its confidence remains visible.
+- Redesigned price cards around three after-fee sale regions (`flea better`, `trader better`, or `close`), suggested listing/net proceeds, both API references, confidence, sample time, and compact risk notices; removed the visible floor value, routine volatility ranges, and redundant single-slot value text.
+- Changed value-per-slot colors and card borders to follow the conservative realizable net value, including the best trader floor, so uncertain smart estimates cannot inflate the loot tier.
+- Redesigned tracked-recipe callouts as a compact, independently tinted in-raid reminder between the sale advice and API details; it names the required material, shows at most three uses, and summarizes overflow without an unusable scroll area while leaving the outer value-tier border untouched. Checking, deleting, or clearing tracked recipes now updates checkbox state without rebuilding and collapsing the browsed recipe tree.
+- Added Night Blue and Sakura Pink application themes for the desktop shell while keeping every in-raid overlay on the existing dark immersive palette.
+
+- Reworked trader restock reminders around one live state source: the main table and a non-focus aggregate overlay now update every active trader countdown once per second.
+- Integrated the existing reminder popup and F7 behavior into the aggregate countdown overlay; triggered traders are highlighted, while an explicit user hide remains respected for later alerts.
+- Removed editable trader-timer fields and the secondary schedule button; OCR now atomically replaces reminders for the currently selected traders.
+- Changed strict cursor-anchored tooltip validation to treat text density only as an empty-box check; short names such as `节能灯泡` now proceed to OCR and local item matching instead of being rejected before OCR.
+- Made Tarkov 1.1 tooltip height select the OCR layout deterministically: normal-height boxes stay single-line, while tall boxes use joined line recognition; also covered 720p borders, maximum-width 4K tooltips, and ambiguous short-name rejection.
+- Added Tarkov 1.1 flea-market fee estimation using the current 5% item and requirement rates, Intelligence Center 3, and Hideout Management discounts; price cards now compare after-fee flea proceeds with the best trader price.
+- Added Intelligence Center (0-3) and Hideout Management (0-50) inputs to first-run setup and Settings; both ship as 0 rather than using the developer's profile.
+- Validated the fee implementation against 18 in-game measurements for Medical tools and WD-40 (100ml), with exact rouble-for-rouble agreement across listings from 1,000 to 100,000 RUB.
+- Restored price-tooltip recognition for Tarkov 1.1's wider/taller tooltip layout, including wrapped item names, while retaining empty-box rejection and legacy-tooltip compatibility.
+- Anchored Tarkov 1.1 tooltip detection to the cursor-left offset or visible client right edge, with a hard maximum width, so inventory label rows no longer outrank the real tooltip.
+- Preserved item names containing navigation words such as `地图`, and reduced false short-name matches from noisy OCR strings such as `绳索电路板医`.
+- Reworked the price overlay into a three-card animated stack: existing cards ease downward before a delayed, gentler new-result fade, and the oldest card moves out while fading when the stack overflows.
+- Temporarily hides only price cards intersecting the active capture region, using native window pixels on high-DPI displays and waiting for the Windows compositor before capture; it then restores their position, opacity, animation, and remaining lifetime so partially covered upper-right tooltips remain queryable.
+- Added a two-stage character-screen guard: when a dragged container obscures the Equipment tab, the Achievements tab can provisionally confirm the page, but lookup still requires strict tooltip geometry and a unique local item match.
+- Corrected top-edge tooltip handling to use client-top clamping, matching Tarkov's right-edge behavior; below-cursor boxes are no longer accepted as a special case.
+- Changed tooltip OCR into a lazy local-match cascade: single-line and split double-line recognition stop on the first unique exact item, while threshold and inverted variants run only when needed.
+- Replaced price cards for ammunition and ammo boxes with tarkov.dev JSON ballistics: damage, penetration, armor damage, velocity, projectile count, and non-zero recoil/accuracy modifiers, with penetration-tier colors and a spectrum accent above 70 penetration.
+- Restyled checkboxes with theme-matched surfaces, high-visibility checked states, and full-row highlighting for feature selection; dark mode no longer uses a stark white indicator box.
+- Reorganized Settings around user tasks: common behavior, module selection, price lookup, reminders/overlays, shortcuts, and a separated advanced area for diagnostics, capture calibration, and Gamma safety.
+- Repositioned the equipment-tab check for Tarkov 1.1's stretched navigation bar, with automatic migration of the old default ROI and a legacy-layout fallback.
+- Fixed Tarkov window selection to prefer the foreground `EscapeFromTarkov` process, reject the launcher, and log the selected window title, process, and origin for diagnostics.
+- Added 16:10 capture regression coverage confirming that Tarkov scales the inventory UI across the full client area without assumed letterboxing.
+
 ## 0.7.0 - 2026-08-02
 
 - Reduced in-raid lookup CPU spikes by limiting RapidOCR to a configurable 1/2/4-thread budget, with 2 threads as the default.

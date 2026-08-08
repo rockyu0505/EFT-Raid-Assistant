@@ -10,7 +10,14 @@ from typing import Any
 from app.models import TRADERS
 
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 8
+LEGACY_INVENTORY_TAB_ROI_BASE = (105, 0, 235, 48)
+INVENTORY_TAB_ROI_BASE = (165, 0, 335, 32)
+LEGACY_ACHIEVEMENTS_TAB_ROI_BASE = (650, 0, 820, 48)
+ACHIEVEMENTS_TAB_ROI_BASE = (1340, 0, 1585, 34)
+LEGACY_HOVER_SEARCH_MARGINS = (560, 560, 240, 45)
+INITIAL_TARKOV_1_1_HOVER_SEARCH_MARGINS = (560, 560, 240, 180)
+HOVER_SEARCH_MARGINS = (660, 700, 240, 180)
 
 
 def resolve_app_directories(
@@ -81,15 +88,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "item_capture_mode": "Hover tooltip",
     "hover_tooltip_offset": [12, -60],
     "hover_tooltip_size": [360, 110],
-    "hover_search_margins": [560, 560, 240, 45],
+    "hover_search_margins": list(HOVER_SEARCH_MARGINS),
     "hover_name_padding": [10, 8, 10, 8],
+    "tooltip_cursor_left_gap": 18,
+    "tooltip_cursor_horizontal_tolerance": 12,
     "tooltip_cursor_bottom_gap": 20,
     "tooltip_cursor_gap_tolerance": 36,
+    "tooltip_max_width": 640,
+    "tooltip_client_edge_tolerance": 12,
     "tooltip_cursor_reference_height": 2160,
     "hover_wait_ms": 0,
     "button_capture_delay_seconds": 0,
-    "inventory_tab_roi_base": [105, 0, 235, 48],
+    "inventory_tab_roi_base": list(INVENTORY_TAB_ROI_BASE),
     "price_game_mode_default": "pve",
+    "smart_price_enabled": False,
+    "flea_intelligence_center_level": 0,
+    "flea_hideout_management_level": 0,
     "state_detection_cache_seconds": 2,
     "require_tarkov_foreground": True,
     "price_overlay_enabled": True,
@@ -224,6 +238,27 @@ def _clean_enabled_features(value: object) -> list[str]:
     return [str(item) for item in value if str(item) in FEATURE_DEFINITIONS]
 
 
+def inventory_tab_roi_candidates(value: object) -> list[tuple[int, int, int, int]]:
+    """Return configured, Tarkov 1.1, and legacy tab ROIs without duplicates."""
+    candidates: list[tuple[int, int, int, int]] = []
+    for candidate in (value, INVENTORY_TAB_ROI_BASE, LEGACY_INVENTORY_TAB_ROI_BASE):
+        if not isinstance(candidate, (list, tuple)) or len(candidate) != 4:
+            continue
+        try:
+            roi = tuple(int(part) for part in candidate)
+        except (TypeError, ValueError):
+            continue
+        if roi[2] <= roi[0] or roi[3] <= roi[1] or roi in candidates:
+            continue
+        candidates.append(roi)
+    return candidates
+
+
+def achievements_tab_roi_candidates() -> list[tuple[int, int, int, int]]:
+    """Return Tarkov 1.1 and legacy achievements-tab ROIs."""
+    return [ACHIEVEMENTS_TAB_ROI_BASE, LEGACY_ACHIEVEMENTS_TAB_ROI_BASE]
+
+
 def _migrate_config(value: dict[str, Any]) -> dict[str, Any]:
     migrated = copy.deepcopy(value)
     try:
@@ -233,5 +268,38 @@ def _migrate_config(value: dict[str, Any]) -> dict[str, Any]:
     if version < 2:
         # Older builds skipped startup cache checks indefinitely in performance mode.
         migrated["performance_skip_auto_price_refresh"] = False
+    if version < 4:
+        current_roi = migrated.get("inventory_tab_roi_base")
+        if isinstance(current_roi, (list, tuple)):
+            try:
+                normalized_roi = tuple(int(part) for part in current_roi)
+            except (TypeError, ValueError):
+                normalized_roi = ()
+            if normalized_roi == LEGACY_INVENTORY_TAB_ROI_BASE:
+                migrated["inventory_tab_roi_base"] = list(INVENTORY_TAB_ROI_BASE)
+    if version < 5:
+        current_margins = migrated.get("hover_search_margins")
+        if isinstance(current_margins, (list, tuple)):
+            try:
+                normalized_margins = tuple(int(part) for part in current_margins)
+            except (TypeError, ValueError):
+                normalized_margins = ()
+            if normalized_margins == LEGACY_HOVER_SEARCH_MARGINS:
+                migrated["hover_search_margins"] = list(HOVER_SEARCH_MARGINS)
+    if version < 7:
+        current_margins = migrated.get("hover_search_margins")
+        if isinstance(current_margins, (list, tuple)):
+            try:
+                normalized_margins = tuple(int(part) for part in current_margins)
+            except (TypeError, ValueError):
+                normalized_margins = ()
+            if normalized_margins == INITIAL_TARKOV_1_1_HOVER_SEARCH_MARGINS:
+                migrated["hover_search_margins"] = list(HOVER_SEARCH_MARGINS)
+        try:
+            current_max_width = int(migrated.get("tooltip_max_width", 560))
+        except (TypeError, ValueError):
+            current_max_width = 560
+        if current_max_width == 560:
+            migrated["tooltip_max_width"] = 640
     migrated["config_version"] = CONFIG_VERSION
     return migrated

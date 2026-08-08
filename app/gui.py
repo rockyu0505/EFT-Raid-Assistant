@@ -3,13 +3,15 @@ from __future__ import annotations
 import copy
 import gc
 import html
+import math
 import os
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
@@ -19,6 +21,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QPropertyAnimation,
     QRect,
+    QSequentialAnimationGroup,
     QSignalBlocker,
     QTimer,
     Qt,
@@ -94,7 +97,16 @@ from app.capture import (
     save_item_lookup_debug_images,
     scale_metric,
 )
-from app.config import APP_DIR, RESOURCE_DIR, load_config, save_config
+from app.config import (
+    APP_DIR,
+    HOVER_SEARCH_MARGINS,
+    INVENTORY_TAB_ROI_BASE,
+    RESOURCE_DIR,
+    achievements_tab_roi_candidates,
+    inventory_tab_roi_candidates,
+    load_config,
+    save_config,
+)
 from app.config import CONFIG_PATH, DEFAULT_ENABLED_FEATURES, FEATURE_DEFINITIONS
 from app.display_filter import (
     DisplayFilterBaseline,
@@ -113,15 +125,28 @@ from app.hideout import HideoutDataError, HideoutTracker
 from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
 from app.hotkeys import HotkeyManager, normalize_hotkey
 from app.item_ocr import (
+    detect_character_header_image,
     detect_inventory_tab_image,
+    iter_item_name_ocr_image_attempts,
     refine_tooltip_name_image,
     run_item_name_ocr_image,
+    tooltip_line_count_hint,
 )
 from app.models import TRADERS, TraderReminder
 from app.ocr import OcrUnavailableError, run_ocr, timer_to_seconds
-from app.prices import PriceLookupError, TarkovPriceClient, ensure_editable_aliases_path
+from app.prices import (
+    PriceLookupError,
+    TarkovPriceClient,
+    calculate_flea_market_fee,
+    ensure_editable_aliases_path,
+)
+from app.price_estimator import (
+    SmartPriceEstimate,
+    build_fast_price_estimate,
+    classify_sale_region,
+)
 from app.rapid_ocr import configure_rapid_ocr_threads
-from app.reminders import ReminderManager
+from app.reminders import ReminderManager, format_countdown, remaining_countdown_seconds
 from app.recipes import (
     RecipeCatalog,
     RecipeDataError,
@@ -170,11 +195,13 @@ HOTKEY_CONFIG_LABELS = [
     ("capture_hotkey", "识别倒计时"),
     ("item_lookup_hotkey", "物品查价"),
     ("hideout_scan_hotkey", "识别藏身处"),
-    ("reminder_hold_hotkey", "隐藏/显示补货提示"),
+    ("reminder_hold_hotkey", "显示/隐藏补货倒计时"),
     ("raid_panel_hotkey", "打开/关闭局内控制"),
     ("raid_log_hotkey", "打开/关闭局内日志"),
     ("display_filter_restore_hotkey", "恢复 Gamma"),
 ]
+
+MAX_VISIBLE_RECIPE_NOTICES = 3
 
 
 class HotkeyLineEdit(QLineEdit):
@@ -337,7 +364,11 @@ class MainWindow(QMainWindow):
             )
             else None
         )
-        self.reminder_overlay = ReminderOverlay() if self._feature_enabled("trader_reminders") else None
+        self.reminder_overlay = (
+            ReminderOverlay(str(self.config.get("reminder_hold_hotkey", "F7")))
+            if self._feature_enabled("trader_reminders")
+            else None
+        )
         self.raid_control_overlay = RaidControlOverlay()
         self.raid_log_overlay = RaidLogOverlay(
             max_lines=int(self.config.get("raid_log_max_lines", 200))
@@ -374,6 +405,9 @@ class MainWindow(QMainWindow):
         self._inventory_check_cache: (
             tuple[float, tuple[int, int] | None, bool, list[str]] | None
         ) = None
+        self._character_header_check_cache: (
+            tuple[float, tuple[int, int] | None, bool, list[str]] | None
+        ) = None
         self._closing = False
         self._workers: set[threading.Thread] = set()
         self._workers_lock = threading.Lock()
@@ -386,13 +420,14 @@ class MainWindow(QMainWindow):
         self.panel_buttons: list[QPushButton] = []
 
         self.watch_checks: dict[str, QCheckBox] = {}
-        self.timer_fields: dict[str, QLineEdit] = {}
+        self.countdown_items: dict[str, QTableWidgetItem] = {}
         self.restock_items: dict[str, QTableWidgetItem] = {}
         self.status_items: dict[str, QTableWidgetItem] = {}
         self._recipe_tree_loading = False
 
         if self.reminders is not None:
             self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
+            self.reminders.reminders_updated.connect(self._on_reminders_updated)
         self.capture_requested.connect(self.capture_and_ocr)
         self.item_lookup_requested.connect(self.capture_item_price)
         self.hideout_scan_requested.connect(self.capture_hideout_progress)
@@ -575,7 +610,7 @@ class MainWindow(QMainWindow):
         self.menuBar().clear()
         self.panel_buttons.clear()
         self.watch_checks.clear()
-        self.timer_fields.clear()
+        self.countdown_items.clear()
         self.restock_items.clear()
         self.status_items.clear()
         self._build_menu()
@@ -1022,11 +1057,11 @@ class MainWindow(QMainWindow):
         self.recipe_color_swatch = QLabel()
         self.recipe_color_swatch.setFixedSize(52, 24)
         self.recipe_color_label = QLabel()
-        color_button = QPushButton("选择边框颜色")
+        color_button = QPushButton("选择提示颜色")
         color_button.clicked.connect(self._choose_recipe_overlay_color)
         reset_color_button = QPushButton("恢复默认")
         reset_color_button.clicked.connect(self._reset_recipe_overlay_color)
-        color_layout.addWidget(QLabel("边框与标题强调色"))
+        color_layout.addWidget(QLabel("独立底色与标题强调色"))
         color_layout.addWidget(self.recipe_color_swatch)
         color_layout.addWidget(self.recipe_color_label)
         color_layout.addStretch(1)
@@ -1502,8 +1537,33 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._refresh_recipe_views)
 
     def _refresh_recipe_views(self) -> None:
-        self._populate_recipe_results()
+        self._sync_recipe_result_checks()
         self._populate_tracked_recipe_overview()
+
+    def _sync_recipe_result_checks(self) -> None:
+        """Update recipe checkboxes without rebuilding the browsed result tree."""
+        if not hasattr(self, "recipe_result_tree"):
+            return
+        tracked = self._tracked_recipe_ids()
+        self.recipe_result_tree.blockSignals(True)
+        try:
+            for product_index in range(self.recipe_result_tree.topLevelItemCount()):
+                product_item = self.recipe_result_tree.topLevelItem(product_index)
+                for recipe_index in range(product_item.childCount()):
+                    recipe_item = product_item.child(recipe_index)
+                    recipe_id = str(
+                        recipe_item.data(0, Qt.ItemDataRole.UserRole) or ""
+                    )
+                    if not recipe_id:
+                        continue
+                    recipe_item.setCheckState(
+                        0,
+                        Qt.CheckState.Checked
+                        if recipe_id in tracked
+                        else Qt.CheckState.Unchecked,
+                    )
+        finally:
+            self.recipe_result_tree.blockSignals(False)
 
     def _update_recipe_summary_only(self) -> None:
         if not hasattr(self, "recipe_summary_label") or self.recipe_catalog is None:
@@ -1536,7 +1596,7 @@ class MainWindow(QMainWindow):
         tracked = self._tracked_recipe_ids() - selected_ids
         self.settings_store.set("tracked_recipe_ids", sorted(tracked))
         self._config_save_timer.start(250)
-        self._populate_recipe_results()
+        self._sync_recipe_result_checks()
         self._populate_tracked_recipe_overview()
         self._update_recipe_summary_only()
         self._log_event(f"已删除 {len(selected_ids)} 个关注配方。")
@@ -1555,7 +1615,9 @@ class MainWindow(QMainWindow):
             return
         self.settings_store.set("tracked_recipe_ids", [])
         self._config_save_timer.start(250)
-        self._populate_recipe_tree()
+        self._sync_recipe_result_checks()
+        self._populate_tracked_recipe_overview()
+        self._update_recipe_summary_only()
         self._log_event("已清除全部关注配方。")
 
     def _recipe_overlay_color(self) -> str:
@@ -1568,7 +1630,7 @@ class MainWindow(QMainWindow):
         color = QColorDialog.getColor(
             QColor(self._recipe_overlay_color()),
             self,
-            "选择关注配方提示边框颜色",
+            "选择关注配方提示颜色",
         )
         if not color.isValid():
             return
@@ -1585,8 +1647,10 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "recipe_color_swatch"):
             return
         color = self._recipe_overlay_color()
+        tint = QColor(color)
         self.recipe_color_swatch.setStyleSheet(
-            f"background:{color}; border:1px solid rgba(255,255,255,90); "
+            f"background:rgba({tint.red()},{tint.green()},{tint.blue()},90); "
+            "border:1px solid rgba(255,255,255,70); "
             "border-radius:4px;"
         )
         self.recipe_color_label.setText(color)
@@ -2450,20 +2514,25 @@ class MainWindow(QMainWindow):
     def _build_trader_group(self) -> QGroupBox:
         group = QGroupBox("商人补货")
         layout = QVBoxLayout(group)
+        note = QLabel(
+            "勾选要关注的商人后识别；有效倒计时会直接建立提醒并每秒更新，无需手动输入。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
         layout.addWidget(self._build_trader_table())
 
         buttons = QHBoxLayout()
         self.capture_button = QPushButton("识别倒计时")
         self.capture_button.clicked.connect(self.capture_and_ocr)
-        self.schedule_button = QPushButton("设置选中提醒")
-        self.schedule_button.clicked.connect(self.schedule_selected)
+        self.toggle_countdown_button = QPushButton("显示/隐藏倒计时悬浮窗")
+        self.toggle_countdown_button.clicked.connect(self.toggle_reminder_hold)
         self.clear_button = QPushButton("清空提醒")
         self.clear_button.clicked.connect(self.clear_reminders)
         self.open_crop_button = QPushButton("打开倒计时截图")
         self.open_crop_button.clicked.connect(self.open_debug_crop)
 
         buttons.addWidget(self.capture_button)
-        buttons.addWidget(self.schedule_button)
+        buttons.addWidget(self.toggle_countdown_button)
         buttons.addWidget(self.clear_button)
         buttons.addWidget(self.open_crop_button)
         layout.addLayout(buttons)
@@ -2473,7 +2542,7 @@ class MainWindow(QMainWindow):
         table = QTableWidget(len(TRADERS), 5)
         self.table = table
         table.setHorizontalHeaderLabels(
-            ["商人", "提醒", "倒计时 / 手动修正", "补货时间", "状态"]
+            ["商人", "提醒", "实时倒计时", "补货时间", "状态"]
         )
         table.verticalHeader().setVisible(False)
         table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -2494,10 +2563,11 @@ class MainWindow(QMainWindow):
             self.watch_checks[trader] = watch
             table.setCellWidget(row, 1, _centered(watch))
 
-            timer = QLineEdit()
-            timer.setPlaceholderText("HH:MM:SS")
-            self.timer_fields[trader] = timer
-            table.setCellWidget(row, 2, timer)
+            countdown_item = QTableWidgetItem("-")
+            countdown_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            countdown_item.setFlags(countdown_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.countdown_items[trader] = countdown_item
+            table.setItem(row, 2, countdown_item)
 
             restock_item = QTableWidgetItem("")
             restock_item.setFlags(restock_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -2650,6 +2720,10 @@ class MainWindow(QMainWindow):
             )
             self.price_mode_combo.setCurrentIndex(max(0, mode_index))
         self._save_config()
+        if self.reminder_overlay is not None:
+            self.reminder_overlay.set_toggle_hotkey(
+                str(self.config.get("reminder_hold_hotkey", "F7"))
+            )
         self._register_hotkeys()
         self._start_display_filter_eye_care_timer()
         self._apply_performance_settings()
@@ -2694,7 +2768,10 @@ class MainWindow(QMainWindow):
         elif self.reminders is None:
             self.reminders = ReminderManager()
             self.reminders.reminder_triggered.connect(self._on_reminder_triggered)
-            self.reminder_overlay = ReminderOverlay()
+            self.reminders.reminders_updated.connect(self._on_reminders_updated)
+            self.reminder_overlay = ReminderOverlay(
+                str(self.config.get("reminder_hold_hotkey", "F7"))
+            )
 
         if "price_lookup" not in new_features:
             if self.price_overlay is not None:
@@ -2755,7 +2832,7 @@ class MainWindow(QMainWindow):
             "price_mode_combo",
             "table",
             "capture_button",
-            "schedule_button",
+            "toggle_countdown_button",
             "clear_button",
             "open_crop_button",
             "data_status_label",
@@ -2917,7 +2994,7 @@ class MainWindow(QMainWindow):
             f"倒计时={self.config.get('capture_hotkey', 'F8') if trader_enabled else '关闭'}，"
             f"物品查价={self.config.get('item_lookup_hotkey', 'Q') if price_enabled else '关闭'}，"
             f"藏身处={self.config.get('hideout_scan_hotkey', 'F6') if hideout_enabled else '关闭'}，"
-            f"隐藏/显示补货提示={self.config.get('reminder_hold_hotkey', 'F7') if trader_enabled else '关闭'}，"
+            f"显示/隐藏补货倒计时={self.config.get('reminder_hold_hotkey', 'F7') if trader_enabled else '关闭'}，"
             f"局内控制={self.config.get('raid_panel_hotkey', 'F9')}，"
             f"局内日志={self.config.get('raid_log_hotkey', 'F10')}，"
             f"Gamma预设={len(preset_hotkeys)} 个"
@@ -3332,15 +3409,20 @@ class MainWindow(QMainWindow):
 
         for index, trader in enumerate(TRADERS):
             if index < len(result.timers):
-                self.timer_fields[trader].setText(result.timers[index])
-                self.status_items[trader].setText("已识别")
+                self.countdown_items[trader].setText(result.timers[index])
+                self.restock_items[trader].setText("")
+                self.status_items[trader].setText(
+                    "已识别" if self.watch_checks[trader].isChecked() else "未选择"
+                )
             else:
+                self.countdown_items[trader].setText("-")
+                self.restock_items[trader].setText("")
                 self.status_items[trader].setText("OCR 失败")
 
         if len(result.timers) < len(TRADERS):
             self._log(
                 f"注意：只识别到 {len(result.timers)} 个倒计时，商人数量为 {len(TRADERS)}。"
-                "请使用手动修正输入框。"
+                "未识别到的商人不会设置提醒。"
             )
         scheduled, invalid = self._schedule_selected_reminders()
         self._show_trader_capture_feedback(result.timers, scheduled, invalid)
@@ -3365,9 +3447,13 @@ class MainWindow(QMainWindow):
         capture_region: Region | None = None
         calibrated_now = False
         hover_cursor_anchor: tuple[int, int] | None = None
+        hover_client_right_edge: int | None = None
+        hover_client_top_edge: int | None = None
         hover_search_image = None
         item_image = None
         inventory_image = None
+        character_header_image = None
+        item_line_count_hint: int | None = None
         stage_started = time.perf_counter()
         try:
             previous_region = self._cached_item_region
@@ -3382,18 +3468,30 @@ class MainWindow(QMainWindow):
                 self._clear_state_detection_cache()
 
             if item_mode == "Hover tooltip":
-                _, hover_search_image, size, region_name, hover_cursor_anchor = (
-                    capture_hover_item_name_region(
-                        capture_mode,
-                        offset=tuple(self.config.get("hover_tooltip_offset", [12, -60])),
-                        crop_size=tuple(self.config.get("hover_tooltip_size", [360, 110])),
-                        search_margins=tuple(
-                            self.config.get("hover_search_margins", [560, 560, 240, 45])
-                        ),
-                        region=capture_region,
-                        save_full_screenshot=False,
-                        save_debug_images=False,
-                    )
+                (
+                    _,
+                    hover_search_image,
+                    size,
+                    region_name,
+                    hover_cursor_anchor,
+                    hover_client_right_edge,
+                    hover_client_top_edge,
+                ) = capture_hover_item_name_region(
+                    capture_mode,
+                    offset=tuple(self.config.get("hover_tooltip_offset", [12, -60])),
+                    crop_size=tuple(self.config.get("hover_tooltip_size", [360, 110])),
+                    search_margins=tuple(
+                        self.config.get("hover_search_margins", list(HOVER_SEARCH_MARGINS))
+                    ),
+                    region=capture_region,
+                    save_full_screenshot=False,
+                    save_debug_images=False,
+                    capture_guard=(
+                        getattr(self, "price_overlay", None).capture_guard
+                        if getattr(self, "price_overlay", None) is not None
+                        and bool(self.config.get("price_overlay_enabled", True))
+                        else None
+                    ),
                 )
                 item_image = hover_search_image
             else:
@@ -3443,10 +3541,40 @@ class MainWindow(QMainWindow):
                 return
             timings.append(("装备页检测", _elapsed_ms(stage_started)))
             if not detected:
+                fallback_started = time.perf_counter()
+                try:
+                    header_detected, header_found, character_header_image = (
+                        self._detect_character_header_from_capture(
+                            capture_mode,
+                            manual_size,
+                            capture_region,
+                        )
+                    )
+                except OcrUnavailableError as exc:
+                    timings.append(("角色页回退失败", _elapsed_ms(fallback_started)))
+                    self._log(str(exc))
+                    self._log_price_lookup_timings(timings, pipeline_started)
+                    QMessageBox.warning(self, "OCR 不可用", str(exc))
+                    return
+                except Exception as exc:
+                    timings.append(("角色页回退失败", _elapsed_ms(fallback_started)))
+                    self._log(f"Character header fallback failed: {exc}")
+                    self._log_price_lookup_timings(timings, pipeline_started)
+                    return
+                timings.append(("角色页回退", _elapsed_ms(fallback_started)))
+                if header_detected:
+                    detected = True
+                    found = header_found
+                    self._log(
+                        "Equipment tab is obscured; achievements header detected. "
+                        "Continuing with strict tooltip geometry and unique item matching."
+                    )
+            if not detected:
                 save_item_lookup_debug_images(
                     hover_search=hover_search_image,
                     item_name=item_image,
                     inventory_tab=inventory_image,
+                    character_header=character_header_image,
                 )
                 self.item_price_label.setText("Price: inventory tab not detected")
                 if self.price_overlay is not None:
@@ -3466,11 +3594,35 @@ class MainWindow(QMainWindow):
                     int(self.config.get("tooltip_cursor_reference_height", 2160)),
                     minimum=6,
                 )
+                tooltip_left_gap = scale_metric(
+                    int(self.config.get("tooltip_cursor_left_gap", 18)),
+                    size[1],
+                    int(self.config.get("tooltip_cursor_reference_height", 2160)),
+                    minimum=5,
+                )
+                tooltip_horizontal_tolerance = scale_metric(
+                    int(self.config.get("tooltip_cursor_horizontal_tolerance", 12)),
+                    size[1],
+                    int(self.config.get("tooltip_cursor_reference_height", 2160)),
+                    minimum=4,
+                )
                 tooltip_tolerance = scale_metric(
                     int(self.config.get("tooltip_cursor_gap_tolerance", 36)),
                     size[1],
                     int(self.config.get("tooltip_cursor_reference_height", 2160)),
                     minimum=14,
+                )
+                tooltip_max_width = scale_metric(
+                    int(self.config.get("tooltip_max_width", 640)),
+                    size[1],
+                    int(self.config.get("tooltip_cursor_reference_height", 2160)),
+                    minimum=120,
+                )
+                tooltip_edge_tolerance = scale_metric(
+                    int(self.config.get("tooltip_client_edge_tolerance", 12)),
+                    size[1],
+                    int(self.config.get("tooltip_cursor_reference_height", 2160)),
+                    minimum=4,
                 )
                 item_image, refined, words = refine_tooltip_name_image(
                     hover_search_image,
@@ -3478,6 +3630,12 @@ class MainWindow(QMainWindow):
                     hover_cursor_anchor,
                     tooltip_gap,
                     tooltip_tolerance,
+                    tooltip_left_gap,
+                    tooltip_horizontal_tolerance,
+                    tooltip_max_width,
+                    hover_client_right_edge,
+                    hover_client_top_edge,
+                    tooltip_edge_tolerance,
                 )
             except Exception as exc:
                 refined = False
@@ -3485,19 +3643,80 @@ class MainWindow(QMainWindow):
                 self._log(f"Tooltip box location failed; falling back to wider OCR crop: {exc}")
             if refined:
                 self._log("Tooltip name box located: " + (" ".join(words) or "no text"))
+                item_line_count_hint = tooltip_line_count_hint(
+                    item_image.height,
+                    size[1],
+                    int(self.config.get("tooltip_cursor_reference_height", 2160)),
+                )
+                self._log(
+                    f"Tooltip OCR layout: {item_line_count_hint} line(s), "
+                    f"crop {item_image.width}x{item_image.height}."
+                )
             else:
-                self._log("Tooltip name box not located; using wider OCR crop.")
+                save_item_lookup_debug_images(
+                    hover_search=hover_search_image,
+                    item_name=item_image,
+                    inventory_tab=inventory_image,
+                    character_header=character_header_image,
+                )
+                timings.append(("Tooltip定位", _elapsed_ms(stage_started)))
+                self.item_price_label.setText("Price: tooltip not detected")
+                self._log_event("未查价：没有定位到鼠标附近的物品提示框。")
+                self._log(
+                    "Tooltip name box not located; rejected the wider UI crop to avoid "
+                    "matching navigation labels as items."
+                )
+                self._log_price_lookup_timings(timings, pipeline_started)
+                return
             timings.append(("Tooltip定位", _elapsed_ms(stage_started)))
 
         stage_started = time.perf_counter()
+        matched_price = None
+        matched_result = None
+        best_confidence = -1.0
+        equally_good_item_ids: set[str] = set()
+        saw_candidates = False
         try:
-            result = run_item_name_ocr_image(item_image)
+            mode = self.price_client.set_game_mode(self._selected_price_game_mode())
+            self.current_price_game_mode = mode
+            self.config["price_game_mode_default"] = mode
+            for result in iter_item_name_ocr_image_attempts(
+                item_image,
+                line_count_hint=item_line_count_hint,
+            ):
+                self._log(f"Item OCR preprocessing: {result.variant_name}")
+                self._log(
+                    "Item candidate names: "
+                    + (", ".join(result.candidates) or "none")
+                )
+                if not result.candidates:
+                    continue
+                saw_candidates = True
+                try:
+                    attempt_price = self.price_client.lookup_candidates(
+                        result.candidates,
+                        mode,
+                    )
+                except PriceLookupError:
+                    continue
+                confidence = float(getattr(attempt_price, "confidence", 0.0) or 0.0)
+                item_id = str(getattr(attempt_price, "item_id", "") or "")
+                if confidence > best_confidence + 1e-9:
+                    best_confidence = confidence
+                    matched_price = attempt_price
+                    matched_result = result
+                    equally_good_item_ids = {item_id}
+                elif abs(confidence - best_confidence) <= 1e-9:
+                    equally_good_item_ids.add(item_id)
+                if confidence >= 0.999:
+                    break
         except OcrUnavailableError as exc:
             timings.append(("物品OCR失败", _elapsed_ms(stage_started)))
             save_item_lookup_debug_images(
                 hover_search=hover_search_image,
                 item_name=item_image,
                 inventory_tab=inventory_image,
+                character_header=character_header_image,
             )
             self._log(str(exc))
             self._log_price_lookup_timings(timings, pipeline_started)
@@ -3509,33 +3728,33 @@ class MainWindow(QMainWindow):
                 hover_search=hover_search_image,
                 item_name=item_image,
                 inventory_tab=inventory_image,
+                character_header=character_header_image,
             )
             self._log(f"物品 OCR 失败：{exc}")
             self._log_price_lookup_timings(timings, pipeline_started)
             QMessageBox.warning(self, "物品 OCR 失败", str(exc))
             return
-        timings.append(("物品OCR", _elapsed_ms(stage_started)))
+        timings.append(("自适应OCR+本地匹配", _elapsed_ms(stage_started)))
 
-        self._log(f"Item OCR preprocessing: {result.variant_name}")
-        self._log("Item candidate names: " + (", ".join(result.candidates) or "none"))
-
-        if not result.candidates:
+        if matched_price is None or matched_result is None or len(equally_good_item_ids) != 1:
             save_item_lookup_debug_images(
                 hover_search=hover_search_image,
                 item_name=item_image,
                 inventory_tab=inventory_image,
+                character_header=character_header_image,
             )
-            self.item_price_label.setText("Price: no item name detected")
-            self._log_event("无匹配物品：没有识别到可用的物品名。")
+            if saw_candidates:
+                self.item_price_label.setText("Price: no unique item match")
+                self._log_event("无匹配物品：OCR 候选无法唯一匹配本地物品。")
+            else:
+                self.item_price_label.setText("Price: no item name detected")
+                self._log_event("无匹配物品：没有识别到可用的物品名。")
             self._log_price_lookup_timings(timings, pipeline_started)
             return
 
-        self.item_name_field.setText(result.candidates[0])
-        self._lookup_item_candidates(
-            result.candidates,
-            timings=timings,
-            pipeline_started=pipeline_started,
-        )
+        self.item_name_field.setText(matched_result.candidates[0])
+        self._log_price_lookup_timings(timings, pipeline_started)
+        self.price_result_ready.emit(matched_price, "")
 
     def capture_item_price_after_delay(self) -> None:
         if not self._feature_enabled("price_lookup") or self.price_client is None:
@@ -3718,14 +3937,10 @@ class MainWindow(QMainWindow):
     def _price_history_worker(self, price: object, source: str = "json") -> None:
         if self._closing or self.price_client is None:
             return
-        item_id = str(getattr(price, "item_id", "") or "")
-        game_mode = str(getattr(price, "game_mode", self.current_price_game_mode) or self.current_price_game_mode)
         try:
-            summary = self.price_client.historical_price_summary(
-                item_id,
-                game_mode,
+            summary = self.price_client.smart_listing_estimate(
+                price,
                 days=2,
-                sample_limit=5,
                 source=source,
             )
         except Exception as exc:
@@ -3744,23 +3959,10 @@ class MainWindow(QMainWindow):
         if _price_overlay_key(price) != self._active_price_key:
             return
         self._log(f"JSON historical price lookup failed: {error}")
-        answer = QMessageBox.question(
-            self,
-            "JSON 历史价格 API 不可用",
-            f"{error}\n\n是否尝试备用 GraphQL API 获取本次历史价格？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            QTimer.singleShot(
-                0,
-                lambda current_price=price: self._start_worker(
-                    "price-history-graphql-fallback",
-                    self._price_history_worker,
-                    current_price,
-                    "graphql",
-                ),
-            )
+        # Smart pricing is optional enrichment after the fast local card. A
+        # transient history failure must not steal focus or delay an in-raid
+        # lookup with a modal fallback prompt.
+        self.price_history_ready.emit(price, None, error)
 
     def _detect_inventory_from_capture(
         self,
@@ -3776,16 +3978,80 @@ class MainWindow(QMainWindow):
                 self._log("Using cached inventory tab state.")
                 return cached_detected, cached_found, None
 
-        inventory_image, _, _ = capture_inventory_tab_region(
-            capture_mode,
-            manual_size,
-            tuple(self.config.get("inventory_tab_roi_base", [105, 0, 235, 48])),
-            capture_region,
-            save_debug_image=False,
+        inventory_image: Image.Image | None = None
+        detected = False
+        found: list[str] = []
+        configured_roi = self.config.get(
+            "inventory_tab_roi_base",
+            list(INVENTORY_TAB_ROI_BASE),
         )
-        detected, found, _ = detect_inventory_tab_image(inventory_image)
+        for candidate_index, roi in enumerate(inventory_tab_roi_candidates(configured_roi)):
+            candidate_image, _, _ = capture_inventory_tab_region(
+                capture_mode,
+                manual_size,
+                roi,
+                capture_region,
+                save_debug_image=False,
+            )
+            if inventory_image is None:
+                inventory_image = candidate_image
+            candidate_detected, candidate_found, _ = detect_inventory_tab_image(candidate_image)
+            if not candidate_detected:
+                continue
+            detected = True
+            found = candidate_found
+            inventory_image = candidate_image
+            if candidate_index > 0:
+                self._log(f"Inventory tab fallback ROI matched: {roi}.")
+            break
         self._inventory_check_cache = (time.monotonic(), signature, detected, found)
         return detected, found, inventory_image
+
+    def _detect_character_header_from_capture(
+        self,
+        capture_mode: str,
+        manual_size: tuple[int, int] | None,
+        capture_region: Region | None,
+    ) -> tuple[bool, list[str], Image.Image | None]:
+        signature = _region_size_signature(capture_region)
+        cached = self._character_header_check_cache
+        if cached is not None:
+            cached_at, cached_signature, cached_detected, cached_found = cached
+            if cached_signature == signature and self._state_detection_cache_is_fresh(cached_at):
+                self._log("Using cached character header state.")
+                return cached_detected, cached_found, None
+
+        header_image: Image.Image | None = None
+        detected = False
+        found: list[str] = []
+        for candidate_index, roi in enumerate(achievements_tab_roi_candidates()):
+            candidate_image, _, _ = capture_inventory_tab_region(
+                capture_mode,
+                manual_size,
+                roi,
+                capture_region,
+                save_debug_image=False,
+            )
+            if header_image is None:
+                header_image = candidate_image
+            candidate_detected, candidate_found, _ = detect_character_header_image(
+                candidate_image
+            )
+            if not candidate_detected:
+                continue
+            detected = True
+            found = candidate_found
+            header_image = candidate_image
+            if candidate_index > 0:
+                self._log(f"Character header fallback ROI matched: {roi}.")
+            break
+        self._character_header_check_cache = (
+            time.monotonic(),
+            signature,
+            detected,
+            found,
+        )
+        return detected, found, header_image
 
     def _state_detection_cache_is_fresh(self, cached_at: float) -> bool:
         ttl = max(0.0, float(self.config.get("state_detection_cache_seconds", 2)))
@@ -3793,6 +4059,7 @@ class MainWindow(QMainWindow):
 
     def _clear_state_detection_cache(self) -> None:
         self._inventory_check_cache = None
+        self._character_header_check_cache = None
 
     def _start_worker(
         self,
@@ -3890,7 +4157,9 @@ class MainWindow(QMainWindow):
             else []
         )
         recipe_notices = self._tracked_recipe_requirement_notices(price)
-        needs_history = _is_high_volatility(price)
+        needs_history = bool(self.config.get("smart_price_enabled", False)) and (
+            not isinstance(getattr(price, "ammo_properties", None), dict)
+        )
         view = _build_price_view(
             price,
             display_language,
@@ -3899,9 +4168,15 @@ class MainWindow(QMainWindow):
             firearm_color,
             firearm_accent,
             hideout_lines,
+            flea_intelligence_center_level=(
+                _safe_int(self.config.get("flea_intelligence_center_level")) or 0
+            ),
+            flea_hideout_management_level=(
+                _safe_int(self.config.get("flea_hideout_management_level")) or 0
+            ),
             recipe_notices=recipe_notices,
             recipe_accent_color=self._recipe_overlay_color(),
-            volatility_notice=needs_history,
+            smart_pending=needs_history,
             toast_key=price_key,
         )
         self.item_price_label.setText(view.label_html)
@@ -3921,12 +4196,26 @@ class MainWindow(QMainWindow):
     def _on_price_history_ready(self, price: object, summary: object, error: str) -> None:
         if self._closing or not self._feature_enabled("price_lookup"):
             return
+        if not bool(self.config.get("smart_price_enabled", False)):
+            return
         price_key = _price_overlay_key(price)
         if price_key != self._active_price_key:
             return
         if error:
             self._log(f"Historical price lookup failed: {error}")
-            return
+            summary = SmartPriceEstimate(
+                suggested_price=None,
+                lower_price=None,
+                upper_price=None,
+                confidence="low",
+                basis="智能挂价",
+                risk_notice="历史价格暂不可用，建议价回退使用API最近低价",
+                sample_count=0,
+                effective_sample_size=0.0,
+                current_offer_count=_safe_int(
+                    getattr(price, "last_offer_count", None)
+                ),
+            )
 
         display_language = str(self.config.get("item_display_language", "zh"))
         raw_tiers = self.config.get("price_value_tiers", [])
@@ -3948,29 +4237,26 @@ class MainWindow(QMainWindow):
             firearm_color,
             firearm_accent,
             hideout_lines,
+            flea_intelligence_center_level=(
+                _safe_int(self.config.get("flea_intelligence_center_level")) or 0
+            ),
+            flea_hideout_management_level=(
+                _safe_int(self.config.get("flea_hideout_management_level")) or 0
+            ),
             recipe_notices=recipe_notices,
             recipe_accent_color=self._recipe_overlay_color(),
-            history_summary=summary,
+            smart_estimate=summary,
             toast_key=price_key,
-        )
-        detail = _build_price_history_view(
-            price,
-            summary,
-            display_language,
-            enhanced.tier_color,
-            enhanced.tier_accent,
-            toast_key=f"{price_key}:history",
         )
         self.item_price_label.setText(enhanced.label_html)
         self.item_price_label.setTextFormat(Qt.TextFormat.RichText)
-        self._log_event(detail.log_text)
+        self._log_event(enhanced.log_text)
         if self.price_overlay is not None and bool(self.config.get("price_overlay_enabled", True)):
             try:
                 seconds = int(self.config.get("price_overlay_seconds", 10))
             except (TypeError, ValueError):
                 seconds = 10
             self.price_overlay.show_price(enhanced, seconds, replace_key=price_key)
-            self.price_overlay.show_price(detail, seconds, replace_key=detail.toast_key)
 
     def _tracked_recipe_requirement_notices(self, price: object) -> list[RecipeNotice]:
         if (
@@ -3992,28 +4278,33 @@ class MainWindow(QMainWindow):
             self._log("商人补货模块未启用，已跳过提醒设置。")
             return [], []
         self._save_config()
-        scheduled: list[tuple[str, TraderReminder]] = []
+        schedules: list[tuple[str, int, int, int]] = []
         invalid: list[tuple[str, str]] = []
         for trader in TRADERS:
             if not self.watch_checks[trader].isChecked():
+                if self.countdown_items[trader].text() != "-":
+                    self.status_items[trader].setText("未选择")
                 continue
 
-            value = self.timer_fields[trader].text().strip()
+            value = self.countdown_items[trader].text().strip()
             seconds = timer_to_seconds(value)
             if seconds is None:
                 self.status_items[trader].setText("倒计时无效")
                 invalid.append((trader, value))
                 self._log(f"已跳过 {trader}：倒计时无效 '{value}'。")
                 continue
-
-            reminder = self.reminders.schedule(
-                trader=trader,
-                countdown_seconds=seconds,
-                lead_seconds=int(self.config.get("lead_time_seconds", 10)),
-                repeat_seconds=int(self.config.get("repeat_alert_seconds", 0)),
+            schedules.append(
+                (
+                    trader,
+                    seconds,
+                    int(self.config.get("lead_time_seconds", 10)),
+                    int(self.config.get("repeat_alert_seconds", 0)),
+                )
             )
-            self.restock_items[trader].setText(reminder.restock_at.strftime("%H:%M:%S"))
-            self.status_items[trader].setText("已设置")
+
+        reminders = self.reminders.replace(schedules)
+        scheduled: list[tuple[str, TraderReminder]] = []
+        for trader, reminder in reminders.items():
             self._log(
                 f"已设置 {trader}：补货 {reminder.restock_at.strftime('%H:%M:%S')}，"
                 f"提醒 {reminder.notify_at.strftime('%H:%M:%S')}。"
@@ -4021,15 +4312,8 @@ class MainWindow(QMainWindow):
             scheduled.append((trader, reminder))
 
         if not scheduled:
-            self._log("没有设置任何提醒。请选择商人并输入有效的 HH:MM:SS 倒计时。")
+            self._log("没有设置任何提醒。请勾选商人后重新识别倒计时。")
         return scheduled, invalid
-
-    def schedule_selected(self) -> None:
-        if not self._feature_enabled("trader_reminders") or self.reminders is None:
-            self._log("商人补货模块未启用，已跳过提醒设置。")
-            return
-        scheduled, invalid = self._schedule_selected_reminders()
-        self._show_trader_schedule_feedback(scheduled, invalid, manual=True)
 
     def _show_trader_capture_feedback(
         self,
@@ -4038,13 +4322,13 @@ class MainWindow(QMainWindow):
         invalid: list[tuple[str, str]],
     ) -> None:
         if scheduled:
-            self._show_trader_schedule_feedback(scheduled, invalid, manual=False)
+            self._show_trader_schedule_feedback(scheduled, invalid)
             return
         detail_lines = [f"已识别 {len(timers)} 个倒计时，但没有设置提醒。"]
         if invalid:
             detail_lines.append("无效倒计时：" + "；".join(f"{trader} {value or '-'}" for trader, value in invalid))
         else:
-            detail_lines.append("请勾选要提醒的商人，或手动修正倒计时后再设置。")
+            detail_lines.append("请勾选要提醒的商人后重新识别。")
         self._show_operation_feedback(
             "商人倒计时已识别",
             "未设置提醒",
@@ -4056,8 +4340,6 @@ class MainWindow(QMainWindow):
         self,
         scheduled: list[tuple[str, TraderReminder]],
         invalid: list[tuple[str, str]],
-        *,
-        manual: bool,
     ) -> None:
         if scheduled:
             detail_lines = [
@@ -4072,11 +4354,16 @@ class MainWindow(QMainWindow):
             self._show_operation_feedback(
                 "已记录并设置提醒",
                 f"{len(scheduled)} 个商人",
-                "\n".join(detail_lines),
+                "\n".join(
+                    [
+                        *detail_lines,
+                        f"按 {self.config.get('reminder_hold_hotkey', 'F7')} 查看实时倒计时。",
+                    ]
+                ),
                 accent_color="#36D27F",
             )
             return
-        title = "未设置提醒" if manual else "商人倒计时已识别"
+        title = "商人倒计时已识别"
         detail = "没有勾选商人，或勾选商人的倒计时无效。"
         if invalid:
             detail = "无效倒计时：" + "；".join(
@@ -4119,6 +4406,32 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             return 6
 
+    def _on_reminders_updated(self, reminders: object) -> None:
+        if not isinstance(reminders, dict):
+            return
+        active = {
+            str(trader): reminder
+            for trader, reminder in reminders.items()
+            if isinstance(reminder, TraderReminder)
+        }
+        if self.reminder_overlay is not None:
+            self.reminder_overlay.set_reminders(active)
+        if not self.countdown_items:
+            return
+        for trader, reminder in active.items():
+            if trader not in self.countdown_items:
+                continue
+            remaining = remaining_countdown_seconds(reminder)
+            self.countdown_items[trader].setText(format_countdown(remaining))
+            self.restock_items[trader].setText(reminder.restock_at.strftime("%H:%M:%S"))
+            if remaining <= 0:
+                status = "已补货"
+            elif reminder.triggered:
+                status = "即将补货"
+            else:
+                status = "倒计时中"
+            self.status_items[trader].setText(status)
+
     def clear_reminders(self) -> None:
         if self.reminders is None or self.reminder_overlay is None:
             self._log("商人补货模块未启用，已跳过清空提醒。")
@@ -4128,6 +4441,7 @@ class MainWindow(QMainWindow):
         for trader in TRADERS:
             self.status_items[trader].setText("未启用")
             self.restock_items[trader].setText("")
+            self.countdown_items[trader].setText("-")
         self._log("提醒已清空。")
 
     def open_debug_crop(self) -> None:
@@ -4147,32 +4461,25 @@ class MainWindow(QMainWindow):
     def _on_reminder_triggered(self, trader: str, reminder: TraderReminder) -> None:
         if not self._feature_enabled("trader_reminders") or self.reminder_overlay is None:
             return
-        self.status_items[trader].setText("已触发")
+        remaining = remaining_countdown_seconds(reminder)
+        self.status_items[trader].setText("已补货" if remaining <= 0 else "即将补货")
         self._log(f"{trader} 的提醒已触发。")
         if bool(self.config.get("sound_enabled", True)):
             QApplication.beep()
         if bool(self.config.get("popup_enabled", True)):
-            view = ReminderView(
-                title=f"{trader} 即将补货",
-                value_text=f"补货时间 {reminder.restock_at:%H:%M:%S}",
-                detail=(
-                    f"提醒时间 {reminder.notify_at:%H:%M:%S}"
-                    f" · 隐藏/显示: {self.config.get('reminder_hold_hotkey', 'F7')}"
-                ),
-            )
-            self.reminder_overlay.show_reminder(view)
+            self.reminder_overlay.show_triggered(trader)
 
     def toggle_reminder_hold(self) -> None:
         if self.reminder_overlay is None:
-            self._log("商人补货模块未启用，已跳过补货提示显示切换。")
+            self._log("商人补货模块未启用，已跳过倒计时悬浮窗切换。")
             return
         state = self.reminder_overlay.toggle_visibility()
         if state is None:
-            self._log("当前没有可隐藏/显示的补货提示。")
+            self._log("当前没有已设置的商人补货倒计时。")
         elif state:
-            self._log("补货提示已显示。")
+            self._log("商人补货倒计时悬浮窗已显示。")
         else:
-            self._log("补货提示已隐藏；再次按热键显示。")
+            self._log("商人补货倒计时悬浮窗已隐藏；再次按热键显示。")
 
     def _manual_size(self) -> tuple[int, int] | None:
         if not bool(self.config.get("manual_resolution_enabled", False)):
@@ -4510,7 +4817,7 @@ class FeatureSetupDialog(QDialog):
     def __init__(self, config: dict[str, object], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("首次启动设置")
-        self.resize(460, 320)
+        self.resize(500, 500)
         self._config = copy.deepcopy(config)
         self.feature_checks: dict[str, QCheckBox] = {}
 
@@ -4529,9 +4836,47 @@ class FeatureSetupDialog(QDialog):
                 initial = {str(item) for item in raw_enabled}
         for feature_id, label in FEATURE_DEFINITIONS.items():
             check = QCheckBox(label)
+            check.setObjectName("featureChoice")
             check.setChecked(feature_id in initial)
             self.feature_checks[feature_id] = check
             layout.addWidget(check)
+
+        fee_group = QGroupBox("跳蚤手续费资料")
+        fee_layout = QFormLayout(fee_group)
+        self.flea_intelligence_center_level = QComboBox()
+        self.flea_intelligence_center_level.addItem("0 级 / 未建造", 0)
+        self.flea_intelligence_center_level.addItem("1 级", 1)
+        self.flea_intelligence_center_level.addItem("2 级", 2)
+        self.flea_intelligence_center_level.addItem("3 级（启用手续费折扣）", 3)
+        intelligence_center_level = max(
+            0,
+            min(3, _safe_int(config.get("flea_intelligence_center_level")) or 0),
+        )
+        self.flea_intelligence_center_level.setCurrentIndex(
+            max(0, self.flea_intelligence_center_level.findData(intelligence_center_level))
+        )
+
+        self.flea_hideout_management_level = QSpinBox()
+        self.flea_hideout_management_level.setRange(0, 50)
+        self.flea_hideout_management_level.setSuffix(" 级")
+        self.flea_hideout_management_level.setValue(
+            max(
+                0,
+                min(
+                    50,
+                    _safe_int(config.get("flea_hideout_management_level")) or 0,
+                ),
+            )
+        )
+        fee_layout.addRow("情报中心等级", self.flea_intelligence_center_level)
+        fee_layout.addRow("藏身处管理技能", self.flea_hideout_management_level)
+        fee_note = QLabel(
+            "这些等级只用于估算挂单手续费和跳蚤净收益，不会上传。"
+            "情报中心 3 级才会启用折扣，之后可在“设置 → 查价”修改。"
+        )
+        fee_note.setWordWrap(True)
+        fee_layout.addRow(fee_note)
+        layout.addWidget(fee_group)
         layout.addStretch(1)
 
         buttons = QDialogButtonBox(
@@ -4548,6 +4893,10 @@ class FeatureSetupDialog(QDialog):
         return {
             "enabled_features": enabled,
             "feature_setup_complete": True,
+            "flea_intelligence_center_level": (
+                self.flea_intelligence_center_level.currentData() or 0
+            ),
+            "flea_hideout_management_level": self.flea_hideout_management_level.value(),
         }
 
 
@@ -4555,7 +4904,8 @@ class SettingsDialog(QDialog):
     def __init__(self, config: dict[str, object], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.resize(640, 520)
+        self.resize(720, 600)
+        self.setMinimumSize(640, 520)
         self._config = config
         self.roi_fields: list[QSpinBox] = []
         self.item_roi_fields: list[QSpinBox] = []
@@ -4571,17 +4921,15 @@ class SettingsDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        tabs.addTab(self._build_hotkeys_tab(), "热键")
-        tabs.addTab(self._build_interface_tab(), "界面")
-        tabs.addTab(self._build_features_tab(), "功能")
-        tabs.addTab(self._build_reminders_tab(), "提醒")
-        tabs.addTab(self._build_prices_tab(), "价格")
-        tabs.addTab(self._build_overlays_tab(), "局内界面")
-        tabs.addTab(self._build_performance_tab(), "性能")
-        tabs.addTab(self._build_capture_tab(), "截图")
-        tabs.setCurrentIndex(0)
-        layout.addWidget(tabs)
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.addTab(self._build_general_tab(), "常规")
+        self.settings_tabs.addTab(self._build_features_tab(), "功能")
+        self.settings_tabs.addTab(self._build_prices_tab(), "查价")
+        self.settings_tabs.addTab(self._build_notifications_tab(), "提醒与浮窗")
+        self.settings_tabs.addTab(self._build_hotkeys_tab(), "快捷键")
+        self.settings_tabs.addTab(self._build_advanced_tab(), "高级")
+        self.settings_tabs.setCurrentIndex(0)
+        layout.addWidget(self.settings_tabs)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
@@ -4590,28 +4938,53 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    def _build_interface_tab(self) -> QWidget:
+    def _build_general_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
+
+        appearance = QGroupBox("外观")
+        appearance_layout = QFormLayout(appearance)
         self.ui_theme = QComboBox()
         for theme_id, label in THEME_LABELS.items():
             self.ui_theme.addItem(label, theme_id)
         self.ui_font_size = QSpinBox()
         self.ui_font_size.setRange(9, 18)
         self.ui_font_size.setSuffix(" pt")
-        layout.addRow("界面主题", self.ui_theme)
-        layout.addRow("主界面字体大小", self.ui_font_size)
+        appearance_layout.addRow("界面主题", self.ui_theme)
+        appearance_layout.addRow("主界面字体大小", self.ui_font_size)
+        layout.addWidget(appearance)
+
+        content = QGroupBox("内容与语言")
+        content_layout = QFormLayout(content)
+        self.item_display_language = QComboBox()
+        self.item_display_language.addItem("中文", "zh")
+        self.item_display_language.addItem("English", "en")
+        content_layout.addRow("物品与任务名称", self.item_display_language)
+        layout.addWidget(content)
+
+        behavior = QGroupBox("应用行为")
+        behavior_layout = QVBoxLayout(behavior)
+        self.close_to_tray = QCheckBox("点击关闭按钮时询问最小化到托盘或退出")
+        behavior_layout.addWidget(self.close_to_tray)
+        layout.addWidget(behavior)
+
         note = QLabel(
             "主题和字体保存后立即应用到主窗口与设置界面；局内半透明提示继续使用"
             "独立暗色样式和字号，避免遮挡游戏画面。"
         )
         note.setWordWrap(True)
-        layout.addRow(note)
+        layout.addWidget(note)
+        layout.addStretch(1)
         return tab
 
     def _build_capture_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
         basic = QFormLayout()
 
         self.capture_mode = QComboBox()
@@ -4635,6 +5008,7 @@ class SettingsDialog(QDialog):
         self.item_capture_mode.addItem("固定物品名 ROI", "Fixed ROI")
         self.hover_wait_ms = QSpinBox()
         self.hover_wait_ms.setRange(0, 5000)
+        self.hover_wait_ms.setSuffix(" ms")
 
         timer_roi = self._build_roi_fields(self.roi_fields)
         item_roi = self._build_roi_fields(self.item_roi_fields)
@@ -4656,9 +5030,9 @@ class SettingsDialog(QDialog):
 
         basic.addRow("截图模式", self.capture_mode)
         basic.addRow("物品识别方式", self.item_capture_mode)
-        layout.addLayout(basic)
+        content_layout.addLayout(basic)
 
-        advanced = QGroupBox("高级截图设置")
+        advanced = QGroupBox("手动识别校准（仅排错时使用）")
         advanced.setCheckable(True)
         advanced.setChecked(False)
         advanced_layout = QVBoxLayout(advanced)
@@ -4679,8 +5053,11 @@ class SettingsDialog(QDialog):
         advanced_layout.addWidget(advanced_body)
         advanced_body.setVisible(False)
         advanced.toggled.connect(advanced_body.setVisible)
-        layout.addWidget(advanced)
-        layout.addStretch(1)
+        content_layout.addWidget(advanced)
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
         return tab
 
     def _make_hotkey_field(self, label: str) -> HotkeyLineEdit:
@@ -4750,102 +5127,133 @@ class SettingsDialog(QDialog):
 
     def _build_hotkeys_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
         self.capture_hotkey = self._make_hotkey_field("识别倒计时")
         self.item_lookup_hotkey = self._make_hotkey_field("物品查价")
         self.hideout_scan_hotkey = self._make_hotkey_field("识别藏身处")
-        self.reminder_hold_hotkey = self._make_hotkey_field("隐藏/显示补货提示")
+        self.reminder_hold_hotkey = self._make_hotkey_field("显示/隐藏补货倒计时")
         self.raid_panel_hotkey = self._make_hotkey_field("打开/关闭局内控制")
         self.raid_log_hotkey = self._make_hotkey_field("打开/关闭局内日志")
         self.display_filter_restore_hotkey = self._make_hotkey_field("恢复 Gamma")
-        layout.addRow("识别倒计时", self.capture_hotkey)
-        layout.addRow("物品查价", self.item_lookup_hotkey)
-        layout.addRow("识别藏身处", self.hideout_scan_hotkey)
-        layout.addRow("隐藏/显示补货提示", self.reminder_hold_hotkey)
-        layout.addRow("打开/关闭局内控制", self.raid_panel_hotkey)
-        layout.addRow("打开/关闭局内日志", self.raid_log_hotkey)
-        layout.addRow("恢复 Gamma", self.display_filter_restore_hotkey)
+
+        lookup_group = QGroupBox("识别与查价")
+        lookup_layout = QFormLayout(lookup_group)
+        lookup_layout.addRow("物品查价", self.item_lookup_hotkey)
+        lookup_layout.addRow("识别商人倒计时", self.capture_hotkey)
+        lookup_layout.addRow("识别藏身处", self.hideout_scan_hotkey)
+        layout.addWidget(lookup_group)
+
+        overlay_group = QGroupBox("局内操作")
+        overlay_layout = QFormLayout(overlay_group)
+        overlay_layout.addRow("显示/隐藏补货倒计时", self.reminder_hold_hotkey)
+        overlay_layout.addRow("打开/关闭局内控制", self.raid_panel_hotkey)
+        overlay_layout.addRow("打开/关闭局内日志", self.raid_log_hotkey)
+        overlay_layout.addRow("恢复 Gamma", self.display_filter_restore_hotkey)
+        layout.addWidget(overlay_group)
+
+        note = QLabel("未启用对应功能时，其专用热键不会注册，也不会占用键位。")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
         return tab
 
     def _build_features_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        intro = QLabel("选择要在主界面启用的功能；保存后立即生效。标注 Beta 的功能仍在持续完善。")
+        intro = QLabel(
+            "这里只决定软件要加载哪些模块；保存后立即生效。各模块的具体选项已按用途"
+            "放到其他页面，标注 Beta 的功能仍在持续完善。"
+        )
         intro.setWordWrap(True)
         layout.addWidget(intro)
         for feature_id, label in FEATURE_DEFINITIONS.items():
             check = QCheckBox(label)
+            check.setObjectName("featureChoice")
             self.feature_checks[feature_id] = check
             layout.addWidget(check)
-        self.display_filter_restore_on_exit = QCheckBox("退出软件时关闭画面增强并恢复原始画面")
-        self.display_filter_eye_care_enabled = QCheckBox(
-            "离开 Tarkov 和本助手后自动关闭画面增强"
-        )
-        self.display_filter_eye_care_check_seconds = QSpinBox()
-        self.display_filter_eye_care_check_seconds.setRange(1, 30)
-        layout.addWidget(self.display_filter_restore_on_exit)
-        layout.addWidget(self.display_filter_eye_care_enabled)
-        eye_row = QWidget()
-        eye_layout = QFormLayout(eye_row)
-        eye_layout.setContentsMargins(0, 0, 0, 0)
-        eye_layout.addRow("护眼检测间隔秒数", self.display_filter_eye_care_check_seconds)
-        layout.addWidget(eye_row)
         layout.addStretch(1)
         return tab
 
     def _build_prices_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
+
         self.price_overlay_enabled = QCheckBox("显示置顶价格浮窗")
-        self.close_to_tray = QCheckBox("点击关闭按钮时询问最小化到托盘或退出")
         self.require_tarkov_foreground = QCheckBox("截图前要求 Tarkov 是前台窗口")
         self.require_inventory_check = QCheckBox("查价前先检测背包/详情界面")
         self.refresh_prices_on_startup = QCheckBox(
             "启动时检查价格更新（ETag，变化时才下载）"
         )
-        self.price_cache_stale_hours = QSpinBox()
-        self.price_cache_stale_hours.setRange(1, 168)
-        self.price_cache_stale_hours.setSuffix(" 小时")
+        self.smart_price_enabled = QCheckBox("启用智能挂价建议")
         self.price_overlay_seconds = QSpinBox()
         self.price_overlay_seconds.setRange(1, 120)
-        self.item_display_language = QComboBox()
-        self.item_display_language.addItem("中文", "zh")
-        self.item_display_language.addItem("English", "en")
+        self.price_overlay_seconds.setSuffix(" 秒")
         self.price_game_mode_default = QComboBox()
         self.price_game_mode_default.addItem("PvE", "pve")
         self.price_game_mode_default.addItem("PvP", "regular")
-        layout.addRow(self.price_overlay_enabled)
-        layout.addRow(self.close_to_tray)
-        layout.addRow(self.require_tarkov_foreground)
-        layout.addRow(self.require_inventory_check)
-        layout.addRow(self.refresh_prices_on_startup)
-        layout.addRow("缓存过期阈值", self.price_cache_stale_hours)
-        layout.addRow("浮窗显示秒数", self.price_overlay_seconds)
-        layout.addRow("物品与任务名称语言", self.item_display_language)
-        layout.addRow("默认价格模式", self.price_game_mode_default)
+        self.flea_intelligence_center_level = QComboBox()
+        self.flea_intelligence_center_level.addItem("0 级 / 未建造", 0)
+        self.flea_intelligence_center_level.addItem("1 级", 1)
+        self.flea_intelligence_center_level.addItem("2 级", 2)
+        self.flea_intelligence_center_level.addItem("3 级（启用手续费折扣）", 3)
+        self.flea_hideout_management_level = QSpinBox()
+        self.flea_hideout_management_level.setRange(0, 50)
+        self.flea_hideout_management_level.setSuffix(" 级")
+
+        display_group = QGroupBox("结果显示")
+        display_layout = QFormLayout(display_group)
+        display_layout.addRow("默认价格模式", self.price_game_mode_default)
+        display_layout.addRow(self.price_overlay_enabled)
+        display_layout.addRow("浮窗显示时间", self.price_overlay_seconds)
+        layout.addWidget(display_group)
+
+        fee_group = QGroupBox("跳蚤手续费与净收益")
+        fee_layout = QFormLayout(fee_group)
+        fee_layout.addRow("情报中心等级", self.flea_intelligence_center_level)
+        fee_layout.addRow("藏身处管理技能", self.flea_hideout_management_level)
+        fee_note = QLabel(
+            "按 Tarkov 1.1 的 5% + 5% 非线性公式计算；情报中心 3 级提供 30% "
+            "折扣，藏身处管理每级再增加 0.3 个百分点。"
+        )
+        fee_note.setWordWrap(True)
+        fee_layout.addRow(fee_note)
+        layout.addWidget(fee_group)
+
+        safety_group = QGroupBox("识别保护")
+        safety_layout = QVBoxLayout(safety_group)
+        safety_layout.addWidget(self.require_tarkov_foreground)
+        safety_layout.addWidget(self.require_inventory_check)
+        layout.addWidget(safety_group)
+
+        data_group = QGroupBox("价格数据")
+        data_layout = QVBoxLayout(data_group)
+        data_layout.addWidget(self.refresh_prices_on_startup)
+        data_layout.addWidget(self.smart_price_enabled)
+        smart_price_note = QLabel(
+            "关闭时直接使用本地缓存的API最近低价作为建议挂单价；开启后会先显示该结果，"
+            "再按当前物品异步读取近期历史并更新建议挂单价，不会批量预取。"
+        )
+        smart_price_note.setWordWrap(True)
+        data_layout.addWidget(smart_price_note)
+        layout.addWidget(data_group)
+        layout.addStretch(1)
         return tab
 
-    def _build_reminders_tab(self) -> QWidget:
+    def _build_notifications_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
+
         self.lead_seconds = QSpinBox()
         self.lead_seconds.setRange(0, 3600)
+        self.lead_seconds.setSuffix(" 秒")
         self.repeat_seconds = QSpinBox()
         self.repeat_seconds.setRange(0, 3600)
+        self.repeat_seconds.setSuffix(" 秒")
         self.feedback_overlay_seconds = QSpinBox()
         self.feedback_overlay_seconds.setRange(1, 120)
+        self.feedback_overlay_seconds.setSuffix(" 秒")
         self.sound_enabled = QCheckBox("声音")
-        self.popup_enabled = QCheckBox("悬浮提示")
-        layout.addRow("提前提醒秒数", self.lead_seconds)
-        layout.addRow("重复提醒间隔", self.repeat_seconds)
-        layout.addRow("操作反馈显示秒数", self.feedback_overlay_seconds)
-        layout.addRow(self.sound_enabled)
-        layout.addRow(self.popup_enabled)
-        return tab
-
-    def _build_overlays_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QFormLayout(tab)
+        self.popup_enabled = QCheckBox("提醒触发时自动显示倒计时悬浮窗")
         self.raid_panel_opacity = QSpinBox()
         self.raid_panel_opacity.setRange(55, 100)
         self.raid_panel_opacity.setSuffix(" %")
@@ -4854,19 +5262,60 @@ class SettingsDialog(QDialog):
         self.raid_log_opacity.setSuffix(" %")
         self.raid_log_max_lines = QSpinBox()
         self.raid_log_max_lines.setRange(20, 2000)
-        layout.addRow("右上控制窗透明度", self.raid_panel_opacity)
-        layout.addRow("左下日志窗透明度", self.raid_log_opacity)
-        layout.addRow("局内日志保留行数", self.raid_log_max_lines)
+        self.raid_log_max_lines.setSuffix(" 行")
+
+        reminder_group = QGroupBox("商人补货提醒")
+        reminder_layout = QFormLayout(reminder_group)
+        reminder_layout.addRow("提前提醒", self.lead_seconds)
+        reminder_layout.addRow("重复提醒间隔", self.repeat_seconds)
+        reminder_layout.addRow(self.sound_enabled)
+        reminder_layout.addRow(self.popup_enabled)
+        reminder_note = QLabel(
+            "主界面按钮或对应热键可随时显示全部活动倒计时。若用户主动隐藏，"
+            "后续提醒只更新状态和声音，不会强行重新打开悬浮窗。"
+        )
+        reminder_note.setWordWrap(True)
+        reminder_layout.addRow(reminder_note)
+        layout.addWidget(reminder_group)
+
+        feedback_group = QGroupBox("通用操作提示")
+        feedback_layout = QFormLayout(feedback_group)
+        feedback_layout.addRow("显示时间", self.feedback_overlay_seconds)
+        layout.addWidget(feedback_group)
+
+        overlay_group = QGroupBox("局内控制与日志")
+        overlay_layout = QFormLayout(overlay_group)
+        overlay_layout.addRow("右上控制窗透明度", self.raid_panel_opacity)
+        overlay_layout.addRow("左下日志窗透明度", self.raid_log_opacity)
+        overlay_layout.addRow("日志保留行数", self.raid_log_max_lines)
         note = QLabel(
             "控制窗会接收键盘和鼠标；日志窗显示时不主动抢焦点，点击后可滚动和拖动。"
         )
         note.setWordWrap(True)
-        layout.addRow(note)
+        overlay_layout.addRow(note)
+        layout.addWidget(overlay_group)
+        layout.addStretch(1)
+        return tab
+
+    def _build_advanced_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        intro = QLabel(
+            "这些选项主要用于兼容特殊设备、控制网络行为或排查识别问题。"
+            "正常使用建议保持默认值。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        self.advanced_tabs = QTabWidget()
+        self.advanced_tabs.addTab(self._build_performance_tab(), "性能与诊断")
+        self.advanced_tabs.addTab(self._build_capture_tab(), "截图与识别")
+        self.advanced_tabs.addTab(self._build_display_filter_safety_tab(), "画面增强")
+        layout.addWidget(self.advanced_tabs)
         return tab
 
     def _build_performance_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
         self.performance_mode_enabled = QCheckBox("性能模式：限制后台任务并在非游戏时定期整理内存")
         self.performance_ocr_threads = QComboBox()
         self.performance_ocr_threads.addItem("低占用（1 线程）", 1)
@@ -4878,17 +5327,64 @@ class SettingsDialog(QDialog):
         )
         self.performance_log_max_lines = QSpinBox()
         self.performance_log_max_lines.setRange(100, 5000)
+        self.performance_log_max_lines.setSuffix(" 行")
         self.performance_cleanup_interval_seconds = QSpinBox()
         self.performance_cleanup_interval_seconds.setRange(15, 600)
+        self.performance_cleanup_interval_seconds.setSuffix(" 秒")
         self.performance_max_concurrent_workers = QSpinBox()
         self.performance_max_concurrent_workers.setRange(1, 4)
-        layout.addRow(self.performance_mode_enabled)
-        layout.addRow("OCR CPU 占用", self.performance_ocr_threads)
-        layout.addRow(self.performance_price_timing_logs)
-        layout.addRow(self.performance_skip_auto_price_refresh)
-        layout.addRow("可见日志最多行数", self.performance_log_max_lines)
-        layout.addRow("空闲清理间隔秒数", self.performance_cleanup_interval_seconds)
-        layout.addRow("后台任务并发上限", self.performance_max_concurrent_workers)
+        self.price_cache_stale_hours = QSpinBox()
+        self.price_cache_stale_hours.setRange(1, 168)
+        self.price_cache_stale_hours.setSuffix(" 小时")
+
+        resource_group = QGroupBox("资源占用")
+        resource_layout = QFormLayout(resource_group)
+        resource_layout.addRow(self.performance_mode_enabled)
+        resource_layout.addRow("OCR CPU 占用", self.performance_ocr_threads)
+        resource_layout.addRow("后台任务并发上限", self.performance_max_concurrent_workers)
+        resource_layout.addRow("空闲清理间隔", self.performance_cleanup_interval_seconds)
+        layout.addWidget(resource_group)
+
+        data_group = QGroupBox("数据与网络")
+        data_layout = QFormLayout(data_group)
+        data_layout.addRow(self.performance_skip_auto_price_refresh)
+        data_layout.addRow("缓存过期阈值", self.price_cache_stale_hours)
+        layout.addWidget(data_group)
+
+        diagnostics_group = QGroupBox("诊断日志")
+        diagnostics_layout = QFormLayout(diagnostics_group)
+        diagnostics_layout.addRow(self.performance_price_timing_logs)
+        diagnostics_layout.addRow("可见日志最多行数", self.performance_log_max_lines)
+        layout.addWidget(diagnostics_group)
+        layout.addStretch(1)
+        return tab
+
+    def _build_display_filter_safety_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self.display_filter_restore_on_exit = QCheckBox(
+            "退出软件时关闭画面增强并恢复原始画面"
+        )
+        self.display_filter_eye_care_enabled = QCheckBox(
+            "离开 Tarkov 和本助手后自动关闭画面增强"
+        )
+        self.display_filter_eye_care_check_seconds = QSpinBox()
+        self.display_filter_eye_care_check_seconds.setRange(1, 30)
+        self.display_filter_eye_care_check_seconds.setSuffix(" 秒")
+
+        safety_group = QGroupBox("自动恢复")
+        safety_layout = QFormLayout(safety_group)
+        safety_layout.addRow(self.display_filter_restore_on_exit)
+        safety_layout.addRow(self.display_filter_eye_care_enabled)
+        safety_layout.addRow("状态检测间隔", self.display_filter_eye_care_check_seconds)
+        layout.addWidget(safety_group)
+        note = QLabel(
+            "只有启用“画面增强 / Gamma”模块时这些选项才会生效；保留自动恢复可以"
+            "避免退出或切换应用后继续沿用游戏内亮度。"
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        layout.addStretch(1)
         return tab
 
     def _build_roi_fields(self, fields: list[QSpinBox]) -> QWidget:
@@ -4991,6 +5487,9 @@ class SettingsDialog(QDialog):
         self.refresh_prices_on_startup.setChecked(
             bool(self._config.get("refresh_prices_on_startup", True))
         )
+        self.smart_price_enabled.setChecked(
+            bool(self._config.get("smart_price_enabled", False))
+        )
         self.price_cache_stale_hours.setValue(
             _safe_int(self._config.get("price_cache_stale_hours")) or 24
         )
@@ -5006,6 +5505,22 @@ class SettingsDialog(QDialog):
             str(self._config.get("price_game_mode_default", "pve"))
         )
         self.price_game_mode_default.setCurrentIndex(max(0, game_mode_index))
+        intelligence_center_level = (
+            _safe_int(self._config.get("flea_intelligence_center_level")) or 0
+        )
+        intelligence_center_level = max(0, min(3, intelligence_center_level))
+        self.flea_intelligence_center_level.setCurrentIndex(
+            max(0, self.flea_intelligence_center_level.findData(intelligence_center_level))
+        )
+        self.flea_hideout_management_level.setValue(
+            max(
+                0,
+                min(
+                    50,
+                    _safe_int(self._config.get("flea_hideout_management_level")) or 0,
+                ),
+            )
+        )
 
         self.lead_seconds.setValue(int(self._config.get("lead_time_seconds", 10)))
         self.repeat_seconds.setValue(int(self._config.get("repeat_alert_seconds", 0)))
@@ -5079,8 +5594,13 @@ class SettingsDialog(QDialog):
             "require_tarkov_foreground": self.require_tarkov_foreground.isChecked(),
             "require_inventory_check": self.require_inventory_check.isChecked(),
             "refresh_prices_on_startup": self.refresh_prices_on_startup.isChecked(),
+            "smart_price_enabled": self.smart_price_enabled.isChecked(),
             "price_cache_stale_hours": self.price_cache_stale_hours.value(),
             "price_game_mode_default": self.price_game_mode_default.currentData() or "pve",
+            "flea_intelligence_center_level": (
+                self.flea_intelligence_center_level.currentData() or 0
+            ),
+            "flea_hideout_management_level": self.flea_hideout_management_level.value(),
             "lead_time_seconds": self.lead_seconds.value(),
             "repeat_alert_seconds": self.repeat_seconds.value(),
             "feedback_overlay_seconds": self.feedback_overlay_seconds.value(),
@@ -5147,6 +5667,7 @@ class PriceView:
     toast_key: str = ""
     recipe_notices: tuple[RecipeNotice, ...] = ()
     recipe_accent_color: str = "#E8C47A"
+    card_border_color: str = ""
 
 
 @dataclass(frozen=True)
@@ -5175,6 +5696,102 @@ def _recipe_product_count_text(record: dict[str, object]) -> str:
     return f"产出 ×{count_text}"
 
 
+def _build_ammo_price_view(
+    price: object,
+    display_language: str,
+    toast_key: str,
+) -> PriceView:
+    properties = getattr(price, "ammo_properties", None)
+    if not isinstance(properties, dict):
+        raise ValueError("Ammo price view requires ItemPropertiesAmmo data.")
+    title = _display_item_name(price, display_language)
+    damage = _safe_int(properties.get("damage"))
+    penetration = _safe_int(properties.get("penetrationPower"))
+    projectile_count = _safe_int(properties.get("projectileCount")) or 1
+    damage_text = str(damage) if damage is not None else "-"
+    if projectile_count > 1:
+        damage_text = f"{damage_text} × {projectile_count}"
+    value_text = f"伤害 {damage_text} · 穿深 {penetration if penetration is not None else '-'}"
+
+    armor_damage = _safe_int(properties.get("armorDamage"))
+    speed = _safe_int(properties.get("initialSpeed"))
+    secondary_parts = [
+        f"甲伤 {armor_damage}%" if armor_damage is not None else "甲伤 -",
+        f"初速 {speed} m/s" if speed is not None else "初速 -",
+    ]
+    pack_count = _safe_int(getattr(price, "ammo_pack_count", None))
+    if pack_count is not None:
+        ammo_name = (
+            str(getattr(price, "ammo_zh_name", "") or "")
+            if display_language.casefold() == "zh"
+            else str(getattr(price, "ammo_name", "") or "")
+        )
+        secondary_parts.insert(0, f"内含 {pack_count} 发 {ammo_name}".strip())
+    secondary_value_text = " · ".join(secondary_parts)
+
+    detail_parts: list[str] = []
+    recoil = _safe_float(properties.get("recoilModifier"))
+    accuracy = _safe_float(properties.get("accuracyModifier"))
+    if recoil:
+        detail_parts.append(f"后座 {recoil * 100:+.0f}%")
+    if accuracy:
+        detail_parts.append(f"精度 {accuracy * 100:+.0f}%")
+    if bool(properties.get("tracer")):
+        tracer_color = str(properties.get("tracerColor") or "").strip()
+        detail_parts.append(f"曳光弹{f'（{tracer_color}）' if tracer_color else ''}")
+    detail = " · ".join(detail_parts) or "无后座或精度修正"
+
+    tier_label, tier_color, tier_accent = _ammo_penetration_tier(penetration)
+    label_html = (
+        f"<div style='line-height:1.35;'>"
+        f"<b>{html.escape(title)}</b><br>"
+        f"<span style='color:{tier_color}; font-size:18px; font-weight:800;'>"
+        f"{html.escape(value_text)}</span><br>"
+        f"<span style='color:{tier_color}; font-size:14px; font-weight:700;'>"
+        f"{html.escape(secondary_value_text)}</span><br>"
+        f"<span>{html.escape(detail)}</span>"
+        f"</div>"
+    )
+    return PriceView(
+        title=title,
+        subtitle="",
+        detail=detail,
+        value_text=value_text,
+        secondary_value_text=secondary_value_text,
+        tier_label=tier_label,
+        tier_color=tier_color,
+        tier_accent=tier_accent,
+        label_html=label_html,
+        log_text=f"{title} | {value_text} | {secondary_value_text} | {detail}",
+        toast_key=toast_key,
+        card_border_color=tier_color,
+    )
+
+
+def _ammo_penetration_tier(penetration: int | None) -> tuple[str, str, str]:
+    colors = {
+        1: "#F5F7FA",
+        2: "#57D37C",
+        3: "#4DA3FF",
+        4: "#B47CFF",
+        5: "#F2C14E",
+        6: "#FF5D5D",
+    }
+    if penetration is None:
+        return "穿透未知", "#D8D8D8", "#D8D8D8"
+    if penetration >= 70:
+        return (
+            "特殊穿透",
+            "#FF7AE7",
+            "qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #FF3B5C, "
+            "stop:0.2 #FFB000, stop:0.4 #45D483, stop:0.6 #46B7FF, "
+            "stop:0.8 #9B72FF, stop:1 #FF4FD8)",
+        )
+    armor_class = max(1, min(6, penetration // 10))
+    color = colors[armor_class]
+    return f"穿透 {armor_class} 级", color, color
+
+
 def _build_price_view(
     price: object,
     display_language: str,
@@ -5183,24 +5800,64 @@ def _build_price_view(
     firearm_color: str = "#00D1D1",
     firearm_accent: str = "#00D1D1",
     hideout_lines: list[str] | None = None,
+    flea_intelligence_center_level: int = 0,
+    flea_hideout_management_level: int = 0,
     recipe_notices: list[RecipeNotice] | None = None,
     recipe_accent_color: str = "#E8C47A",
-    history_summary: object | None = None,
-    volatility_notice: bool = False,
+    smart_estimate: SmartPriceEstimate | object | None = None,
+    smart_pending: bool = False,
     toast_key: str = "",
 ) -> PriceView:
+    if isinstance(getattr(price, "ammo_properties", None), dict):
+        return _build_ammo_price_view(price, display_language, toast_key)
     game_mode = _game_mode_label(str(getattr(price, "game_mode", "regular")))
-    title = _display_item_name(price, display_language)
-    confidence = getattr(price, "confidence", 0.0)
+    title = f"{_display_item_name(price, display_language)} · {game_mode}"
     vendor_name = getattr(price, "best_vendor_name", None)
     vendor_currency = getattr(price, "best_vendor_currency", "RUB")
     vendor_price = _money(_safe_int(getattr(price, "best_vendor_price", None)), vendor_currency)
     vendor = f"{vendor_name}: {vendor_price}" if vendor_name else vendor_price
     slots = _safe_int(getattr(price, "slots", None))
     avg_value = _safe_int(getattr(price, "avg_24h_price", None))
-    reference_value = _safe_int(getattr(history_summary, "median_price", None)) or avg_value
-    total_value, total_source = _best_total_value(price, reference_value)
-    value_per_slot = _slot_value(total_value, slots)
+    last_low = _safe_int(getattr(price, "last_low_price", None))
+    offer_count = _safe_int(getattr(price, "last_offer_count", None))
+    fast_estimate = build_fast_price_estimate(last_low, avg_value, offer_count)
+    fallback_listing_price = last_low if last_low is not None else avg_value
+
+    def flea_values(listing_price: int | None) -> tuple[int | None, int | None]:
+        fee = calculate_flea_market_fee(
+            getattr(price, "base_price", None),
+            listing_price,
+            intelligence_center_level=flea_intelligence_center_level,
+            hideout_management_level=flea_hideout_management_level,
+        )
+        net = (
+            listing_price - fee
+            if listing_price is not None and fee is not None
+            else None
+        )
+        return fee, net
+
+    vendor_rub = _safe_int(getattr(price, "best_vendor_price_rub", None))
+    _last_low_fee, last_low_net = flea_values(last_low)
+    _avg_fee, avg_net = flea_values(avg_value)
+    has_market_reference = last_low is not None or avg_value is not None
+    if has_market_reference and last_low_net is None and avg_net is None:
+        # A gross market price is not comparable to a trader's guaranteed RUB
+        # return when the fee inputs are unavailable.
+        sale_region = classify_sale_region(None, None, None)
+    else:
+        sale_region = classify_sale_region(
+            last_low_net,
+            avg_net,
+            vendor_rub,
+        )
+    conservative_values = [
+        value
+        for value in (sale_region.flea_lower_net, vendor_rub)
+        if value is not None
+    ]
+    conservative_total_value = max(conservative_values) if conservative_values else None
+    conservative_value_per_slot = _slot_value(conservative_total_value, slots)
     is_firearm = bool(getattr(price, "is_firearm", False))
 
     if is_firearm:
@@ -5208,50 +5865,88 @@ def _build_price_view(
         tier_color = _safe_color(firearm_color, "#00D1D1")
         tier_accent = _safe_accent(firearm_accent, tier_color)
     else:
-        value_for_tier = value_per_slot if value_basis == "slot" else total_value
+        value_for_tier = (
+            conservative_value_per_slot
+            if value_basis == "slot"
+            else conservative_total_value
+        )
         if value_for_tier is None and value_basis == "slot":
-            value_for_tier = total_value
+            value_for_tier = conservative_total_value
         tier_label, tier_color, tier_accent = _price_tier(value_for_tier, tiers)
 
-    if total_value is not None:
-        value_text = f"{total_source}: {_money(total_value, 'RUB')}"
+    smart_price = _safe_int(getattr(smart_estimate, "suggested_price", None))
+    smart_confidence = str(getattr(smart_estimate, "confidence", "low") or "low")
+    smart_requested = smart_pending or smart_estimate is not None
+    smart_usable = smart_requested and smart_price is not None
+    listing_price = smart_price if smart_usable else fallback_listing_price
+    flea_fee, flea_net_value = flea_values(listing_price)
+    if sale_region.region == "flea":
+        value_text = "跳蚤更优"
+    elif sale_region.region == "trader":
+        value_text = f"商人更优 · {vendor_name or '商人'}"
+    elif sale_region.region == "close":
+        value_text = "收益接近"
     else:
-        value_text = "最优价: -"
-    if is_firearm:
-        secondary_value_text = "枪械：单格价值不参与分级"
-    elif value_per_slot is not None:
-        secondary_value_text = f"单格价值: {_money(value_per_slot, 'RUB')}/格"
-    else:
-        secondary_value_text = "单格价值: -"
+        value_text = "出售判断数据不足"
 
-    detail_line_1 = (
-        f"[{game_mode}] · "
-        f"24h均价 {_money(avg_value, 'RUB')} · "
-        f"当前最低 {_money(_safe_int(getattr(price, 'last_low_price', None)), 'RUB')}"
+    if listing_price is not None and flea_net_value is not None:
+        secondary_value_text = (
+            f"建议挂 {_money(listing_price, 'RUB')} · "
+            f"净到手 {_money(flea_net_value, 'RUB')}"
+        )
+    elif listing_price is not None:
+        secondary_value_text = f"建议挂 {_money(listing_price, 'RUB')}"
+    else:
+        secondary_value_text = "挂价与净收益数据不足"
+
+    detail_lines: list[str] = []
+    detail_lines.append(
+        f"API最近低价 {_money(last_low, 'RUB')} · "
+        f"24h均价 {_money(avg_value, 'RUB')}"
     )
-    detail_line_2 = f"商人 {vendor} · 匹配 {confidence:.0%}"
-    extra_parts: list[str] = []
-    history_median = _safe_int(getattr(history_summary, "median_price", None))
-    if history_median is not None:
-        extra_parts.append(f"历史中位 {_money(history_median, 'RUB')}")
-    price_low_24h = _safe_int(getattr(price, "low_24h_price", None))
-    price_high_24h = _safe_int(getattr(price, "high_24h_price", None))
-    low_24h = price_low_24h if price_low_24h is not None else _safe_int(getattr(history_summary, "low_price", None))
-    high_24h = price_high_24h if price_high_24h is not None else _safe_int(getattr(history_summary, "high_price", None))
-    range_label = "24h" if price_low_24h is not None or price_high_24h is not None else "历史"
-    if low_24h is not None or high_24h is not None:
-        extra_parts.append(f"{range_label}区间 {_money(low_24h, 'RUB')} - {_money(high_24h, 'RUB')}")
-    offer_count = _safe_int(getattr(price, "last_offer_count", None))
-    if offer_count is not None:
-        extra_parts.append(f"挂单 {offer_count}")
-    change = _safe_float(getattr(price, "change_48h_percent", None))
-    if change is not None:
-        extra_parts.append(f"48h {change:+.1f}%")
-    if volatility_notice:
-        extra_parts.append("疑似高波动物品，正在联网查询详细价格")
-    detail_lines = [detail_line_1, detail_line_2]
-    if extra_parts:
-        detail_lines.append(" · ".join(extra_parts))
+
+    if sale_region.region == "trader" and vendor_rub is not None:
+        detail_lines.append(
+            f"{vendor_name or '商人'}收购 {_money(vendor_rub, 'RUB')}"
+        )
+    elif sale_region.region == "close" and vendor_rub is not None:
+        detail_lines.append(
+            f"{vendor_name or '商人'}收购 {_money(vendor_rub, 'RUB')}"
+        )
+    elif sale_region.region == "unknown" and vendor_rub is not None:
+        detail_lines.append(
+            f"{vendor_name or '商人'}收购 {_money(vendor_rub, 'RUB')}"
+        )
+
+    smart_confidence_label = {"high": "高", "medium": "中", "low": "低"}.get(
+        smart_confidence,
+        "低",
+    )
+    metadata_parts: list[str] = []
+    if smart_usable:
+        metadata_parts.append(f"智能可信度 {smart_confidence_label}")
+    elif smart_pending:
+        metadata_parts.append("智能分析中…")
+    sample_age = _format_api_sample_age(getattr(price, "updated", None))
+    if sample_age:
+        metadata_parts.append(sample_age)
+    if metadata_parts:
+        detail_lines.append(" · ".join(metadata_parts))
+
+    risk_parts: list[str] = []
+    if listing_price is not None and flea_fee is None:
+        risk_parts.append("手续费数据不足，无法准确估算跳蚤净收益")
+    elif not has_market_reference:
+        risk_parts.append("跳蚤市场参考缺失，无法比较出售渠道")
+    if vendor_rub is None:
+        risk_parts.append("商人收购价缺失，无法比较出售渠道")
+    if fast_estimate.risk_notice:
+        risk_parts.append(fast_estimate.risk_notice)
+    smart_risk = str(getattr(smart_estimate, "risk_notice", "") or "")
+    if smart_risk and smart_risk not in risk_parts:
+        risk_parts.append(smart_risk)
+    if risk_parts:
+        detail_lines.append("风险：" + "；".join(risk_parts[:2]))
     detail = "\n".join(detail_lines)
 
     hideout_text = "；".join(hideout_lines or [])
@@ -5268,21 +5963,31 @@ def _build_price_view(
     notices = tuple(recipe_notices or [])
     recipe_html = ""
     if notices:
+        visible_notices = notices[:MAX_VISIBLE_RECIPE_NOTICES]
         notice_rows = "<div style='height:5px;'></div>".join(
             f"<div style='margin-top:4px;'>"
-            f"<span style='color:#9AA5B2;'>目标产物</span><br>"
-            f"<span style='color:{safe_recipe_color}; font-size:14px; font-weight:800;'>"
+            f"<span style='color:#9AA5B2;'>可用于</span> "
+            f"<span style='color:#FBFAF4; font-size:14px; font-weight:800;'>"
             f"{html.escape(notice.product_text)}</span><br>"
-            f"<span style='color:#AEB7C2;'>{html.escape(notice.source_text)}</span> · "
-            f"<span style='font-weight:800;'>{html.escape(notice.requirement_text)}</span>"
+            f"<span style='color:#9AA5B2;'>需要</span> "
+            f"<span style='color:{safe_recipe_color}; font-weight:800;'>"
+            f"{html.escape(_recipe_material_text(notice))}</span> · "
+            f"<span style='color:#AEB7C2;'>{html.escape(notice.source_text)}</span>"
             f"</div>"
-            for notice in notices
+            for notice in visible_notices
         )
+        remaining = len(notices) - len(visible_notices)
+        if remaining > 0:
+            notice_rows += (
+                f"<div style='height:5px;'></div>"
+                f"<div style='color:#AEB7C2;'>另有 {remaining} 个关注用途</div>"
+            )
+        recipe_background = _blend_hex_color(safe_recipe_color, "#080A0D", 0.22)
         recipe_html = (
             f"<div style='margin-top:8px; padding:7px 9px; "
-            f"border:1px solid {safe_recipe_color}; border-radius:6px;'>"
+            f"background-color:{recipe_background}; border-radius:6px;'>"
             f"<span style='color:{safe_recipe_color}; font-weight:800;'>"
-            f"制作/兑换配方</span><br>{notice_rows}</div>"
+            f"★ 关注用途物品 · {len(notices)}</span><br>{notice_rows}</div>"
         )
     detail_html = "<br>".join(html.escape(line) for line in detail.splitlines())
     label_html = (
@@ -5290,19 +5995,19 @@ def _build_price_view(
         f"<b>{html.escape(title)}</b><br>"
         f"<span style='color:{tier_color}; font-size:18px; font-weight:800;'>{html.escape(value_text)}</span><br>"
         f"<span style='color:{tier_color}; font-size:14px; font-weight:700;'>{html.escape(secondary_value_text)}</span><br>"
+        f"{recipe_html}"
         f"<span>{detail_html}</span>"
         f"{hideout_html}"
-        f"{recipe_html}"
         f"</div>"
     )
-    log_text = f"[{game_mode}] {title} | {value_text} | {secondary_value_text} | 商人 {vendor}"
-    if volatility_notice:
-        log_text = f"{log_text} | 疑似高波动物品，正在联网查询详细价格"
+    log_text = f"{title} | {value_text} | {secondary_value_text} | 商人 {vendor}"
+    if smart_pending:
+        log_text = f"{log_text} | 智能挂价分析中"
     if hideout_text:
         log_text = f"{log_text} | 藏身处 {hideout_text}"
     if notices:
         log_text = (
-            f"{log_text} | 制作/兑换配方 "
+            f"{log_text} | 关注用途 "
             + "；".join(notice.compact_text for notice in notices)
         )
     return PriceView(
@@ -5319,6 +6024,7 @@ def _build_price_view(
         toast_key=toast_key,
         recipe_notices=notices,
         recipe_accent_color=safe_recipe_color,
+        card_border_color=tier_color,
     )
 
 def _display_item_name(price: object, display_language: str) -> str:
@@ -5338,6 +6044,52 @@ def _money(value: int | None, currency: str | None = "RUB") -> str:
     return f"{value:,} {currency or 'RUB'}"
 
 
+def _format_api_sample_age(value: object, now: float | None = None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        numeric = float(text)
+    except ValueError:
+        try:
+            sampled_at = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return ""
+        if sampled_at.tzinfo is None:
+            sampled_at = sampled_at.replace(tzinfo=timezone.utc)
+        timestamp = sampled_at.timestamp()
+    else:
+        timestamp = numeric / 1000.0 if numeric > 10_000_000_000 else numeric
+
+    try:
+        reference = time.time() if now is None else float(now)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if (
+        not math.isfinite(timestamp)
+        or not math.isfinite(reference)
+        or timestamp <= 0
+        or timestamp > reference + 86400
+    ):
+        return ""
+    age_seconds = max(0, round(reference - timestamp))
+    if age_seconds < 60:
+        return "API采样 刚刚"
+    if age_seconds < 3600:
+        return f"API采样 {age_seconds // 60}分钟前"
+    if age_seconds < 86400:
+        hours, remainder = divmod(age_seconds, 3600)
+        minutes = remainder // 60
+        if minutes:
+            return f"API采样 {hours}小时{minutes}分钟前"
+        return f"API采样 {hours}小时前"
+    try:
+        sampled_local = datetime.fromtimestamp(timestamp)
+    except (OSError, OverflowError, ValueError):
+        return ""
+    return f"API采样 {sampled_local:%m-%d %H:%M}"
+
+
 def _safe_float(value: object) -> float | None:
     if value is None:
         return None
@@ -5353,94 +6105,46 @@ def _slot_value(value: int | None, slots: int | None) -> int | None:
     return round(value / slots)
 
 
-def _best_total_value(price: object, reference_value: int | None) -> tuple[int | None, str]:
-    vendor_rub = _safe_int(getattr(price, "best_vendor_price_rub", None))
-    if reference_value is not None and vendor_rub is not None:
-        if vendor_rub > reference_value:
-            return vendor_rub, "最优价(商人)"
-        return reference_value, "参考价"
-    if reference_value is not None:
-        return reference_value, "参考价"
-    if vendor_rub is not None:
-        return vendor_rub, "最优价(商人)"
-    last_low = _safe_int(getattr(price, "last_low_price", None))
-    if last_low is not None:
-        return last_low, "当前最低"
-    return None, "最优价"
-
-
-def _is_high_volatility(price: object, threshold: float = 0.50) -> bool:
-    avg_value = _safe_int(getattr(price, "avg_24h_price", None))
-    last_low = _safe_int(getattr(price, "last_low_price", None))
-    if avg_value is None or avg_value <= 0 or last_low is None:
-        return False
-    return abs(last_low - avg_value) / avg_value >= threshold
-
-
 def _price_overlay_key(price: object) -> str:
     item_id = str(getattr(price, "item_id", "") or "")
     mode = str(getattr(price, "game_mode", "") or "")
     return f"price:{mode}:{item_id}"
 
 
-def _build_price_history_view(
-    price: object,
-    summary: object,
-    display_language: str,
-    tier_color: str,
-    tier_accent: str,
-    toast_key: str = "",
-) -> PriceView:
-    title = f"{_display_item_name(price, display_language)} · 详细评估"
-    median = _safe_int(getattr(summary, "median_price", None))
-    sample_count = _safe_int(getattr(summary, "sample_count", None))
-    latest = _safe_int(getattr(summary, "latest_price", None))
-    latest_min = _safe_int(getattr(summary, "latest_min_price", None))
-    latest_offer = _safe_int(getattr(summary, "latest_offer_count", None))
-    price_low_24h = _safe_int(getattr(price, "low_24h_price", None))
-    price_high_24h = _safe_int(getattr(price, "high_24h_price", None))
-    low_24h = price_low_24h if price_low_24h is not None else _safe_int(getattr(summary, "low_price", None))
-    high_24h = price_high_24h if price_high_24h is not None else _safe_int(getattr(summary, "high_price", None))
-    range_label = "24h" if price_low_24h is not None or price_high_24h is not None else "历史"
-    value_text = f"历史中位: {_money(median, 'RUB')}"
-    secondary_value_text = (
-        f"最近 {sample_count or 0} 个历史点 · 最新 {_money(latest, 'RUB')}"
-    )
-    detail_parts = [
-        f"{range_label}最低 {_money(low_24h, 'RUB')}",
-        f"{range_label}最高 {_money(high_24h, 'RUB')}",
-        f"最新最低 {_money(latest_min, 'RUB')}",
-    ]
-    if latest_offer is not None:
-        detail_parts.append(f"最新挂单 {latest_offer}")
-    detail = " · ".join(detail_parts)
-    label_html = (
-        f"<div style='line-height:1.35;'>"
-        f"<b>{html.escape(title)}</b><br>"
-        f"<span style='color:{tier_color}; font-size:18px; font-weight:800;'>{html.escape(value_text)}</span><br>"
-        f"<span style='color:{tier_color}; font-size:14px; font-weight:700;'>{html.escape(secondary_value_text)}</span><br>"
-        f"<span>{html.escape(detail)}</span>"
-        f"</div>"
-    )
-    return PriceView(
-        title=title,
-        subtitle="",
-        detail=detail,
-        value_text=value_text,
-        secondary_value_text=secondary_value_text,
-        tier_label="历史",
-        tier_color=tier_color,
-        tier_accent=tier_accent,
-        label_html=label_html,
-        log_text=f"{title} | {value_text} | {secondary_value_text} | {detail}",
-        toast_key=toast_key,
-    )
-
-
 def _safe_color(value: str, fallback: str) -> str:
     if re.match(r"^#[0-9A-Fa-f]{6}$", value):
         return value
     return fallback
+
+
+def _blend_hex_color(
+    foreground: str,
+    background: str,
+    foreground_ratio: float,
+) -> str:
+    foreground_color = QColor(_safe_color(foreground, "#E8C47A"))
+    background_color = QColor(_safe_color(background, "#080A0D"))
+    ratio = max(0.0, min(1.0, float(foreground_ratio)))
+    red = round(
+        background_color.red() * (1.0 - ratio) + foreground_color.red() * ratio
+    )
+    green = round(
+        background_color.green() * (1.0 - ratio) + foreground_color.green() * ratio
+    )
+    blue = round(
+        background_color.blue() * (1.0 - ratio) + foreground_color.blue() * ratio
+    )
+    return QColor(red, green, blue).name().upper()
+
+
+def _recipe_material_text(notice: RecipeNotice | object) -> str:
+    material_text = str(getattr(notice, "material_text", "") or "").strip()
+    if material_text:
+        return material_text
+    fallback = str(getattr(notice, "requirement_text", "") or "").strip()
+    if fallback.startswith("需求："):
+        return fallback.removeprefix("需求：").strip()
+    return fallback or "数量未知"
 
 
 def _safe_accent(value: str, fallback: str) -> str:
@@ -5488,7 +6192,36 @@ def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
 
 
+def _interpolate_point(start: QPoint, end: QPoint, fraction: float) -> QPoint:
+    value = max(0.0, min(1.0, fraction))
+    return QPoint(
+        round(start.x() + (end.x() - start.x()) * value),
+        round(start.y() + (end.y() - start.y()) * value),
+    )
+
+
+PRICE_CAPTURE_COMPOSITOR_SETTLE_SECONDS = 0.034
+
+
+def _capture_window_rect(widget: QWidget | object) -> QRect:
+    """Return a top-level window rectangle in native capture pixels when possible."""
+    try:
+        import win32gui  # type: ignore
+
+        left, top, right, bottom = win32gui.GetWindowRect(int(widget.winId()))
+        if right > left and bottom > top:
+            return QRect(left, top, right - left, bottom - top)
+    except Exception:
+        pass
+    return widget.frameGeometry()
+
+
 class PriceOverlay(QWidget):
+    MAX_VISIBLE_TOASTS = 3
+    MOVE_DURATION_MS = 360
+    NEW_TOAST_FADE_DELAY_MS = 140
+    NEW_TOAST_FADE_MS = 360
+
     def __init__(self) -> None:
         super().__init__()
         self._toasts: list[PriceToast] = []
@@ -5499,22 +6232,68 @@ class PriceOverlay(QWidget):
                 if toast.toast_key == replace_key:
                     toast.update_view(view)
                     toast.show_for(seconds)
-                    self._position_toasts()
+                    self._animate_layout()
                     return
         toast = PriceToast(view)
         toast.closed_callback = lambda item=toast: self._forget_toast(item)
         self._toasts.insert(0, toast)
-        while len(self._toasts) > 3:
-            old_toast = self._toasts.pop()
-            old_toast.close()
-        self._position_toasts()
-        toast.show_for(seconds)
+        overflow: PriceToast | None = None
+        if len(self._toasts) > self.MAX_VISIBLE_TOASTS:
+            overflow = self._toasts.pop()
+
+        layout_toasts = list(self._toasts)
+        if overflow is not None:
+            layout_toasts.append(overflow)
+        targets = self._toast_targets(layout_toasts)
+        if targets:
+            for item, target in targets:
+                if item is toast:
+                    item.move(target)
+                elif item is overflow:
+                    item.fade_out(self.MOVE_DURATION_MS, move_target=target)
+                else:
+                    item.animate_to(target, self.MOVE_DURATION_MS)
+        toast.show_for(
+            seconds,
+            fade_in=True,
+            fade_delay_ms=self.NEW_TOAST_FADE_DELAY_MS,
+            fade_duration_ms=self.NEW_TOAST_FADE_MS,
+        )
 
     def clear_prices(self) -> None:
         toasts = list(self._toasts)
         self._toasts.clear()
         for toast in toasts:
             toast.close()
+
+    @contextmanager
+    def capture_guard(self, region: Region) -> Iterator[None]:
+        """Briefly remove only toast windows that would cover a screenshot."""
+        capture_rect = QRect(region.left, region.top, region.width, region.height)
+        hidden = [
+            toast
+            for toast in self._toasts
+            if toast.isVisible() and _capture_window_rect(toast).intersects(capture_rect)
+        ]
+        for toast in hidden:
+            toast.hide()
+        if hidden:
+            QApplication.processEvents()
+            # MSS captures native desktop pixels, while Qt geometry is expressed in
+            # device-independent coordinates on a scaled display.  GetWindowRect
+            # above keeps the intersection test in native pixels; this short pause
+            # then gives DWM enough time to present the hidden window before capture.
+            time.sleep(PRICE_CAPTURE_COMPOSITOR_SETTLE_SECONDS)
+            QApplication.processEvents()
+        try:
+            yield
+        finally:
+            for toast in hidden:
+                if toast in self._toasts and not toast._closing:
+                    toast.show()
+                    toast.raise_()
+            if hidden:
+                QApplication.processEvents()
 
     def hide(self) -> None:
         self.clear_prices()
@@ -5523,17 +6302,28 @@ class PriceOverlay(QWidget):
     def _forget_toast(self, toast: "PriceToast") -> None:
         if toast in self._toasts:
             self._toasts.remove(toast)
+            self._animate_layout()
 
-    def _position_toasts(self) -> None:
+    def _toast_targets(
+        self,
+        toasts: list["PriceToast"],
+    ) -> list[tuple["PriceToast", QPoint]]:
         screen = QApplication.primaryScreen()
         if screen is None:
-            return
+            return []
         rect = screen.availableGeometry()
         top = rect.top() + 80
-        for toast in self._toasts:
+        targets: list[tuple[PriceToast, QPoint]] = []
+        for toast in toasts:
             toast.adjustSize()
-            toast.move(rect.right() - toast.width() - 24, top)
+            target = QPoint(rect.right() - toast.width() - 24, top)
+            targets.append((toast, target))
             top += toast.height() + 10
+        return targets
+
+    def _animate_layout(self) -> None:
+        for toast, target in self._toast_targets(self._toasts):
+            toast.animate_to(target, self.MOVE_DURATION_MS)
 
 
 class PriceToast(QWidget):
@@ -5542,15 +6332,19 @@ class PriceToast(QWidget):
         self.toast_key = view.toast_key
         self.closed_callback: object | None = None
         self._closing = False
-        self._animation: QPropertyAnimation | None = None
+        self._opacity_animation: QPropertyAnimation | None = None
+        self._position_animation: QSequentialAnimationGroup | None = None
         self._timer_generation = 0
         self.setWindowTitle("塔科夫物品价格")
         self.setWindowFlags(
             Qt.WindowType.Tool
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._opacity = QGraphicsOpacityEffect(self)
         self._opacity.setOpacity(1.0)
         self.setGraphicsEffect(self._opacity)
@@ -5581,6 +6375,7 @@ class PriceToast(QWidget):
         content_layout.setSpacing(4)
 
         self._accent = accent
+        self._card = card
         self._title_label = QLabel()
         self._title_label.setWordWrap(True)
         self._value_label = QLabel()
@@ -5593,45 +6388,44 @@ class PriceToast(QWidget):
         recipe_layout = QVBoxLayout(self._recipe_box)
         recipe_layout.setContentsMargins(10, 8, 10, 9)
         recipe_layout.setSpacing(5)
-        self._recipe_title_label = QLabel("制作/兑换配方")
+        recipe_header = QHBoxLayout()
+        recipe_header.setContentsMargins(0, 0, 0, 0)
+        recipe_header.setSpacing(8)
+        self._recipe_title_label = QLabel("★ 关注用途物品")
+        self._recipe_count_label = QLabel("0")
+        self._recipe_count_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        recipe_header.addWidget(self._recipe_title_label)
+        recipe_header.addStretch(1)
+        recipe_header.addWidget(self._recipe_count_label)
         self._recipe_content_label = QLabel()
         self._recipe_content_label.setWordWrap(True)
         self._recipe_content_label.setTextFormat(Qt.TextFormat.RichText)
-        self._recipe_scroll = QScrollArea()
-        self._recipe_scroll.setWidgetResizable(True)
-        self._recipe_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._recipe_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        self._recipe_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._recipe_scroll.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-            "QScrollArea > QWidget > QWidget { background: transparent; }"
-        )
-        self._recipe_scroll.viewport().setAutoFillBackground(False)
-        self._recipe_scroll.setWidget(self._recipe_content_label)
-        recipe_layout.addWidget(self._recipe_title_label)
-        recipe_layout.addWidget(self._recipe_scroll)
+        recipe_layout.addLayout(recipe_header)
+        recipe_layout.addWidget(self._recipe_content_label)
 
         content_layout.addWidget(self._title_label)
         content_layout.addWidget(self._value_label)
         content_layout.addWidget(self._secondary_value_label)
-        content_layout.addWidget(self._detail_label)
         content_layout.addWidget(self._recipe_box)
+        content_layout.addWidget(self._detail_label)
         card_layout.addWidget(content, 1)
         outer.addWidget(card)
 
-        self.setStyleSheet(
-            "QWidget#priceToastCard {"
-            "background: rgba(18, 20, 24, 226);"
-            "border: 1px solid rgba(255, 255, 255, 38);"
-            "border-radius: 8px;"
-            "}"
-        )
         self.update_view(view)
 
     def update_view(self, view: PriceView) -> None:
         self.toast_key = view.toast_key or self.toast_key
+        border_color = _safe_color(
+            view.card_border_color,
+            "rgba(255, 255, 255, 38)",
+        )
+        self._card.setStyleSheet(
+            "QWidget#priceToastCard {"
+            "background: rgba(18, 20, 24, 226);"
+            f"border: 1px solid {border_color};"
+            "border-radius: 8px;"
+            "}"
+        )
         self._accent.setStyleSheet(
             f"background: {view.tier_accent};"
             "border-top-left-radius: 8px;"
@@ -5651,69 +6445,181 @@ class PriceToast(QWidget):
         self._detail_label.setStyleSheet("font-size: 12px; color: rgba(245, 242, 232, 0.68);")
         if view.recipe_notices:
             color = _safe_color(view.recipe_accent_color, "#E8C47A")
+            tint = QColor(color)
             self._recipe_box.setStyleSheet(
                 "QFrame#recipeNoticeBox {"
-                "background: rgba(8, 10, 13, 150);"
-                f"border: 1px solid {color};"
+                f"background: rgba({tint.red()}, {tint.green()}, {tint.blue()}, 48);"
+                "border: none;"
                 "border-radius: 6px;"
                 "}"
             )
             self._recipe_title_label.setStyleSheet(
                 f"font-size: 12px; font-weight: 800; color: {color};"
             )
+            self._recipe_count_label.setText(str(len(view.recipe_notices)))
+            self._recipe_count_label.setStyleSheet(
+                f"font-size: 11px; font-weight: 800; color: #FBFAF4; "
+                f"background: rgba({tint.red()}, {tint.green()}, {tint.blue()}, 110); "
+                "padding: 1px 6px; border-radius: 7px;"
+            )
+            visible_notices = view.recipe_notices[:MAX_VISIBLE_RECIPE_NOTICES]
             rows = "<div style='height:7px;'></div>".join(
                 f"<div>"
-                f"<span style='color:#929CAA;'>目标产物</span><br>"
-                f"<span style='font-size:14px; font-weight:800; color:{color};'>"
+                f"<span style='color:#929CAA;'>可用于</span> "
+                f"<span style='font-size:14px; font-weight:800; color:#FBFAF4;'>"
                 f"{html.escape(notice.product_text)}</span><br>"
-                f"<span style='color:#BFC3C8;'>{html.escape(notice.source_text)}</span> · "
-                f"<span style='font-weight:800; color:#FBFAF4;'>"
-                f"{html.escape(notice.requirement_text)}</span>"
+                f"<span style='color:#929CAA;'>需要</span> "
+                f"<span style='font-weight:800; color:{color};'>"
+                f"{html.escape(_recipe_material_text(notice))}</span> · "
+                f"<span style='color:#BFC3C8;'>{html.escape(notice.source_text)}</span>"
                 f"</div>"
-                for notice in view.recipe_notices
+                for notice in visible_notices
             )
+            remaining = len(view.recipe_notices) - len(visible_notices)
+            if remaining > 0:
+                rows += (
+                    "<div style='height:7px;'></div>"
+                    f"<div style='color:#BFC3C8;'>另有 {remaining} 个关注用途</div>"
+                )
             self._recipe_content_label.setText(rows)
             self._recipe_content_label.setStyleSheet(
                 "font-size: 12px; color: rgba(245, 242, 232, 0.90);"
             )
-            estimated_height = max(58, len(view.recipe_notices) * 62)
-            self._recipe_scroll.setFixedHeight(min(260, estimated_height))
             self._recipe_box.show()
         else:
+            self._recipe_count_label.clear()
             self._recipe_content_label.clear()
             self._recipe_box.hide()
         self.adjustSize()
 
-    def show_for(self, seconds: int) -> None:
+    def show_for(
+        self,
+        seconds: int,
+        *,
+        fade_in: bool = False,
+        fade_delay_ms: int = 0,
+        fade_duration_ms: int = 240,
+    ) -> None:
         self._closing = False
         self._timer_generation += 1
         generation = self._timer_generation
-        if self._animation is not None:
-            self._animation.stop()
-            self._opacity.setOpacity(1.0)
+        self._stop_opacity_animation()
+        self._opacity.setOpacity(0.0 if fade_in else 1.0)
         self.show()
         self.raise_()
+        if fade_in:
+            delay_ms = max(0, int(fade_delay_ms))
+            if delay_ms:
+                QTimer.singleShot(
+                    delay_ms,
+                    lambda: self._fade_in_if_current(generation, fade_duration_ms),
+                )
+            else:
+                self._fade_in_if_current(generation, fade_duration_ms)
         duration_ms = max(1, int(seconds)) * 1000
         QTimer.singleShot(duration_ms, lambda: self._fade_out_if_current(generation))
+
+    def _fade_in_if_current(self, generation: int, duration_ms: int) -> None:
+        if generation != self._timer_generation or self._closing:
+            return
+        self._animate_opacity(
+            1.0,
+            duration_ms,
+            QEasingCurve.Type.InOutCubic,
+        )
 
     def _fade_out_if_current(self, generation: int) -> None:
         if generation == self._timer_generation:
             self.fade_out()
 
-    def fade_out(self, duration_ms: int = 450) -> None:
+    def animate_to(self, target: QPoint, duration_ms: int = 360) -> None:
+        target = QPoint(target)
+        start = self.pos()
+        if start == target:
+            return
+        if self._position_animation is not None:
+            self._position_animation.stop()
+
+        duration = max(120, int(duration_ms))
+        accelerate_ms = max(1, round(duration * 0.25))
+        cruise_ms = max(1, round(duration * 0.50))
+        decelerate_ms = max(1, duration - accelerate_ms - cruise_ms)
+        accelerate_end = _interpolate_point(start, target, 1 / 6)
+        cruise_end = _interpolate_point(start, target, 5 / 6)
+
+        group = QSequentialAnimationGroup(self)
+        segments = (
+            (start, accelerate_end, accelerate_ms, QEasingCurve.Type.InQuad),
+            (accelerate_end, cruise_end, cruise_ms, QEasingCurve.Type.Linear),
+            (cruise_end, target, decelerate_ms, QEasingCurve.Type.OutQuad),
+        )
+        for segment_start, segment_end, segment_ms, easing in segments:
+            animation = QPropertyAnimation(self, b"pos", group)
+            animation.setDuration(segment_ms)
+            animation.setStartValue(segment_start)
+            animation.setEndValue(segment_end)
+            animation.setEasingCurve(easing)
+            group.addAnimation(animation)
+
+        self._position_animation = group
+
+        def clear_animation() -> None:
+            if self._position_animation is group:
+                self._position_animation = None
+
+        group.finished.connect(clear_animation)
+        group.start()
+
+    def fade_out(self, duration_ms: int = 450, move_target: QPoint | None = None) -> None:
         if self._closing:
             return
         self._closing = True
+        duration = max(80, duration_ms)
+        if move_target is not None:
+            self.animate_to(move_target, duration)
+        self._animate_opacity(
+            0.0,
+            duration,
+            QEasingCurve.Type.InCubic,
+            finished=self.close,
+        )
+
+    def _animate_opacity(
+        self,
+        target: float,
+        duration_ms: int,
+        easing: QEasingCurve.Type,
+        *,
+        finished: Callable[[], None] | None = None,
+    ) -> None:
+        self._stop_opacity_animation()
         animation = QPropertyAnimation(self._opacity, b"opacity", self)
-        self._animation = animation
-        animation.setDuration(max(80, duration_ms))
-        animation.setStartValue(1.0)
-        animation.setEndValue(0.0)
-        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        animation.finished.connect(self.close)
+        self._opacity_animation = animation
+        animation.setDuration(max(80, int(duration_ms)))
+        animation.setStartValue(self._opacity.opacity())
+        animation.setEndValue(max(0.0, min(1.0, target)))
+        animation.setEasingCurve(easing)
+
+        def finish_animation() -> None:
+            if self._opacity_animation is animation:
+                self._opacity_animation = None
+            if finished is not None:
+                finished()
+
+        animation.finished.connect(finish_animation)
         animation.start()
 
+    def _stop_opacity_animation(self) -> None:
+        if self._opacity_animation is not None:
+            self._opacity_animation.stop()
+            self._opacity_animation = None
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._timer_generation += 1
+        self._stop_opacity_animation()
+        if self._position_animation is not None:
+            self._position_animation.stop()
+            self._position_animation = None
         callback = self.closed_callback
         self.closed_callback = None
         if callable(callback):
@@ -5764,63 +6670,182 @@ class FeedbackOverlay(QWidget):
 
 
 class ReminderOverlay(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, toggle_hotkey: str = "F7") -> None:
         super().__init__()
-        self._toasts: list[ReminderToast] = []
+        self._reminders: dict[str, TraderReminder] = {}
+        self._countdown_labels: dict[str, QLabel] = {}
+        self._status_labels: dict[str, QLabel] = {}
         self._hidden = False
 
-    def show_reminder(self, view: ReminderView) -> None:
-        toast = ReminderToast(view)
-        toast.closed_callback = lambda item=toast: self._forget_toast(item)
-        self._toasts.insert(0, toast)
-        while len(self._toasts) > 5:
-            old_toast = self._toasts.pop()
-            old_toast.close()
-        self._position_toasts()
-        if self._hidden:
-            toast.hide()
-        else:
-            toast.show_persistent()
+        self.setWindowTitle("商人补货倒计时")
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self._card = QWidget()
+        self._card.setObjectName("reminderCountdownCard")
+        self._card.setMinimumWidth(440)
+        self._card.setMaximumWidth(560)
+        card_layout = QVBoxLayout(self._card)
+        card_layout.setContentsMargins(16, 13, 16, 13)
+        card_layout.setSpacing(9)
+
+        header = QHBoxLayout()
+        title = QLabel("商人补货倒计时")
+        title.setObjectName("reminderCountdownTitle")
+        self._count_label = QLabel("0 个")
+        self._count_label.setObjectName("reminderCountdownCount")
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self._count_label)
+        card_layout.addLayout(header)
+
+        self._rows_widget = QWidget()
+        self._rows_layout = QGridLayout(self._rows_widget)
+        self._rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._rows_layout.setHorizontalSpacing(14)
+        self._rows_layout.setVerticalSpacing(6)
+        self._rows_layout.setColumnStretch(1, 1)
+        card_layout.addWidget(self._rows_widget)
+
+        self._footer_label = QLabel()
+        self._footer_label.setObjectName("reminderCountdownFooter")
+        card_layout.addWidget(self._footer_label)
+        outer.addWidget(self._card)
+        self.set_toggle_hotkey(toggle_hotkey)
+
+        self.setStyleSheet(
+            "QWidget#reminderCountdownCard {"
+            "background: rgba(18, 20, 24, 238);"
+            "border: 1px solid rgba(242, 193, 78, 115);"
+            "border-radius: 10px;"
+            "}"
+            "QLabel#reminderCountdownTitle {"
+            "font-size: 18px; font-weight: 800; color: #FBFAF4;"
+            "}"
+            "QLabel#reminderCountdownCount {"
+            "font-size: 13px; font-weight: 700; color: #F2C14E;"
+            "}"
+            "QLabel#reminderCountdownTrader {"
+            "font-size: 14px; font-weight: 700; color: #FBFAF4;"
+            "}"
+            "QLabel#reminderCountdownStatus {"
+            "font-size: 12px; color: rgba(245, 242, 232, 0.68);"
+            "}"
+            "QLabel#reminderCountdownFooter {"
+            "font-size: 11px; color: rgba(245, 242, 232, 0.52);"
+            "}"
+        )
+
+    def set_toggle_hotkey(self, hotkey: str) -> None:
+        self._footer_label.setText(
+            f"{hotkey.strip() or 'F7'} 显示/隐藏 · 提醒触发后在此高亮"
+        )
+
+    def set_reminders(self, reminders: dict[str, TraderReminder]) -> None:
+        keys_changed = tuple(self._reminders) != tuple(reminders)
+        self._reminders = dict(reminders)
+        if keys_changed:
+            self._rebuild_rows()
+        self._update_rows()
+        if not self._reminders:
+            super().hide()
+            return
+        if self.isVisible() and not self._hidden:
+            self._position_on_screen()
+
+    def show_triggered(self, trader: str) -> None:
+        if trader not in self._reminders or self._hidden:
+            return
+        self._update_rows()
+        self._show_panel()
 
     def toggle_visibility(self) -> bool | None:
-        if not self._toasts:
+        if not self._reminders:
             return None
-        self._hidden = not self._hidden
-        if self._hidden:
-            for toast in list(self._toasts):
-                toast.hide()
-        else:
-            for toast in list(self._toasts):
-                toast.show_persistent()
-            self._position_toasts()
-        return not self._hidden
+        if self.isVisible() and not self._hidden:
+            self._hidden = True
+            super().hide()
+            return False
+        self._hidden = False
+        self._show_panel()
+        return True
 
     def clear_reminders(self) -> None:
         self._hidden = False
-        toasts = list(self._toasts)
-        self._toasts.clear()
-        for toast in toasts:
-            toast.close()
-
-    def hide(self) -> None:
-        self.clear_reminders()
+        self._reminders.clear()
+        self._rebuild_rows()
         super().hide()
 
-    def _forget_toast(self, toast: "ReminderToast") -> None:
-        if toast in self._toasts:
-            self._toasts.remove(toast)
+    def _rebuild_rows(self) -> None:
+        while self._rows_layout.count():
+            item = self._rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._countdown_labels.clear()
+        self._status_labels.clear()
 
-    def _position_toasts(self) -> None:
+        ordered = [trader for trader in TRADERS if trader in self._reminders]
+        ordered.extend(trader for trader in self._reminders if trader not in ordered)
+        for row, trader in enumerate(ordered):
+            name = QLabel(trader)
+            name.setObjectName("reminderCountdownTrader")
+            countdown = QLabel("00:00:00")
+            countdown.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            status = QLabel("")
+            status.setObjectName("reminderCountdownStatus")
+            status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._countdown_labels[trader] = countdown
+            self._status_labels[trader] = status
+            self._rows_layout.addWidget(name, row, 0)
+            self._rows_layout.addWidget(countdown, row, 1)
+            self._rows_layout.addWidget(status, row, 2)
+        self._count_label.setText(f"{len(ordered)} 个")
+
+    def _update_rows(self) -> None:
+        for trader, reminder in self._reminders.items():
+            countdown = self._countdown_labels.get(trader)
+            status = self._status_labels.get(trader)
+            if countdown is None or status is None:
+                continue
+            remaining = remaining_countdown_seconds(reminder)
+            countdown.setText(format_countdown(remaining))
+            if remaining <= 0:
+                state = "已补货"
+                color = "#36D27F"
+            elif reminder.triggered:
+                state = "即将补货"
+                color = "#F2C14E"
+            else:
+                state = f"补货 {reminder.restock_at:%H:%M:%S}"
+                color = "#5DA8FF"
+            countdown.setStyleSheet(
+                f"font-size: 20px; font-weight: 900; color: {color};"
+            )
+            status.setText(state)
+
+    def _show_panel(self) -> None:
+        self._position_on_screen()
+        self.show()
+        self.raise_()
+
+    def _position_on_screen(self) -> None:
         screen = QApplication.primaryScreen()
         if screen is None:
             return
         rect = screen.availableGeometry()
-        left = rect.left() + 32
-        top = rect.top() + 220
-        for toast in self._toasts:
-            toast.adjustSize()
-            toast.move(left, top)
-            top += toast.height() + 12
+        self.adjustSize()
+        self.move(rect.left() + 32, rect.top() + 220)
 
 
 class ReminderToast(QWidget):

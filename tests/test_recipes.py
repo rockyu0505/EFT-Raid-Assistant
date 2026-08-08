@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QHeaderView
 
 from app.config import DEFAULT_CONFIG
@@ -107,12 +108,21 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertEqual(catalog.record_count("regular"), 1)
         self.assertEqual(catalog.tracked_requirement_lines("powder", [], "regular"), [])
         lines = catalog.tracked_requirement_lines("powder", ["craft-1"], "regular")
+        notices = catalog.tracked_requirement_notices(
+            "powder",
+            ["craft-1"],
+            "regular",
+        )
 
         self.assertEqual(len(lines), 1)
         self.assertIn("测试弹药 ×60", lines[0])
         self.assertIn("需求：2 个", lines[0])
         self.assertIn("物品等级≥15", lines[0])
         self.assertIn("需可用状态", lines[0])
+        self.assertEqual(
+            notices[0].material_text,
+            "火药 ×2 · 工具 · 物品等级≥15 · 需可用状态",
+        )
 
     def test_search_text_contains_product_source_and_requirement(self) -> None:
         record = RecipeCatalog(self.path).records("regular")[0]
@@ -177,6 +187,7 @@ class RecipeCatalogTests(unittest.TestCase):
                     product_text="测试弹药 ×60",
                     source_text="工作台 Lv2 制作",
                     requirement_text="需求：2 个",
+                    material_text="火药 ×2",
                 )
             ],
             recipe_accent_color="#33AA77",
@@ -185,16 +196,119 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertEqual(len(view.recipe_notices), 1)
         self.assertIn("测试弹药", view.label_html)
         self.assertIn("#33AA77", view.label_html)
-        self.assertIn("制作/兑换配方", view.log_text)
-        self.assertIn("需求：2 个", view.label_html)
+        self.assertIn("关注用途", view.log_text)
+        self.assertIn("火药 ×2", view.label_html)
 
         toast = PriceToast(view)
         self.assertFalse(toast._recipe_box.isHidden())
         self.assertIn("测试弹药", toast._recipe_content_label.text())
-        self.assertEqual(toast._recipe_title_label.text(), "制作/兑换配方")
-        self.assertIn("需求：2 个", toast._recipe_content_label.text())
-        self.assertIn("#33AA77", toast._recipe_box.styleSheet())
+        self.assertEqual(toast._recipe_title_label.text(), "★ 关注用途物品")
+        self.assertEqual(toast._recipe_count_label.text(), "1")
+        self.assertIn("火药 ×2", toast._recipe_content_label.text())
+        self.assertIn("background: rgba(51, 170, 119, 48)", toast._recipe_box.styleSheet())
+        self.assertIn("border: none", toast._recipe_box.styleSheet())
+        self.assertIn("#33AA77", toast._recipe_title_label.styleSheet())
+        content_layout = toast._recipe_box.parentWidget().layout()
+        self.assertLess(
+            content_layout.indexOf(toast._recipe_box),
+            content_layout.indexOf(toast._detail_label),
+        )
+        self.assertFalse(hasattr(toast, "_recipe_scroll"))
         toast.close()
+
+    def test_price_card_caps_recipe_rows_without_an_unusable_scroll_area(self) -> None:
+        price = SimpleNamespace(
+            game_mode="regular",
+            name="Gunpowder",
+            short_name="Powder",
+            confidence=1.0,
+            best_vendor_name="Therapist",
+            best_vendor_currency="RUB",
+            best_vendor_price=10_000,
+            avg_24h_price=12_000,
+            last_low_price=11_000,
+            slots=1,
+            is_firearm=False,
+        )
+        notices = [
+            RecipeNotice(
+                recipe_id=f"craft-{index}",
+                product_text=f"目标产物 {index}",
+                source_text="工作台 Lv2 制作",
+                requirement_text=f"需求：{index + 1} 个",
+                material_text=f"火药 ×{index + 1}",
+            )
+            for index in range(5)
+        ]
+
+        toast = PriceToast(
+            _build_price_view(
+                price,
+                "en",
+                [],
+                "slot",
+                recipe_notices=notices,
+            )
+        )
+        content = toast._recipe_content_label.text()
+
+        self.assertEqual(toast._recipe_count_label.text(), "5")
+        self.assertIn("目标产物 0", content)
+        self.assertIn("目标产物 2", content)
+        self.assertNotIn("目标产物 3", content)
+        self.assertNotIn("目标产物 4", content)
+        self.assertIn("另有 2 个关注用途", content)
+        self.assertFalse(hasattr(toast, "_recipe_scroll"))
+        toast.close()
+
+    def test_app_themes_do_not_recolor_the_in_raid_price_or_recipe_card(self) -> None:
+        price = SimpleNamespace(
+            game_mode="regular",
+            name="Gunpowder",
+            short_name="Powder",
+            confidence=1.0,
+            best_vendor_name="Therapist",
+            best_vendor_currency="RUB",
+            best_vendor_price=10_000,
+            avg_24h_price=12_000,
+            last_low_price=11_000,
+            slots=1,
+            is_firearm=False,
+        )
+        view = _build_price_view(
+            price,
+            "en",
+            [],
+            "slot",
+            recipe_notices=[
+                RecipeNotice(
+                    recipe_id="craft-1",
+                    product_text="测试弹药 ×60",
+                    source_text="工作台 Lv2 制作",
+                    requirement_text="需求：2 个",
+                    material_text="火药 ×2",
+                )
+            ],
+        )
+        styles: set[tuple[str, str, str, str]] = set()
+
+        try:
+            for theme in ("light", "dark", "night_blue", "sakura_pink"):
+                apply_app_theme(self.app, 11, theme)
+                toast = PriceToast(view)
+                styles.add(
+                    (
+                        toast._card.styleSheet(),
+                        toast._value_label.styleSheet(),
+                        toast._recipe_box.styleSheet(),
+                        toast._recipe_title_label.styleSheet(),
+                    )
+                )
+                toast.close()
+        finally:
+            apply_app_theme(self.app, 11, "light")
+
+        self.assertEqual(len(styles), 1)
 
     def test_main_window_builds_bundled_recipe_tree(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)
@@ -302,6 +416,48 @@ class RecipeCatalogTests(unittest.TestCase):
         self.assertEqual(config["tracked_recipe_ids"], [])
         window.hide()
         window.deleteLater()
+
+    def test_tracking_recipe_preserves_result_expansion_selection_and_scroll(self) -> None:
+        config = deepcopy(DEFAULT_CONFIG)
+        config["enabled_features"] = ["recipe_tracking"]
+        config["feature_setup_complete"] = True
+        config["tracked_recipe_ids"] = []
+        with patch("app.gui.load_config", return_value=config):
+            window = _RecipeSmokeWindow()
+
+        try:
+            window.show()
+            self.app.processEvents()
+            tree = window.recipe_result_tree
+            product_item = next(
+                tree.topLevelItem(index)
+                for index in range(tree.topLevelItemCount())
+                if tree.topLevelItem(index).childCount() > 0
+            )
+            product_index = tree.indexOfTopLevelItem(product_item)
+            recipe_item = product_item.child(0)
+            recipe_id = str(recipe_item.data(0, Qt.ItemDataRole.UserRole) or "")
+            product_item.setExpanded(True)
+            recipe_item.setExpanded(True)
+            tree.setCurrentItem(recipe_item)
+            scroll_bar = tree.verticalScrollBar()
+            scroll_bar.setValue(min(25, scroll_bar.maximum()))
+            scroll_value = scroll_bar.value()
+            self.assertGreater(scroll_value, 0)
+
+            recipe_item.setCheckState(0, Qt.CheckState.Checked)
+            self.app.processEvents()
+
+            self.assertIs(tree.topLevelItem(product_index), product_item)
+            self.assertTrue(product_item.isExpanded())
+            self.assertTrue(recipe_item.isExpanded())
+            self.assertIs(tree.currentItem(), recipe_item)
+            self.assertEqual(scroll_bar.value(), scroll_value)
+            self.assertIn(recipe_id, config["tracked_recipe_ids"])
+            self.assertIn("已关注总览 (1)", window.recipe_tabs.tabText(1))
+        finally:
+            window.hide()
+            window.deleteLater()
 
     def test_bundled_snapshot_uses_game_handbook_paths(self) -> None:
         catalog = RecipeCatalog()

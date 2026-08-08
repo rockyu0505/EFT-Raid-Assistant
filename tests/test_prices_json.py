@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import app.prices as prices
@@ -84,6 +86,35 @@ class JsonPriceClientTests(unittest.TestCase):
         self.assertIs(self.client._items_by_mode["pve"], loaded_items)
         load_disk_cache.assert_not_called()
 
+    def test_smart_history_is_fetched_once_within_the_short_cache_window(self) -> None:
+        now = time.time()
+        history = [
+            {
+                "timestamp": now - (7 - index) * 3600,
+                "priceMin": 100_000,
+                "price": 102_000,
+                "offerCount": 20,
+            }
+            for index in range(8)
+        ]
+        item = SimpleNamespace(
+            item_id=ITEM_ID,
+            game_mode="regular",
+            last_low_price=101_000,
+            last_offer_count=20,
+        )
+
+        with patch.object(
+            self.client,
+            "_fetch_historical_prices_json",
+            return_value=history,
+        ) as fetch_history:
+            first = self.client.smart_listing_estimate(item)
+            second = self.client.smart_listing_estimate(item)
+
+        self.assertEqual(first.suggested_price, second.suggested_price)
+        fetch_history.assert_called_once_with(ITEM_ID, "regular", 2)
+
     def test_set_game_mode_loads_from_disk_only_when_memory_is_empty(self) -> None:
         self.client._items_by_mode["pve"] = []
 
@@ -92,6 +123,69 @@ class JsonPriceClientTests(unittest.TestCase):
 
         self.assertEqual(selected, "pve")
         load_disk_cache.assert_called_once_with("pve")
+
+    def test_ambiguous_short_name_does_not_pick_an_arbitrary_item(self) -> None:
+        self.client._items_by_mode["regular"] = [
+            {
+                "id": "ammo-a",
+                "name": "5.45x39mm BP gs",
+                "shortName": "BP",
+                "zhName": "5.45x39毫米 BP gs子弹",
+                "zhShortName": "BP",
+            },
+            {
+                "id": "ammo-b",
+                "name": "7.62x39mm BP gzh",
+                "shortName": "BP",
+                "zhName": "7.62x39毫米 BP gzh子弹",
+                "zhShortName": "BP",
+            },
+        ]
+        self.client._build_search_index("regular")
+
+        with self.assertRaises(PriceLookupError):
+            self.client.lookup("BP", "regular")
+
+    def test_ammo_box_resolves_the_ballistics_of_its_contained_round(self) -> None:
+        ammo_id = "ammo-round"
+        box_id = "ammo-box"
+        properties = {
+            "propertiesType": "ItemPropertiesAmmo",
+            "damage": 54,
+            "penetrationPower": 31,
+            "armorDamage": 37,
+            "initialSpeed": 922,
+            "projectileCount": 1,
+        }
+        self.client._items_by_mode["regular"] = [
+            {
+                "id": ammo_id,
+                "name": "5.56x45mm M855",
+                "shortName": "M855",
+                "zhName": "5.56x45毫米 M855",
+                "types": ["ammo"],
+                "properties": properties,
+            },
+            {
+                "id": box_id,
+                "name": "5.56x45mm M855 ammo pack (50 pcs)",
+                "shortName": "M855 pack",
+                "zhName": "5.56x45mm M855弹药包（50发装）",
+                "types": ["ammoBox"],
+                "containsItems": [{"item": ammo_id, "count": 50}],
+            },
+        ]
+        self.client._build_search_index("regular")
+
+        result = self.client.lookup(
+            "5.56x45mm M855 ammo pack (50 pcs)",
+            "regular",
+        )
+
+        self.assertEqual(result.ammo_properties, properties)
+        self.assertEqual(result.ammo_pack_count, 50)
+        self.assertEqual(result.ammo_name, "5.56x45mm M855")
+        self.assertEqual(result.ammo_zh_name, "5.56x45毫米 M855")
 
     def test_json_refresh_is_default_and_merges_translations(self) -> None:
         documents = {

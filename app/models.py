@@ -78,6 +78,10 @@ class ItemPrice:
     best_vendor_currency: str | None
     wiki_link: str | None
     updated: str | None
+    ammo_properties: dict[str, object] | None = None
+    ammo_pack_count: int | None = None
+    ammo_name: str = ""
+    ammo_zh_name: str = ""
 
 
 @dataclass(frozen=True)

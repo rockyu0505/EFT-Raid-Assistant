@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
@@ -39,6 +40,9 @@ UI_NOISE = {
 }
 
 INVENTORY_TAB_DEBUG_PATH = APP_DIR / "debug" / "last_inventory_tab.png"
+TOOLTIP_BORDER_INSET = 2
+TOOLTIP_REFERENCE_HEIGHT = 2160
+TOOLTIP_DOUBLE_LINE_MIN_BORDER_HEIGHT = 96
 
 
 def refine_tooltip_name_crop(
@@ -48,6 +52,12 @@ def refine_tooltip_name_crop(
     cursor_anchor: tuple[int, int] | None = None,
     cursor_bottom_gap: int = 20,
     cursor_gap_tolerance: int = 36,
+    cursor_left_gap: int | None = None,
+    cursor_horizontal_tolerance: int = 12,
+    max_box_width: int | None = None,
+    client_right_edge_x: int | None = None,
+    client_top_edge_y: int | None = None,
+    client_edge_tolerance: int = 12,
 ) -> tuple[bool, list[str]]:
     """Find the tooltip bounds inside the hover search crop and save a tighter name crop."""
     image = Image.open(search_path).convert("RGB")
@@ -57,6 +67,12 @@ def refine_tooltip_name_crop(
         cursor_anchor=cursor_anchor,
         cursor_bottom_gap=cursor_bottom_gap,
         cursor_gap_tolerance=cursor_gap_tolerance,
+        cursor_left_gap=cursor_left_gap,
+        cursor_horizontal_tolerance=cursor_horizontal_tolerance,
+        max_box_width=max_box_width,
+        client_right_edge_x=client_right_edge_x,
+        client_top_edge_y=client_top_edge_y,
+        client_edge_tolerance=client_edge_tolerance,
     )
     refined_image.save(output_path)
     return refined, details
@@ -68,6 +84,12 @@ def refine_tooltip_name_image(
     cursor_anchor: tuple[int, int] | None = None,
     cursor_bottom_gap: int = 20,
     cursor_gap_tolerance: int = 36,
+    cursor_left_gap: int | None = None,
+    cursor_horizontal_tolerance: int = 12,
+    max_box_width: int | None = None,
+    client_right_edge_x: int | None = None,
+    client_top_edge_y: int | None = None,
+    client_edge_tolerance: int = 12,
 ) -> tuple[Image.Image, bool, list[str]]:
     """Find the tooltip bounds and return the name crop without filesystem round-trips."""
     del padding  # Border detection already returns the exact content bounds used by the legacy path.
@@ -77,14 +99,39 @@ def refine_tooltip_name_image(
         cursor_anchor=cursor_anchor,
         cursor_bottom_gap=cursor_bottom_gap,
         cursor_gap_tolerance=cursor_gap_tolerance,
+        cursor_left_gap=cursor_left_gap,
+        cursor_horizontal_tolerance=cursor_horizontal_tolerance,
+        max_box_width=max_box_width,
+        client_right_edge_x=client_right_edge_x,
+        client_top_edge_y=client_top_edge_y,
+        client_edge_tolerance=client_edge_tolerance,
     )
     if border_box is not None:
-        crop_box = _inset_box(border_box, 2, image.size)
+        crop_box = _inset_box(border_box, TOOLTIP_BORDER_INSET, image.size)
         refined_image = image.crop(crop_box)
         x0, y0, x1, y1 = border_box
         details = [f"border:{x1 - x0}x{y1 - y0}"]
         if cursor_anchor is not None:
-            details.append(f"cursor-gap:{cursor_anchor[1] - y1}/{cursor_bottom_gap}")
+            vertical_anchor = _cursor_vertical_anchor(
+                y0,
+                y1,
+                cursor_anchor[1],
+                cursor_bottom_gap,
+                cursor_gap_tolerance,
+            )
+            if vertical_anchor is not None:
+                _, gap = vertical_anchor
+                details.append(f"cursor-gap:{gap}/{cursor_bottom_gap}")
+            if cursor_left_gap is not None:
+                expected_left = cursor_anchor[0] + cursor_left_gap
+                if abs(x0 - expected_left) <= max(1, cursor_horizontal_tolerance):
+                    details.append(f"cursor-left:{x0 - cursor_anchor[0]}/{cursor_left_gap}")
+            if client_right_edge_x is not None:
+                if abs(x1 - client_right_edge_x) <= max(1, client_edge_tolerance):
+                    details.append(f"client-right:{x1}/{client_right_edge_x}")
+            if client_top_edge_y is not None:
+                if abs(y0 - client_top_edge_y) <= max(1, client_edge_tolerance):
+                    details.append(f"client-top:{y0}/{client_top_edge_y}")
         return refined_image, True, details
 
     return image, False, []
@@ -95,6 +142,12 @@ def _find_tooltip_border_box(
     cursor_anchor: tuple[int, int] | None = None,
     cursor_bottom_gap: int = 20,
     cursor_gap_tolerance: int = 36,
+    cursor_left_gap: int | None = None,
+    cursor_horizontal_tolerance: int = 12,
+    max_box_width: int | None = None,
+    client_right_edge_x: int | None = None,
+    client_top_edge_y: int | None = None,
+    client_edge_tolerance: int = 12,
 ) -> tuple[int, int, int, int] | None:
     gray = ImageOps.grayscale(image)
     mask = _tooltip_border_mask(gray)
@@ -105,23 +158,72 @@ def _find_tooltip_border_box(
     candidates: list[tuple[float, tuple[int, int, int, int]]] = []
     width, height = image.size
     gray_pixels = np.asarray(gray, dtype=np.uint8)
-    min_box_height = max(20, round(height * 0.08))
+    horizontally_anchored = cursor_anchor is not None and (
+        cursor_left_gap is not None or client_right_edge_x is not None
+    )
+    # Cursor anchoring already provides the strong geometric guard. Keeping the
+    # old search-crop-relative minimum here rejected valid 720p/900p tooltips,
+    # whose border height scales down while the 420px search crop does not.
+    min_box_height = 18 if horizontally_anchored else max(20, round(height * 0.08))
+    max_box_height = max(76, round(height * 0.45))
     for index, (top_y, top_x0, top_x1) in enumerate(runs):
         for bottom_y, bottom_x0, bottom_x1 in runs[index + 1 :]:
             box_height = bottom_y - top_y
-            if box_height > 76:
+            if box_height > max_box_height:
                 break
             if box_height < min_box_height:
                 continue
 
-            overlap = min(top_x1, bottom_x1) - max(top_x0, bottom_x0)
-            x0 = max(0, min(top_x0, bottom_x0) - 2)
-            x1 = min(width, max(top_x1, bottom_x1) + 2)
+            overlap_x0 = max(top_x0, bottom_x0)
+            overlap_x1 = min(top_x1, bottom_x1)
+            overlap = overlap_x1 - overlap_x0
+            if horizontally_anchored:
+                # A tooltip edge can merge into a much longer inventory/window
+                # separator. The shared span preserves the cursor-anchored box;
+                # taking the union would turn that separator into a false wide box.
+                x0 = max(0, overlap_x0 - 2)
+                x1 = min(width, overlap_x1 + 2)
+            else:
+                x0 = max(0, min(top_x0, bottom_x0) - 2)
+                x1 = min(width, max(top_x1, bottom_x1) + 2)
             box_width = x1 - x0
-            if box_width < 38 or box_width > min(850, width):
+            width_limit = min(850, width)
+            if max_box_width is not None:
+                width_limit = min(width_limit, max(38, max_box_width))
+            if box_width < 38 or box_width > width_limit:
                 continue
             if overlap < min(32, box_width * 0.35):
                 continue
+
+            horizontal_anchor_score = 0.0
+            left_matches = False
+            edge_matches = False
+            if cursor_anchor is not None and (
+                cursor_left_gap is not None or client_right_edge_x is not None
+            ):
+                if cursor_left_gap is not None:
+                    expected_left = cursor_anchor[0] + cursor_left_gap
+                    left_error = abs(x0 - expected_left)
+                    left_tolerance = max(1, cursor_horizontal_tolerance)
+                    if left_error <= left_tolerance:
+                        left_matches = True
+                        horizontal_anchor_score = max(
+                            horizontal_anchor_score,
+                            160.0 * (1.0 - left_error / left_tolerance),
+                        )
+
+                if client_right_edge_x is not None:
+                    edge_error = abs(x1 - client_right_edge_x)
+                    edge_tolerance = max(1, client_edge_tolerance)
+                    if edge_error <= edge_tolerance:
+                        edge_matches = True
+                        horizontal_anchor_score = max(
+                            horizontal_anchor_score,
+                            160.0 * (1.0 - edge_error / edge_tolerance),
+                        )
+
+                if not left_matches and not edge_matches:
+                    continue
 
             top_score = _horizontal_line_score(mask, top_y, x0, x1)
             bottom_score = _horizontal_line_score(mask, bottom_y, x0, x1)
@@ -134,18 +236,59 @@ def _find_tooltip_border_box(
                 _vertical_line_score(mask, max(top_x1, bottom_x1) - 1, top_y, bottom_y),
             )
             dark_ratio = _dark_interior_ratio(gray_pixels, (x0, top_y, x1, bottom_y))
-            bright_ratio = _bright_interior_ratio(gray_pixels, (x0, top_y, x1, bottom_y))
+            bright_ratio, bright_area = _bright_interior_statistics(
+                gray_pixels,
+                (x0, top_y, x1, bottom_y),
+            )
             if top_score + bottom_score < 0.8:
                 continue
             if left_score + right_score < 0.08:
                 continue
             if dark_ratio < 0.70:
                 continue
-            if bright_ratio < 0.055:
-                continue
+
+            vertical_anchor: tuple[str, int] | None = None
+            top_edge_matches = False
             if cursor_anchor is not None:
-                gap = cursor_anchor[1] - bottom_y
-                if gap < -6 or gap > cursor_bottom_gap + cursor_gap_tolerance:
+                vertical_anchor = _cursor_vertical_anchor(
+                    top_y,
+                    bottom_y,
+                    cursor_anchor[1],
+                    cursor_bottom_gap,
+                    cursor_gap_tolerance,
+                )
+                if client_top_edge_y is not None:
+                    top_edge_error = abs(top_y - client_top_edge_y)
+                    top_edge_matches = (
+                        top_edge_error <= max(1, client_edge_tolerance)
+                        and cursor_anchor[1]
+                        <= box_height + cursor_bottom_gap + cursor_gap_tolerance
+                    )
+                if vertical_anchor is None and not top_edge_matches:
+                    continue
+
+            strict_anchor_match = (
+                (left_matches or edge_matches)
+                and (vertical_anchor is not None or top_edge_matches)
+                and top_score + bottom_score >= 1.35
+                and left_score + right_score >= 0.16
+                and dark_ratio >= 0.78
+            )
+            bright_pixels = round(bright_ratio * bright_area)
+            if strict_anchor_match:
+                # Once the full border and both cursor axes agree, this stage
+                # only rejects a visually empty box. OCR and the local item
+                # matcher decide whether the contained text is a valid item;
+                # name length must not be inferred from pixel density here.
+                if bright_pixels < 8:
+                    continue
+            else:
+                # Tarkov 1.1 widened the tooltip while keeping roughly the same
+                # amount of name text. Keep the legacy density requirement for
+                # small/unanchored boxes, but accept a cursor-anchored large box
+                # when it still contains a meaningful absolute amount of text.
+                minimum_bright_ratio = max(0.015, min(0.055, 240 / max(1, bright_area)))
+                if bright_ratio < minimum_bright_ratio:
                     continue
 
             score = (
@@ -153,14 +296,20 @@ def _find_tooltip_border_box(
                 + (left_score + right_score) * 90
                 + dark_ratio * 70
                 + bright_ratio * 160
-                + box_width * 0.05
                 + box_height * 0.25
+                + horizontal_anchor_score
             )
-            if cursor_anchor is not None:
-                gap = cursor_anchor[1] - bottom_y
+            if cursor_anchor is None or (
+                cursor_left_gap is None and client_right_edge_x is None
+            ):
+                score += box_width * 0.05
+            if vertical_anchor is not None:
+                _, gap = vertical_anchor
                 gap_error = abs(gap - cursor_bottom_gap)
                 gap_score = max(0.0, 1.0 - gap_error / max(1, cursor_gap_tolerance))
                 score += gap_score * 130
+            elif top_edge_matches:
+                score += 130
             candidates.append((score, (x0, top_y, x1, bottom_y)))
 
     if not candidates:
@@ -168,6 +317,21 @@ def _find_tooltip_border_box(
     if cursor_anchor is not None:
         candidates = _penalize_parent_tooltip_boxes(candidates)
     return max(candidates, key=lambda value: value[0])[1]
+
+
+def _cursor_vertical_anchor(
+    top_y: int,
+    bottom_y: int,
+    cursor_y: int,
+    expected_gap: int,
+    tolerance: int,
+) -> tuple[str, int] | None:
+    """Describe whether a tooltip is immediately above the cursor."""
+    maximum_gap = expected_gap + tolerance
+    gap = cursor_y - bottom_y
+    if not -6 <= gap <= maximum_gap:
+        return None
+    return "above", gap
 
 
 def _penalize_parent_tooltip_boxes(
@@ -263,15 +427,15 @@ def _dark_interior_ratio(
     return float(np.count_nonzero(values < 65)) / values.size
 
 
-def _bright_interior_ratio(
+def _bright_interior_statistics(
     pixels: np.ndarray,
     box: tuple[int, int, int, int],
-) -> float:
+) -> tuple[float, int]:
     x0, y0, x1, y1 = box
     values = pixels[y0 + 3 : y1 - 2, x0 + 3 : x1 - 3]
     if values.size == 0:
-        return 0.0
-    return float(np.count_nonzero(values > 115)) / values.size
+        return 0.0, 0
+    return float(np.count_nonzero(values > 115)) / values.size, int(values.size)
 
 
 def _inset_box(
@@ -286,81 +450,54 @@ def _inset_box(
 def run_item_name_ocr(
     crop_path: Path,
     model_version: str = "v5",
+    line_count_hint: int | None = None,
 ) -> ParsedItemName:
     """OCR a UI crop and return likely item-name candidates."""
-    return _run_rapidocr_item_name(crop_path, model_version)
+    return _run_rapidocr_item_name(crop_path, model_version, line_count_hint)
 
 
 def run_item_name_ocr_image(
     image: Image.Image,
     model_version: str = "v5",
+    line_count_hint: int | None = None,
 ) -> ParsedItemName:
     """OCR an in-memory UI crop and return likely item-name candidates."""
-    return _run_rapidocr_item_name_image(image.convert("RGB"), model_version)
+    return _run_rapidocr_item_name_image(
+        image.convert("RGB"),
+        model_version,
+        line_count_hint,
+    )
 
 
-def _run_rapidocr_item_name(crop_path: Path, model_version: str = "v5") -> ParsedItemName:
+def _run_rapidocr_item_name(
+    crop_path: Path,
+    model_version: str = "v5",
+    line_count_hint: int | None = None,
+) -> ParsedItemName:
     image = Image.open(crop_path).convert("RGB")
-    return _run_rapidocr_item_name_image(image, model_version)
+    return _run_rapidocr_item_name_image(image, model_version, line_count_hint)
 
 
 def _run_rapidocr_item_name_image(
     image: Image.Image,
     model_version: str = "v5",
+    line_count_hint: int | None = None,
 ) -> ParsedItemName:
-    line_images = _split_text_line_images(image)
-    variants = _build_item_variants(image)
-    line_variants = [
-        (f"lines:{index + 1}", line_image)
-        for index, line_image in enumerate(line_images)
-        if line_image.width > 0 and line_image.height > 0
-    ]
-    variant_images = [(variant.name, variant.image) for variant in variants]
-    if len(line_variants) > 1:
-        variant_images.insert(0, ("line-split", line_variants))
     best = ParsedItemName(raw_text="", candidates=[], variant_name="rapidocr-none")
     best_score = 0
     raw_parts: list[str] = []
-
-    for variant_name, variant_payload in variant_images:
-        started = time.perf_counter()
-        if isinstance(variant_payload, list):
-            texts: list[str] = []
-            scores: list[float] = []
-            for _, line_image in variant_payload:
-                rapid = run_rapid_text(
-                    line_image,
-                    model_version=model_version,
-                    use_det=False,
-                    use_cls=False,
-                    use_rec=True,
-                )
-                texts.extend(rapid.lines)
-                scores.extend(rapid.scores)
-        else:
-            rapid = run_rapid_text(
-                variant_payload,
-                model_version=model_version,
-                use_det=False,
-                use_cls=False,
-                use_rec=True,
-            )
-            texts = rapid.lines
-            scores = rapid.scores
-        elapsed_ms = round((time.perf_counter() - started) * 1000)
-        text = "\n".join(texts)
-        raw_parts.append(f"{variant_name}:{elapsed_ms}ms:{text}")
-        candidates = parse_item_name_candidates(text)
-        score = _score_candidates(candidates)
-        if scores:
-            score += round(max(scores) * 10)
+    for attempt, recognition_score in _iter_item_name_ocr_attempts_with_score(
+        image,
+        model_version,
+        line_count_hint,
+    ):
+        raw_parts.append(f"{attempt.variant_name}:{attempt.raw_text}")
+        score = _score_candidates(attempt.candidates) + recognition_score
+        if line_count_hint == 2 and "line-split" in attempt.variant_name and attempt.candidates:
+            score += 60
         if score > best_score:
             best_score = score
-            best = ParsedItemName(
-                raw_text=text,
-                candidates=candidates,
-                variant_name=f"rapidocr:{variant_name}:{elapsed_ms}ms",
-            )
+            best = attempt
 
     if best.candidates:
         return best
@@ -369,6 +506,95 @@ def _run_rapidocr_item_name_image(
         candidates=[],
         variant_name="rapidocr:none",
     )
+
+
+def iter_item_name_ocr_image_attempts(
+    image: Image.Image,
+    model_version: str = "v5",
+    line_count_hint: int | None = None,
+) -> Iterator[ParsedItemName]:
+    """Yield progressively more expensive OCR attempts in preferred order."""
+    for attempt, _ in _iter_item_name_ocr_attempts_with_score(
+        image.convert("RGB"),
+        model_version,
+        line_count_hint,
+    ):
+        yield attempt
+
+
+def _iter_item_name_ocr_attempts_with_score(
+    image: Image.Image,
+    model_version: str,
+    line_count_hint: int | None,
+) -> Iterator[tuple[ParsedItemName, int]]:
+    if line_count_hint == 1:
+        line_images = [image]
+    else:
+        line_images = _split_text_line_images(image)
+        if line_count_hint == 2 and len(line_images) < 2:
+            line_images = _force_split_double_line_image(image)
+    variants = _build_item_variants(image)
+    line_variants = [
+        (f"lines:{index + 1}", _build_item_variants(line_image)[0].image)
+        for index, line_image in enumerate(line_images)
+        if line_image.width > 0 and line_image.height > 0
+    ]
+    variant_images = [(variant.name, variant.image) for variant in variants]
+    if len(line_variants) > 1:
+        variant_images.insert(0, ("line-split", line_variants))
+
+    for variant_name, variant_payload in variant_images:
+        started = time.perf_counter()
+        try:
+            if isinstance(variant_payload, list):
+                texts: list[str] = []
+                scores: list[float] = []
+                for _, line_image in variant_payload:
+                    rapid = run_rapid_text(
+                        line_image,
+                        model_version=model_version,
+                        use_det=False,
+                        use_cls=False,
+                        use_rec=True,
+                    )
+                    texts.extend(rapid.lines)
+                    scores.extend(rapid.scores)
+            else:
+                rapid = run_rapid_text(
+                    variant_payload,
+                    model_version=model_version,
+                    use_det=False,
+                    use_cls=False,
+                    use_rec=True,
+                )
+                texts = rapid.lines
+                scores = rapid.scores
+        except RapidOcrUnavailableError as exc:
+            raise OcrUnavailableError(str(exc)) from exc
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        text = "\n".join(texts)
+        candidates = parse_item_name_candidates(text)
+        yield (
+            ParsedItemName(
+                raw_text=text,
+                candidates=candidates,
+                variant_name=f"rapidocr:{variant_name}:{elapsed_ms}ms",
+            ),
+            round(max(scores) * 10) if scores else 0,
+        )
+
+
+def tooltip_line_count_hint(
+    crop_height: int,
+    capture_height: int,
+    reference_height: int = TOOLTIP_REFERENCE_HEIGHT,
+) -> int:
+    """Infer Tarkov 1.1's fixed one/two-line tooltip layout from border height."""
+    if crop_height <= 0 or capture_height <= 0 or reference_height <= 0:
+        return 1
+    border_height = crop_height + TOOLTIP_BORDER_INSET * 2
+    normalized_height = border_height * reference_height / capture_height
+    return 2 if normalized_height >= TOOLTIP_DOUBLE_LINE_MIN_BORDER_HEIGHT else 1
 
 
 def _split_text_line_images(image: Image.Image) -> list[Image.Image]:
@@ -430,6 +656,50 @@ def _split_text_line_images(image: Image.Image) -> list[Image.Image]:
     return line_images
 
 
+def _force_split_double_line_image(image: Image.Image) -> list[Image.Image]:
+    """Split an expected two-line tooltip at the darkest central row."""
+    gray = np.asarray(ImageOps.grayscale(image), dtype=np.uint8)
+    if gray.ndim != 2 or gray.size == 0 or image.height < 24:
+        return [image]
+
+    height, width = gray.shape
+    first = max(1, round(height * 0.32))
+    last = min(height - 1, round(height * 0.68))
+    if last <= first:
+        return [image]
+    row_hits = np.count_nonzero(gray >= 125, axis=1)
+    split_y = first + int(np.argmin(row_hits[first:last]))
+    if split_y <= 2 or split_y >= height - 2:
+        return [image]
+
+    halves = [
+        image.crop((0, 0, width, split_y)),
+        image.crop((0, split_y, width, height)),
+    ]
+    trimmed = [_trim_line_to_bright_content(part) for part in halves]
+    if any(part.width < 12 or part.height < 5 for part in trimmed):
+        return [image]
+    return trimmed
+
+
+def _trim_line_to_bright_content(image: Image.Image) -> Image.Image:
+    gray = np.asarray(ImageOps.grayscale(image), dtype=np.uint8)
+    positions = np.argwhere(gray >= 125)
+    if positions.size == 0:
+        return image
+    padding = max(2, round(image.height * 0.10))
+    y0, x0 = positions.min(axis=0)
+    y1, x1 = positions.max(axis=0)
+    return image.crop(
+        (
+            max(0, int(x0) - padding),
+            max(0, int(y0) - padding),
+            min(image.width, int(x1) + padding + 1),
+            min(image.height, int(y1) + padding + 1),
+        )
+    )
+
+
 def detect_inventory_tab_crop(crop_path: Path) -> tuple[bool, list[str], str]:
     """Detect the inventory screen from an already-captured top-left tab crop."""
     tab_crop = Image.open(crop_path)
@@ -452,6 +722,17 @@ def detect_inventory_tab_image(tab_crop: Image.Image) -> tuple[bool, list[str], 
     normalized_tab = _normalize_detection_text(tab_text)
     tab_found = _matching_keywords(normalized_tab, {"装备", "gear"})
     return bool(tab_found), [f"tab:{keyword}" for keyword in tab_found], tab_text
+
+def detect_character_header_image(tab_crop: Image.Image) -> tuple[bool, list[str], str]:
+    """Detect the character screen from its stable achievements-tab label."""
+    tab_text = _ocr_detection_crop(tab_crop.convert("RGB"))
+    normalized_tab = _normalize_detection_text(tab_text)
+    tab_found = _matching_keywords(
+        normalized_tab,
+        {"成就", "achievement", "achievements"},
+    )
+    return bool(tab_found), [f"header:{keyword}" for keyword in tab_found], tab_text
+
 
 def _active_tab_visual_score(image: Image.Image) -> float:
     """Score the selected equipment tab by its bright highlighted tab background."""
@@ -504,12 +785,15 @@ def _fit_box(
 
 def parse_item_name_candidates(text: str) -> list[str]:
     candidates: list[str] = []
+    line_values: list[str] = []
     for line in text.splitlines():
         value = _clean_line(line)
         if not value:
             continue
         lowered = value.lower()
-        if lowered in UI_NOISE or any(noise in lowered for noise in UI_NOISE):
+        # Navigation labels are noise only as standalone OCR lines. Item names
+        # such as "地形调查地图" legitimately contain one of these words.
+        if lowered in UI_NOISE:
             continue
         has_cjk = re.search(r"[\u4e00-\u9fff]", value) is not None
         if (not has_cjk and len(value) < 3) or len(value) > 90:
@@ -520,6 +804,7 @@ def parse_item_name_candidates(text: str) -> list[str]:
             continue
         if _looks_like_ocr_gibberish(value):
             continue
+        line_values.append(value)
         candidates.extend(_line_candidate_variants(value))
 
     deduped: list[str] = []
@@ -529,11 +814,10 @@ def parse_item_name_candidates(text: str) -> list[str]:
         if key not in seen:
             seen.add(key)
             deduped.append(value)
-    if len(deduped) > 1:
-        joined = " ".join(deduped)
-        if len(joined) <= 120 and _normalize_candidate_key(deduped[0]) not in _normalize_candidate_key(
-            deduped[1]
-        ):
+    if len(line_values) > 1:
+        joined = _join_wrapped_name_lines(line_values)
+        joined_key = joined.casefold()
+        if joined and len(joined) <= 120 and joined_key not in seen:
             deduped.insert(0, joined)
     return deduped[:5]
 
@@ -549,6 +833,27 @@ def _clean_line(value: str) -> str:
 
 def _normalize_candidate_key(value: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", value.casefold())
+
+
+def _join_wrapped_name_lines(lines: list[str]) -> str:
+    tokens: list[str] = []
+    for line in lines:
+        next_tokens = line.split()
+        if not next_tokens:
+            continue
+        if not tokens:
+            tokens.extend(next_tokens)
+            continue
+
+        overlap = 0
+        for size in range(min(len(tokens), len(next_tokens)), 0, -1):
+            previous_keys = [_normalize_candidate_key(token) for token in tokens[-size:]]
+            next_keys = [_normalize_candidate_key(token) for token in next_tokens[:size]]
+            if previous_keys == next_keys:
+                overlap = size
+                break
+        tokens.extend(next_tokens[overlap:])
+    return " ".join(tokens)
 
 
 def _line_candidate_variants(value: str) -> list[str]:
