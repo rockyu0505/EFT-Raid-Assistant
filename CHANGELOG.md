@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 - 2026-08-08
+
+- Added tarkov.dev's `pvp-season` game mode as “赛季服” across price lookup, 48-hour history, settings, the F9 in-raid controller, cache diagnostics, tracked crafts/barters, developer OCR tools, and packaged seed data.
+- Kept seasonal refreshes on tarkov.dev's JSON API because its GraphQL `GameMode` enum still exposes only PvP/PvE; an accepted GraphQL fallback refreshes those two modes while retaining the last valid seasonal cache.
+- Added a startup software-update check backed by a small GitHub Release manifest, plus a manual `Help -> Check for updates` action.
+- Added an explicit update prompt, background download progress, cancellation and resume support, release notes, exact asset-size checks, SHA-256 verification, and archive-structure validation.
+- Added a separately packaged Windows updater that waits for the main app to exit, preserves portable user data, replaces the managed runtime, rolls back on failure, and restarts the app with a success/failure result notice.
+- Added mirror-ready manifest URLs so a mainland China object-storage download source can be introduced later without changing installed clients; GitHub remains the initial source and manual download remains available after network failures.
+- Extended the repeatable release build to produce `update-manifest.json` and include `EFT Raid Assistant Updater.exe` in the portable ZIP.
+- Treated a missing manifest on pre-updater releases as a normal “not published yet” state instead of exposing a raw HTTP 404 error.
+
 ## 0.7.2 - 2026-08-07
 
 - Added an immediate local listing suggestion that uses `lastLowPrice` directly, shows the 24-hour average and API sample time alongside it, and warns instead of silently changing the suggestion when market depth is thin or the references diverge.

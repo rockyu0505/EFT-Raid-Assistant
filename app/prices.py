@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Any
 
 from app.config import APP_DIR, RESOURCE_DIR
+from app.game_modes import (
+    GAME_MODES,
+    GRAPHQL_GAME_MODES,
+    SEASONAL_GAME_MODE,
+    game_mode_label,
+    normalize_game_mode,
+)
 from app.models import HistoricalPriceSummary, ItemPrice
 from app.price_estimator import SmartPriceEstimate, estimate_smart_listing_price
 
@@ -29,8 +36,11 @@ DATA_DIR = APP_DIR / "data"
 RESOURCE_DATA_DIR = RESOURCE_DIR / "data"
 CHINESE_ALIASES_PATH = DATA_DIR / "item_aliases_zh.json"
 BUNDLED_CHINESE_ALIASES_PATH = RESOURCE_DATA_DIR / "item_aliases_zh.json"
-GAME_MODES = ("regular", "pve")
-JSON_TRANSLATION_MODE = "regular"
+JSON_TRANSLATION_MODE_BY_MODE = {
+    "regular": "regular",
+    "pve": "regular",
+    SEASONAL_GAME_MODE: SEASONAL_GAME_MODE,
+}
 DEFAULT_MINIMUM_ITEM_COUNT = 1000
 SMART_HISTORY_CACHE_SECONDS = 15 * 60
 FLEA_MARKET_ITEM_TAX_RATE = 0.05
@@ -497,7 +507,7 @@ class TarkovPriceClient:
             return self._refresh_json_modes(GAME_MODES)
 
         pending: dict[str, list[dict[str, Any]]] = {}
-        for mode in GAME_MODES:
+        for mode in GRAPHQL_GAME_MODES:
             items = self._fetch_graphql_items(mode, "en")
             zh_items = self._fetch_graphql_items(mode, "zh")
             pending[mode] = _merge_localized_items(items, zh_items)
@@ -507,11 +517,15 @@ class TarkovPriceClient:
 
     def _refresh_json_modes(self, game_modes: tuple[str, ...]) -> dict[str, int]:
         modes = tuple(dict.fromkeys(_normalize_game_mode(mode) for mode in game_modes))
-        translation_paths = (
-            f"{JSON_TRANSLATION_MODE}/items_en",
-            f"{JSON_TRANSLATION_MODE}/items_zh",
-        )
         item_paths = tuple(f"{mode}/items" for mode in modes)
+        translation_modes = tuple(
+            dict.fromkeys(JSON_TRANSLATION_MODE_BY_MODE[mode] for mode in modes)
+        )
+        translation_paths = tuple(
+            path
+            for mode in translation_modes
+            for path in (f"{mode}/items_en", f"{mode}/items_zh")
+        )
         resource_paths = (*item_paths, *translation_paths)
 
         if self._json_resources_unchanged(resource_paths, modes):
@@ -525,10 +539,15 @@ class TarkovPriceClient:
             if etag:
                 pending_etags[resource_path] = etag
 
-        english = _json_translation_map(documents[translation_paths[0]], "英文")
-        chinese = _json_translation_map(documents[translation_paths[1]], "中文")
         pending_items: dict[str, list[dict[str, Any]]] = {}
         for mode, resource_path in zip(modes, item_paths):
+            translation_mode = JSON_TRANSLATION_MODE_BY_MODE[mode]
+            english = _json_translation_map(
+                documents[f"{translation_mode}/items_en"], "英文"
+            )
+            chinese = _json_translation_map(
+                documents[f"{translation_mode}/items_zh"], "中文"
+            )
             pending_items[mode] = _json_items(
                 documents[resource_path],
                 english,
@@ -675,6 +694,9 @@ class TarkovPriceClient:
             parts.append(f"{label}:{value}")
         return " / ".join(parts)
 
+    def cached_item_count(self, game_mode: str) -> int:
+        return len(self._items_by_mode.get(_normalize_game_mode(game_mode)) or [])
+
     def cache_is_stale(self, stale_hours: float = 24.0) -> bool:
         stale_seconds = max(1.0, float(stale_hours)) * 3600.0
         now = time.time()
@@ -767,6 +789,10 @@ class TarkovPriceClient:
         game_mode: str,
         language: str = "en",
     ) -> list[dict[str, Any]]:
+        if _normalize_game_mode(game_mode) not in GRAPHQL_GAME_MODES:
+            raise PriceLookupError(
+                "tarkov.dev GraphQL 尚未支持赛季服，请使用 JSON 数据源。"
+            )
         payload = json.dumps(
             {"query": ITEMS_QUERY, "variables": {"gameMode": game_mode, "lang": language}}
         ).encode("utf-8")
@@ -824,6 +850,10 @@ class TarkovPriceClient:
         game_mode: str,
         days: int,
     ) -> list[dict[str, Any]]:
+        if _normalize_game_mode(game_mode) not in GRAPHQL_GAME_MODES:
+            raise PriceLookupError(
+                "tarkov.dev GraphQL 尚未支持赛季服历史价格，请使用 JSON 数据源。"
+            )
         payload = json.dumps(
             {
                 "query": HISTORICAL_PRICES_QUERY,
@@ -1210,14 +1240,11 @@ def _merge_localized_items(
 
 
 def _normalize_game_mode(game_mode: str) -> str:
-    value = str(game_mode).strip().casefold()
-    if value in {"pve", "pvemode"}:
-        return "pve"
-    return "regular"
+    return normalize_game_mode(game_mode)
 
 
 def _game_mode_label(game_mode: str) -> str:
-    return "PvE" if _normalize_game_mode(game_mode) == "pve" else "PvP"
+    return game_mode_label(game_mode)
 
 
 def _cache_path_for_mode(game_mode: str) -> Path:

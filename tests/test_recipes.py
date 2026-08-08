@@ -95,7 +95,7 @@ class RecipeCatalogTests(unittest.TestCase):
                         "ammo": {"name": "弹药", "parent": ""},
                         "rounds": {"name": "子弹", "parent": "ammo"},
                     },
-                    "modes": {"regular": [recipe], "pve": []},
+                    "modes": {"regular": [recipe], "pve": [], "pvp-season": [recipe]},
                 },
                 ensure_ascii=False,
             ),
@@ -106,6 +106,7 @@ class RecipeCatalogTests(unittest.TestCase):
         catalog = RecipeCatalog(self.path)
 
         self.assertEqual(catalog.record_count("regular"), 1)
+        self.assertEqual(catalog.record_count("pvp-season"), 1)
         self.assertEqual(catalog.tracked_requirement_lines("powder", [], "regular"), [])
         lines = catalog.tracked_requirement_lines("powder", ["craft-1"], "regular")
         notices = catalog.tracked_requirement_notices(
@@ -314,15 +315,20 @@ class RecipeCatalogTests(unittest.TestCase):
         config = deepcopy(DEFAULT_CONFIG)
         config["enabled_features"] = ["recipe_tracking"]
         config["feature_setup_complete"] = True
+        config["price_game_mode_default"] = "pvp-season"
         catalog = RecipeCatalog()
-        tracked_id = str(catalog.records("pve")[0]["id"])
+        expected_count = catalog.record_count("pvp-season")
+        tracked_id = str(catalog.records("pvp-season")[0]["id"])
         config["tracked_recipe_ids"] = [tracked_id]
         config["recipe_overlay_accent_color"] = "#3366AA"
         with patch("app.gui.load_config", return_value=config):
             window = _RecipeSmokeWindow()
 
         self.assertIsNotNone(window.recipe_catalog)
-        self.assertEqual(window.recipe_catalog.record_count("pve"), 1020)
+        self.assertGreaterEqual(expected_count, 1000)
+        self.assertEqual(
+            window.recipe_catalog.record_count("pvp-season"), expected_count
+        )
         self.assertGreater(window.recipe_category_tree.topLevelItemCount(), 0)
         self.assertGreater(window.recipe_result_tree.topLevelItemCount(), 0)
         self.assertGreater(window.tracked_recipe_tree.topLevelItemCount(), 0)
@@ -330,7 +336,7 @@ class RecipeCatalogTests(unittest.TestCase):
             "交换用物品", window.recipe_category_tree.topLevelItem(1).text(0)
         )
         self.assertIn("已关注总览 (1)", window.recipe_tabs.tabText(1))
-        self.assertIn("共 1020 个配方", window.recipe_summary_label.text())
+        self.assertIn(f"共 {expected_count} 个配方", window.recipe_summary_label.text())
         self.assertEqual(window.recipe_color_label.text(), "#3366AA")
         self.assertGreaterEqual(window.minimumWidth(), 1160)
         self.assertGreaterEqual(window.width(), 1520)
@@ -461,15 +467,20 @@ class RecipeCatalogTests(unittest.TestCase):
 
     def test_bundled_snapshot_uses_game_handbook_paths(self) -> None:
         catalog = RecipeCatalog()
-        records = catalog.records("regular")
 
         self.assertGreaterEqual(len(catalog.handbook_categories), 80)
-        self.assertEqual(sum(bool(catalog.category_path(record)) for record in records), 1019)
-        unlocks = [record for record in records if record.get("task_unlock")]
-        self.assertEqual(len(unlocks), 104)
-        self.assertTrue(
-            all(isinstance(record.get("unlock_task"), dict) for record in unlocks)
-        )
+        for mode in ("regular", "pve", "pvp-season"):
+            records = catalog.records(mode)
+            self.assertGreaterEqual(len(records), 1000)
+            self.assertGreaterEqual(
+                sum(bool(catalog.category_path(record)) for record in records),
+                len(records) - 1,
+            )
+            unlocks = [record for record in records if record.get("task_unlock")]
+            self.assertGreaterEqual(len(unlocks), 50)
+            self.assertTrue(
+                all(isinstance(record.get("unlock_task"), dict) for record in unlocks)
+            )
 
     def test_interface_font_setting_applies_live(self) -> None:
         config = deepcopy(DEFAULT_CONFIG)

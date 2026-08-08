@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.game_modes import GAME_MODE_CHOICES
+
 
 GAMMA_CONTROLS = {
     "gamma": ("Gamma", 40, 160, 100, 2),
@@ -149,8 +151,8 @@ class RaidControlOverlay(QWidget):
 
         session_section, session_layout = self._section("本次游戏")
         self.game_mode_combo = QComboBox()
-        self.game_mode_combo.addItem("PvE", "pve")
-        self.game_mode_combo.addItem("PvP", "regular")
+        for label, mode in GAME_MODE_CHOICES:
+            self.game_mode_combo.addItem(label, mode)
         self.language_combo = QComboBox()
         self.language_combo.addItem("中文", "zh")
         self.language_combo.addItem("English", "en")

@@ -11,7 +11,12 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 JSON_API = "https://json.tarkov.dev"
 OUTPUT_PATH = ROOT / "data" / "recipes.json"
-GAME_MODES = ("regular", "pve")
+GAME_MODES = ("regular", "pve", "pvp-season")
+TRANSLATION_MODE_BY_MODE = {
+    "regular": "regular",
+    "pve": "regular",
+    "pvp-season": "pvp-season",
+}
 MINIMUM_SOURCE_COUNTS = {"crafts": 100, "barters": 400}
 
 
@@ -25,21 +30,39 @@ def main() -> int:
     station_names = _load_station_names()
     modes: dict[str, list[dict[str, Any]]] = {}
     source_etags: dict[str, str] = {}
-    item_document, item_etag = _fetch_json("regular/items")
-    item_zh_document, item_zh_etag = _fetch_json("regular/items_zh")
-    source_etags["regular/items"] = item_etag
-    source_etags["regular/items_zh"] = item_zh_etag
-    handbook_categories = _handbook_categories(item_document, item_zh_document)
-    trader_document, trader_etag = _fetch_json("regular/traders")
-    trader_en_document, trader_en_etag = _fetch_json("regular/traders_en")
-    source_etags["regular/traders"] = trader_etag
-    source_etags["regular/traders_en"] = trader_en_etag
-    trader_names = _trader_names(trader_document, trader_en_document)
-    task_en_document, task_en_etag = _fetch_json("regular/tasks_en")
-    task_zh_document, task_zh_etag = _fetch_json("regular/tasks_zh")
-    source_etags["regular/tasks_en"] = task_en_etag
-    source_etags["regular/tasks_zh"] = task_zh_etag
+    handbook_categories: dict[str, dict[str, Any]] = {}
+    localized_context: dict[str, tuple[dict[str, str], dict[str, Any], dict[str, Any]]] = {}
+    for translation_mode in dict.fromkeys(TRANSLATION_MODE_BY_MODE.values()):
+        item_document, item_etag = _fetch_json(f"{translation_mode}/items")
+        item_zh_document, item_zh_etag = _fetch_json(f"{translation_mode}/items_zh")
+        trader_document, trader_etag = _fetch_json(f"{translation_mode}/traders")
+        trader_en_document, trader_en_etag = _fetch_json(
+            f"{translation_mode}/traders_en"
+        )
+        task_en_document, task_en_etag = _fetch_json(f"{translation_mode}/tasks_en")
+        task_zh_document, task_zh_etag = _fetch_json(f"{translation_mode}/tasks_zh")
+        source_etags.update(
+            {
+                f"{translation_mode}/items": item_etag,
+                f"{translation_mode}/items_zh": item_zh_etag,
+                f"{translation_mode}/traders": trader_etag,
+                f"{translation_mode}/traders_en": trader_en_etag,
+                f"{translation_mode}/tasks_en": task_en_etag,
+                f"{translation_mode}/tasks_zh": task_zh_etag,
+            }
+        )
+        handbook_categories.update(
+            _handbook_categories(item_document, item_zh_document)
+        )
+        localized_context[translation_mode] = (
+            _trader_names(trader_document, trader_en_document),
+            task_en_document,
+            task_zh_document,
+        )
     for mode in GAME_MODES:
+        trader_names, task_en_document, task_zh_document = localized_context[
+            TRANSLATION_MODE_BY_MODE[mode]
+        ]
         item_map = _load_item_map(mode)
         tasks, task_etag = _fetch_json(f"{mode}/tasks")
         crafts, craft_etag = _fetch_json(f"{mode}/crafts")
@@ -114,7 +137,7 @@ def main() -> int:
 def _fetch_json(resource_path: str) -> tuple[dict[str, Any], str]:
     request = urllib.request.Request(
         f"{JSON_API}/{resource_path}",
-        headers={"Accept": "application/json", "User-Agent": "EFT-Raid-Assistant/0.7.0"},
+        headers={"Accept": "application/json", "User-Agent": "EFT-Raid-Assistant/0.8.0"},
     )
     with urllib.request.urlopen(request, timeout=45) as response:
         raw = response.read()

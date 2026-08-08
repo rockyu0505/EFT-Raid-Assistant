@@ -8,6 +8,10 @@ debug/
 
 cache/
 config.json
+.update-cache/
+.update-result.json
+.update-staging-*/
+.update-backup-*/
 data/hideout_progress.json
 startup_log*.txt
 install_log.txt

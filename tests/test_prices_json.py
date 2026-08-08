@@ -191,8 +191,11 @@ class JsonPriceClientTests(unittest.TestCase):
         documents = {
             "regular/items": (_item_document(27000), '"regular"'),
             "pve/items": (_item_document(31000), '"pve"'),
+            "pvp-season/items": (_item_document(41000), '"pvp-season"'),
             "regular/items_en": (ENGLISH, '"en"'),
             "regular/items_zh": (CHINESE, '"zh"'),
+            "pvp-season/items_en": (ENGLISH, '"season-en"'),
+            "pvp-season/items_zh": (CHINESE, '"season-zh"'),
         }
 
         with patch.object(
@@ -202,8 +205,8 @@ class JsonPriceClientTests(unittest.TestCase):
         ) as fetch_json, patch.object(self.client, "_fetch_graphql_items") as fetch_graphql:
             counts = self.client.refresh_all_modes()
 
-        self.assertEqual(counts, {"regular": 1, "pve": 1})
-        self.assertEqual(fetch_json.call_count, 4)
+        self.assertEqual(counts, {"regular": 1, "pve": 1, "pvp-season": 1})
+        self.assertEqual(fetch_json.call_count, 7)
         fetch_graphql.assert_not_called()
         item = self.client._items_by_mode["regular"][0]
         self.assertEqual(item["name"], "Colt M4A1 5.56x45 assault rifle")
@@ -218,8 +221,10 @@ class JsonPriceClientTests(unittest.TestCase):
     def test_json_failure_preserves_existing_cache(self) -> None:
         old_regular = [{"id": "old-regular", "name": "Old PvP"}]
         old_pve = [{"id": "old-pve", "name": "Old PvE"}]
+        old_seasonal = [{"id": "old-seasonal", "name": "Old season"}]
         self.client._items_by_mode["regular"] = old_regular
         self.client._items_by_mode["pve"] = old_pve
+        self.client._items_by_mode["pvp-season"] = old_seasonal
 
         with patch.object(
             self.client,
@@ -231,17 +236,23 @@ class JsonPriceClientTests(unittest.TestCase):
 
         self.assertIs(self.client._items_by_mode["regular"], old_regular)
         self.assertIs(self.client._items_by_mode["pve"], old_pve)
+        self.assertIs(self.client._items_by_mode["pvp-season"], old_seasonal)
 
     def test_partial_json_response_does_not_commit_either_mode(self) -> None:
         old_regular = [{"id": "old-regular", "name": "Old PvP"}]
         old_pve = [{"id": "old-pve", "name": "Old PvE"}]
+        old_seasonal = [{"id": "old-seasonal", "name": "Old season"}]
         self.client._items_by_mode["regular"] = old_regular
         self.client._items_by_mode["pve"] = old_pve
+        self.client._items_by_mode["pvp-season"] = old_seasonal
         documents = {
             "regular/items": (_item_document(27000), '"regular"'),
             "pve/items": ({"data": {"items": {}}}, '"pve"'),
+            "pvp-season/items": (_item_document(41000), '"pvp-season"'),
             "regular/items_en": (ENGLISH, '"en"'),
             "regular/items_zh": (CHINESE, '"zh"'),
+            "pvp-season/items_en": (ENGLISH, '"season-en"'),
+            "pvp-season/items_zh": (CHINESE, '"season-zh"'),
         }
 
         with patch.object(
@@ -254,15 +265,20 @@ class JsonPriceClientTests(unittest.TestCase):
 
         self.assertIs(self.client._items_by_mode["regular"], old_regular)
         self.assertIs(self.client._items_by_mode["pve"], old_pve)
+        self.assertIs(self.client._items_by_mode["pvp-season"], old_seasonal)
 
     def test_unchanged_etags_skip_large_json_downloads(self) -> None:
         self.client._items_by_mode["regular"] = [{"id": ITEM_ID}]
         self.client._items_by_mode["pve"] = [{"id": ITEM_ID}]
+        self.client._items_by_mode["pvp-season"] = [{"id": ITEM_ID}]
         self.client._json_etags = {
             "regular/items": '"regular"',
             "pve/items": '"pve"',
+            "pvp-season/items": '"pvp-season"',
             "regular/items_en": '"en"',
             "regular/items_zh": '"zh"',
+            "pvp-season/items_en": '"season-en"',
+            "pvp-season/items_zh": '"season-zh"',
         }
 
         with patch.object(
@@ -272,8 +288,8 @@ class JsonPriceClientTests(unittest.TestCase):
         ) as head_check, patch.object(self.client, "_fetch_json_document") as fetch_json:
             counts = self.client.refresh_all_modes()
 
-        self.assertEqual(counts, {"regular": 1, "pve": 1})
-        self.assertEqual(head_check.call_count, 4)
+        self.assertEqual(counts, {"regular": 1, "pve": 1, "pvp-season": 1})
+        self.assertEqual(head_check.call_count, 7)
         fetch_json.assert_not_called()
 
     def test_graphql_is_only_used_when_explicitly_requested(self) -> None:
@@ -299,6 +315,10 @@ class JsonPriceClientTests(unittest.TestCase):
         self.assertEqual(fetch_graphql.call_count, 4)
         fetch_json.assert_not_called()
 
+    def test_graphql_rejects_seasonal_mode_with_a_clear_message(self) -> None:
+        with self.assertRaisesRegex(PriceLookupError, "GraphQL 尚未支持赛季服"):
+            self.client.refresh_items("pvp-season", source="graphql")
+
     def test_historical_prices_use_json_by_default(self) -> None:
         points = [
             {"price": 100, "priceMin": 90, "timestamp": 1},
@@ -323,7 +343,7 @@ class JsonPriceClientTests(unittest.TestCase):
         writable_cache = root / "portable" / "cache"
         bundled_cache = root / "bundle" / "cache"
         bundled_cache.mkdir(parents=True)
-        for mode in ("regular", "pve"):
+        for mode in ("regular", "pve", "pvp-season"):
             (bundled_cache / f"tarkov_items_{mode}.json").write_text(
                 json.dumps(
                     {
@@ -347,6 +367,9 @@ class JsonPriceClientTests(unittest.TestCase):
 
         self.assertEqual(client._items_by_mode["regular"][0]["id"], "seed-regular")
         self.assertEqual(client._items_by_mode["pve"][0]["id"], "seed-pve")
+        self.assertEqual(
+            client._items_by_mode["pvp-season"][0]["id"], "seed-pvp-season"
+        )
         self.assertFalse(writable_cache.exists())
 
 

@@ -93,6 +93,17 @@ class RaidOverlayTests(unittest.TestCase):
 
         self.assertEqual(modes, ["regular"])
 
+    def test_control_supports_seasonal_mode(self) -> None:
+        overlay = RaidControlOverlay()
+        overlay.sync(
+            {"price_game_mode_default": "pvp-season"},
+            [],
+            "赛季服 · cache ready",
+        )
+
+        self.assertEqual(overlay.game_mode_combo.currentData(), "pvp-season")
+        self.assertEqual(overlay.game_mode_combo.currentText(), "赛季服")
+
     def test_gamma_changes_only_apply_after_explicit_enable(self) -> None:
         overlay = RaidControlOverlay()
         overlay.sync(

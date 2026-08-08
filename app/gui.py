@@ -124,6 +124,12 @@ from app.diagnostics import create_diagnostic_bundle
 from app.hideout import HideoutDataError, HideoutTracker
 from app.hideout_ocr import hideout_ocr_text_path, run_hideout_ocr
 from app.hotkeys import HotkeyManager, normalize_hotkey
+from app.game_modes import (
+    GAME_MODES,
+    GAME_MODE_CHOICES,
+    game_mode_label,
+    normalize_game_mode,
+)
 from app.item_ocr import (
     detect_character_header_image,
     detect_inventory_tab_image,
@@ -160,6 +166,7 @@ from app.recipes import (
 from app.ui.raid_overlays import RaidControlOverlay, RaidLogOverlay
 from app.ui.state import LogBus, SettingsStore
 from app.ui.theme import THEME_LABELS, apply_app_theme
+from app.update_ui import UpdateCoordinator
 
 
 DISPLAY_FILTER_SLIDERS = {
@@ -354,7 +361,13 @@ class MainWindow(QMainWindow):
                 self._recipe_data_error = str(exc)
         self.current_price_game_mode = str(self.config.get("price_game_mode_default", "pve"))
         if self.price_client is not None:
-            self.price_client.set_game_mode(self.current_price_game_mode)
+            self.current_price_game_mode = self.price_client.set_game_mode(
+                self.current_price_game_mode
+            )
+        else:
+            self.current_price_game_mode = normalize_game_mode(
+                self.current_price_game_mode
+            )
         self.price_overlay = PriceOverlay() if self._feature_enabled("price_lookup") else None
         self.feedback_overlay = (
             FeedbackOverlay()
@@ -415,6 +428,7 @@ class MainWindow(QMainWindow):
         self._tray_notice_shown = False
         self._active_price_key = ""
         self.tray_icon: QSystemTrayIcon | None = None
+        self.update_coordinator: UpdateCoordinator | None = None
         self.item_completion_model = QStandardItemModel(0, 2, self)
         self.item_completion_lookup: dict[str, str] = {}
         self.panel_buttons: list[QPushButton] = []
@@ -474,6 +488,15 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self.log_bus.visible_line_ready.connect(self._append_main_log_line)
         self._build_tray_icon()
+        self.update_coordinator = UpdateCoordinator(
+            self.config,
+            self,
+            log=self._log_event,
+        )
+        self.update_coordinator.restart_requested.connect(
+            self._restart_for_app_update
+        )
+        self.update_coordinator.schedule_startup_check()
         self._refresh_item_completer()
         self._register_hotkeys()
         self._update_cache_status_label()
@@ -510,6 +533,8 @@ class MainWindow(QMainWindow):
         ):
             self.restore_display_filter(show_feedback=False)
         self._save_config()
+        if self.update_coordinator is not None:
+            self.update_coordinator.shutdown()
         self.hotkeys.unregister(join_timeout=1.0)
         if self.reminders is not None:
             self.reminders.shutdown()
@@ -823,6 +848,18 @@ class MainWindow(QMainWindow):
 
     def request_exit(self) -> None:
         self._force_exit = True
+        self.close()
+        QApplication.quit()
+
+    def check_for_app_updates(self) -> None:
+        if self.update_coordinator is None:
+            QMessageBox.information(self, "检查更新", "更新组件尚未完成初始化。")
+            return
+        self.update_coordinator.check_now(interactive=True)
+
+    def _restart_for_app_update(self) -> None:
+        self._force_exit = True
+        self.shutdown()
         self.close()
         QApplication.quit()
 
@@ -2427,6 +2464,8 @@ class MainWindow(QMainWindow):
         raid_log_action.triggered.connect(self.toggle_raid_log_overlay)
         diagnostics_action = QAction("导出诊断包", self)
         diagnostics_action.triggered.connect(self.export_diagnostics)
+        update_action = QAction("检查软件更新", self)
+        update_action.triggered.connect(self.check_for_app_updates)
         quit_action = QAction("退出", self)
         quit_action.triggered.connect(self.request_exit)
 
@@ -2447,6 +2486,9 @@ class MainWindow(QMainWindow):
         file_menu.addAction(diagnostics_action)
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
+
+        help_menu = self.menuBar().addMenu("帮助")
+        help_menu.addAction(update_action)
 
     def _build_status_bar(self) -> QWidget:
         widget = QWidget()
@@ -2481,8 +2523,8 @@ class MainWindow(QMainWindow):
         completer.activated[QModelIndex].connect(self._on_item_completion_index_activated)
         self.item_name_field.setCompleter(completer)
         self.price_mode_combo = QComboBox()
-        self.price_mode_combo.addItem("PvE", "pve")
-        self.price_mode_combo.addItem("PvP", "regular")
+        for label, mode in GAME_MODE_CHOICES:
+            self.price_mode_combo.addItem(label, mode)
         mode_index = self.price_mode_combo.findData(self.current_price_game_mode)
         self.price_mode_combo.setCurrentIndex(max(0, mode_index))
         self.price_mode_combo.currentIndexChanged.connect(self._on_price_mode_changed)
@@ -2652,7 +2694,7 @@ class MainWindow(QMainWindow):
         self._config_save_timer.start(350)
 
     def _on_raid_game_mode_changed(self, mode: str) -> None:
-        if mode not in {"pve", "regular"}:
+        if mode not in GAME_MODES:
             return
         changed = self.settings_store.set("price_game_mode_default", mode)
         if self.price_client is not None:
@@ -3075,7 +3117,8 @@ class MainWindow(QMainWindow):
                 answer = QMessageBox.question(
                     self,
                     "JSON 价格 API 不可用",
-                    f"{result.error}\n\n现有本地缓存已经保留。是否尝试备用 GraphQL API？",
+                    f"{result.error}\n\n现有本地缓存已经保留。是否尝试备用 GraphQL API？\n"
+                    "注意：GraphQL 目前只能刷新 PvP/PvE，赛季服会保留现有缓存。",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
@@ -3093,11 +3136,25 @@ class MainWindow(QMainWindow):
             return
 
         counts = result.counts or {}
-        status = (
-            f"价格缓存已通过 {source_label} 就绪："
-            f"PvP {counts.get('regular', 0)} 个物品，"
-            f"PvE {counts.get('pve', 0)} 个物品"
-        )
+        if result.source == "graphql":
+            seasonal_count = (
+                self.price_client.cached_item_count("pvp-season")
+                if self.price_client is not None
+                else 0
+            )
+            status = (
+                f"价格缓存已通过 {source_label} 就绪："
+                f"PvP {counts.get('regular', 0)} 个物品，"
+                f"PvE {counts.get('pve', 0)} 个物品；"
+                f"赛季服保留 {seasonal_count} 个物品"
+            )
+        else:
+            status = (
+                f"价格缓存已通过 {source_label} 就绪："
+                f"PvP {counts.get('regular', 0)} 个物品，"
+                f"PvE {counts.get('pve', 0)} 个物品，"
+                f"赛季服 {counts.get('pvp-season', 0)} 个物品"
+            )
         self._log(status)
         self._last_data_error = ""
         self._update_cache_status_label()
@@ -3313,7 +3370,8 @@ class MainWindow(QMainWindow):
             lines.append(
                 "配方："
                 f"PvP {self.recipe_catalog.record_count('regular')} 条 / "
-                f"PvE {self.recipe_catalog.record_count('pve')} 条"
+                f"PvE {self.recipe_catalog.record_count('pve')} 条 / "
+                f"赛季服 {self.recipe_catalog.record_count('pvp-season')} 条"
                 + (
                     f" · 生成于 {self.recipe_catalog.generated_at}"
                     if self.recipe_catalog.generated_at
@@ -5189,8 +5247,8 @@ class SettingsDialog(QDialog):
         self.price_overlay_seconds.setRange(1, 120)
         self.price_overlay_seconds.setSuffix(" 秒")
         self.price_game_mode_default = QComboBox()
-        self.price_game_mode_default.addItem("PvE", "pve")
-        self.price_game_mode_default.addItem("PvP", "regular")
+        for label, mode in GAME_MODE_CHOICES:
+            self.price_game_mode_default.addItem(label, mode)
         self.flea_intelligence_center_level = QComboBox()
         self.flea_intelligence_center_level.addItem("0 级 / 未建造", 0)
         self.flea_intelligence_center_level.addItem("1 级", 1)
@@ -6179,7 +6237,7 @@ def _price_tier(value: int | None, tiers: list[object]) -> tuple[str, str, str]:
 
 
 def _game_mode_label(game_mode: str) -> str:
-    return "PvE" if str(game_mode).strip().casefold() == "pve" else "PvP"
+    return game_mode_label(game_mode)
 
 
 def _region_size_signature(region: Region | None) -> tuple[int, int] | None:

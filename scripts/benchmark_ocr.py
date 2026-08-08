@@ -16,7 +16,9 @@ from app.prices import PriceLookupError, TarkovPriceClient
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark RapidOCR item OCR on cropped tooltip images.")
     parser.add_argument("images", nargs="+", type=Path)
-    parser.add_argument("--mode", default="pve", choices=["pve", "regular"])
+    parser.add_argument(
+        "--mode", default="pve", choices=["pve", "regular", "pvp-season"]
+    )
     parser.add_argument(
         "--models",
         default="v5",

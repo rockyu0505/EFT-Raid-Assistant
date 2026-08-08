@@ -45,7 +45,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Generate synthetic EFT tooltip crops and benchmark OCR match accuracy."
     )
-    parser.add_argument("--mode", default="pve", choices=["pve", "regular"])
+    parser.add_argument(
+        "--mode", default="pve", choices=["pve", "regular", "pvp-season"]
+    )
     parser.add_argument(
         "--models",
         default="v5",

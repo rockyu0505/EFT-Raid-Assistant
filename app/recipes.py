@@ -6,10 +6,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from app.config import RESOURCE_DIR
+from app.game_modes import GAME_MODES, normalize_game_mode
 
 
 RECIPE_DATA_PATH = RESOURCE_DIR / "data" / "recipes.json"
-GAME_MODES = ("regular", "pve")
 
 
 class RecipeDataError(RuntimeError):
@@ -375,4 +375,4 @@ def _unlock_task_search_text(record: dict[str, Any]) -> str:
 
 
 def _mode(value: str) -> str:
-    return "pve" if str(value).casefold() == "pve" else "regular"
+    return normalize_game_mode(value)
